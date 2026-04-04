@@ -70,6 +70,42 @@ Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable 
 
 ---
 
+## 🧠 Guide d'Analyse Stratégique (Phase 1)
+
+L'objectif de la Phase 1 est de répondre à une question : **"Pouvons-nous gagner de l'argent sans nous faire écraser par les institutions ?"**
+
+### L'analogie du Photographe
+En Phase 1, Jawas est un **photographe sur le bord d'une piste de course**. Il ne court pas, il observe les autres courir :
+- Une transaction **SUCCESS** sur Solscan = Le coureur qui a franchi la ligne en premier et empoché la prime.
+- Une transaction **FAILED** sur Solscan = Un coureur qui a essayé, mais qui est arrivé quelques millisecondes trop tard.
+
+### Comment analyser vos données Airtable ?
+
+Après 1 ou 2 semaines, filtrez vos données pour identifier les opportunités :
+
+#### 1. Chercher le "Gisement" (Niches)
+Filtrez le champ `Profit USD` entre **$50 et $500**. 
+- **Beaucoup de SUCCESS dans cette zone ?** C'est bon signe. Cela veut dire que des liquidations de petite taille se produisent régulièrement.
+- **Peu de FAILED pour ces transactions ?** C'est encore mieux ! Cela signifie que la compétition est faible sur ces montants.
+
+#### 2. Mesurer la "Férocité" (Compétition)
+Regardez une signature `SUCCESS` et cherchez si d'autres lignes Airtable ont le même `Liquidated User` au même moment mais sont `FAILED`.
+- **10 FAILED pour 1 SUCCESS** : La zone est ultra-compétitive (bots institutionnels). Danger.
+- **0 ou 1 FAILED pour 1 SUCCESS** : La zone est calme. C'est notre cible prioritaire pour la Phase 2.
+
+#### 3. Valider notre "Vitesse" (Delay MS)
+Regardez le champ `Delay MS`. Il indique combien de temps après l'arrivée du signal WebSocket notre bot a fini de traiter l'info.
+- **Moins de 50ms** : Notre code est rapide. Nous sommes prêts techniquement.
+- **Plus de 200ms** : Nous devrons optimiser le code ou changer de serveur avant de passer en Phase 2.
+
+### Le signal du "Go / No-Go"
+Vous ne devriez passer en **Phase 2 (Hunt)** que si vous trouvez au moins **3 niches par jour** où :
+1. Le profit est > $50.
+2. Il y a moins de 2 bots concurrents (FAILED) sur la même opportunité.
+3. Votre `Delay MS` moyen est stable.
+
+---
+
 ## 🔍 Outils de Diagnostic (Cross-Check)
 
 Si vous ne voyez aucune liquidation dans Airtable, vous pouvez vérifier manuellement si le marché est calme ou si le bot a un problème avec l'outil historique :
