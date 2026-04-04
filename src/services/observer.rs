@@ -6,7 +6,7 @@ use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::StreamingRpcClient;
 use crate::utils::utc_now;
 
-const KAMINO_PROGRAM_ID: &str = "KLend2VCL2syzzZbsiByMvKm9teD9NQUsc9X744rMvR";
+const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const LIQUIDATE_LOG_MARKER: &str = "Instruction: LiquidateObligation";
 
 pub struct ObserverService<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> {
@@ -306,7 +306,7 @@ mod tests {
             is_error: false,
             received_at: std::time::Instant::now(),
             logs: vec![
-                "Program KLend2VCL2syzzZbsiByMvKm9teD9NQUsc9X744rMvR invoke [1]".to_string(),
+                "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]".to_string(),
                 "Program log: Instruction: LiquidateObligation".to_string(),
                 "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF".to_string(),
                 "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111".to_string(),
@@ -344,11 +344,11 @@ mod tests {
 
     /// Logs matching the actual KLend Anchor event format observed on mainnet.
     /// Uses `lending_market`, `obligation`, `repay_reserve`, `withdraw_reserve`
-    /// as emitted by KLend2VCL2syzzZbsiByMvKm9teD9NQUsc9X744rMvR.
+    /// as emitted by KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD.
     #[test]
     fn parses_actual_klend_log_format() {
         let logs = make_logs(&[
-            "Program KLend2VCL2syzzZbsiByMvKm9teD9NQUsc9X744rMvR invoke [1]",
+            "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]",
             "Program log: Instruction: LiquidateObligation",
             "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF",
             "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111",
