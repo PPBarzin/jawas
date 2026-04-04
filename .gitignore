@@ -1,0 +1,18 @@
+# Secrets
+.env
+secrets/
+
+# Rust
+/target
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+.gemini/
+.claude/

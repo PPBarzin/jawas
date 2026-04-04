@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  jawas:
+    build: .
+    env_file: .env
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M

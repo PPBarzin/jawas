@@ -2,12 +2,16 @@ mod domain;
 mod ports;
 mod adapters;
 mod services;
+mod utils;
 
-use adapters::{airtable::AirtableAdapter, helius::HeliusAdapter};
+use adapters::{airtable::AirtableAdapter, helius::HeliusAdapter, oracle::SimplePriceOracle};
 use ports::{
     logger::{LiquidationLogger, ObservationEvent},
     rpc::RpcClient,
 };
+use services::heartbeat::HeartbeatService;
+use services::observer::ObserverService;
+use utils::utc_now;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,6 +23,9 @@ async fn main() -> anyhow::Result<()> {
     let rpc_url = std::env::var("RPC_URL")
         .expect("RPC_URL must be set in .env or environment");
 
+    let ws_url = std::env::var("WS_URL")
+        .expect("WS_URL must be set in .env or environment");
+
     let airtable_token = std::env::var("AIRTABLE_TOKEN")
         .expect("AIRTABLE_TOKEN must be set in .env or environment");
 
@@ -29,8 +36,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "Jawas-Watch".to_string());
 
     // ── 2. Build adapters ────────────────────────────────────────────────────
-    let rpc = HeliusAdapter::new(&rpc_url);
+    let rpc = HeliusAdapter::new(&rpc_url, &ws_url);
     let logger = AirtableAdapter::new(airtable_token, airtable_base_id, table_watch);
+    let oracle = SimplePriceOracle::new();
 
     // ── 3. Health check — Solana RPC ─────────────────────────────────────────
     print!("  [RPC] Connecting to Solana... ");
@@ -44,18 +52,25 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 4. Health check — Airtable ───────────────────────────────────────────
     print!("  [Airtable] Sending boot ping... ");
-    let now = utc_now();
     let ping_event = ObservationEvent {
-        timestamp: now.clone(),
-        borrower: "health-check".to_string(),
-        collateral_token: "N/A".to_string(),
-        collateral_amount: 0.0,
-        debt_repaid_usdc: 0.0,
-        profit_estimated_usd: 0.0,
-        ltv_at_liquidation: 0.0,
+        timestamp: utc_now(),
+        signature: "Jawas is alive".to_string(),
+        protocol: "N/A".to_string(),
+        market: "N/A".to_string(),
+        liquidated_user: "health-check".to_string(),
+        liquidator: "N/A".to_string(),
+        repay_mint: "N/A".to_string(),
+        withdraw_mint: "N/A".to_string(),
+        repay_symbol: "N/A".to_string(),
+        withdraw_symbol: "N/A".to_string(),
+        repay_amount: 0.0,
+        withdraw_amount: 0.0,
+        repaid_usd: 0.0,
+        withdrawn_usd: 0.0,
+        profit_usd: 0.0,
         delay_ms: 0,
         competing_bots: 0,
-        winner_tx: "Jawas is alive".to_string(),
+        status: "WATCHED".to_string(),
     };
 
     match logger.log_observation(&ping_event).await {
@@ -68,47 +83,25 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Jawas Phase 1: Ready. Watching Kamino...");
 
-    // ── 5. Main watch loop (placeholder — observer will be wired here) ───────
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        println!("[heartbeat] watching...");
-    }
-}
+    // ── 5. Spawn observer ────────────────────────────────────────────────────
+    let logger_for_observer = logger.clone();
+    let oracle_for_observer = oracle;
+    tokio::spawn(async move {
+        if let Err(e) = ObserverService::new(rpc, logger_for_observer, oracle_for_observer).watch().await {
+            eprintln!("[observer] exited with error: {}", e);
+        }
+    });
 
-/// Returns the current UTC time as an ISO 8601 string.
-/// Uses only std — no chrono dependency in main.rs.
-fn utc_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let (y, mo, d, h, mi, s) = unix_to_utc(secs);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
-}
+    // ── 6. Spawn heartbeat — every 15 minutes ────────────────────────────────
+    let logger_for_heartbeat = logger.clone();
+    tokio::spawn(async move {
+        let heartbeat = HeartbeatService::new(logger_for_heartbeat);
+        heartbeat.run(tokio::time::Duration::from_secs(15 * 60)).await;
+    });
 
-fn unix_to_utc(mut s: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let sec = s % 60; s /= 60;
-    let min = s % 60; s /= 60;
-    let hour = s % 24; s /= 24;
-    let mut days = s;
-    let mut year = 1970u64;
-    loop {
-        let days_in_year = if is_leap(year) { 366 } else { 365 };
-        if days < days_in_year { break; }
-        days -= days_in_year;
-        year += 1;
-    }
-    let months = [31u64, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut month = 0u64;
-    for &m in &months {
-        if days < m { break; }
-        days -= m;
-        month += 1;
-    }
-    (year, month + 1, days + 1, hour, min, sec)
-}
+    // ── 7. Wait for termination ──────────────────────────────────────────────
+    tokio::signal::ctrl_c().await?;
+    println!("Jawas Phase 1: Shutdown requested. Bye!");
 
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    Ok(())
 }
