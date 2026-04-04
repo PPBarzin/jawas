@@ -1,12 +1,12 @@
-version: '3.8'
-
 services:
   jawas:
     build: .
-    env_file: .env
+    container_name: JAWAS
+    env_file:
+      - .env
     restart: always
     deploy:
       resources:
         limits:
-          cpus: '1.0'
+          cpus: "1.0"
           memory: 512M
