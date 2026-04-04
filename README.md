@@ -70,6 +70,27 @@ Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable 
 
 ---
 
+## 🔍 Outils de Diagnostic (Cross-Check)
+
+Si vous ne voyez aucune liquidation dans Airtable, vous pouvez vérifier manuellement si le marché est calme ou si le bot a un problème avec l'outil historique :
+
+### Script de Cross-Check Historique
+Ce script Python scanne les dernières transactions réelles de Kamino et génère un rapport Markdown.
+
+1. **Installation :**
+   ```bash
+   pip install requests python-dotenv
+   ```
+2. **Lancement :**
+   ```bash
+   python tools/kamino_history.py
+   ```
+3. **Analyse :**
+   - Si le script trouve des liquidations que le bot n'a pas vues : **Le bot a un bug de parsing.**
+   - Si le script ne trouve rien non plus : **Le marché est simplement calme.**
+
+---
+
 ## 🛠 Dépannage (Troubleshooting)
 
 | Problème | Solution |
