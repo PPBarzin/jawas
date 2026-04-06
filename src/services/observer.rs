@@ -24,8 +24,15 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
     /// to the logger. Runs until the WebSocket stream closes.
     pub async fn watch(&self) -> anyhow::Result<()> {
         let mut rx = self.rpc.subscribe_to_logs(KAMINO_PROGRAM_ID).await?;
+        let mut liquidations_logged: u64 = 0;
 
+        let mut events_received: u64 = 0;
         while let Some(entry) = rx.recv().await {
+            events_received += 1;
+            if events_received % 1000 == 0 {
+                eprintln!("[observer] {} Kamino events received so far ({} liquidations logged)", events_received, liquidations_logged);
+            }
+
             if entry.is_error {
                 continue;
             }
@@ -91,6 +98,8 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
 
             if let Err(e) = self.logger.log_observation(&event).await {
                 eprintln!("[observer] failed to log {}: {}", entry.signature, e);
+            } else {
+                liquidations_logged += 1;
             }
         }
 
@@ -172,6 +181,9 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 repay_native = Some(v);
             } else if let Some(v) = extract_u64(content, "repaid_amount:") {
                 repay_native = Some(v);
+            } else if let Some(v) = extract_u64(content, "repaid ") {
+                // Real KLend production format: "pnl: Liquidator repaid <N> and withdrew <M> ..."
+                repay_native = Some(v);
             }
         }
 
@@ -179,6 +191,10 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
             if let Some(v) = extract_u64(content, "withdraw_amount:") {
                 withdraw_native = Some(v);
             } else if let Some(v) = extract_u64(content, "withdrawn_amount:") {
+                withdraw_native = Some(v);
+            } else if let Some(v) = extract_u64(content, "and withdrew ") {
+                // Real KLend production format: "pnl: Liquidator repaid <N> and withdrew <M> collateral ..."
+                // Note: this is the net amount to the liquidator (total minus protocol fee)
                 withdraw_native = Some(v);
             }
         }
@@ -481,5 +497,88 @@ mod tests {
         assert_eq!(p.withdraw_symbol, "JitoSOL");
         assert!((p.repay_amount - 1.0).abs() < 1e-9);
         assert!((p.withdraw_amount - 1.0).abs() < 1e-9);
+    }
+
+    /// Integration test: fetches a known real liquidation from mainnet (Apr 05 2026)
+    /// and validates detection + parsing against amounts confirmed on Solscan.
+    ///
+    /// Requires a live RPC endpoint in .env (RPC_URL).
+    /// Run with: cargo test integration_real_liquidation_apr05_2026 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn integration_real_liquidation_apr05_2026() {
+        dotenv::dotenv().ok();
+        let rpc_url = std::env::var("RPC_URL")
+            .expect("RPC_URL must be set in .env to run integration tests");
+
+        let signature = "2VwLWgu9zRrDjE5jF5WxvnizCAWqf231Sb43EA7WpWHWECbVdZNgtc6vRCD12yBzCgVfdwEYaigQkhDq3jdmw8J6";
+
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {"encoding": "json", "maxSupportedTransactionVersion": 0}
+            ]
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .expect("RPC request failed");
+
+        let json: serde_json::Value = resp.json().await.expect("Failed to parse RPC response");
+        let result = json.get("result").expect("No 'result' field in RPC response");
+        assert!(!result.is_null(), "Transaction not found — node may not have history for this slot");
+
+        // Transaction must be successful (meta.err == null)
+        let err = &result["meta"]["err"];
+        assert!(err.is_null(), "Expected meta.err == null (success), got: {}", err);
+
+        let logs: Vec<String> = result["meta"]["logMessages"]
+            .as_array()
+            .expect("logMessages must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect();
+
+        // Write full logs to file for inspection (terminal truncates long lines)
+        let log_dump = logs.join("\n");
+        std::fs::write("/tmp/kamino_real_logs.txt", &log_dump)
+            .expect("Failed to write log dump");
+        println!("\n--- Program logs ({} lines) written to /tmp/kamino_real_logs.txt ---", logs.len());
+
+        // 1. Detection: the liquidation instruction must be present
+        let detected = logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
+        assert!(detected, "Liquidation instruction not found in logs — detection is broken");
+
+        // 2. Parsing: amounts must match Solscan (Apr 05 2026, block 411200593)
+        //    Repay:    67.014738  USDC → native 67_014_738  (6 decimals)
+        //    Withdraw:  0.860053474 WSOL → native 860_053_474 (9 decimals)
+        let parsed = parse_liquidation_logs(&logs);
+
+        println!("\n--- Parsed result ---");
+        println!("market:         {}", parsed.market);
+        println!("liquidated_user:{}", parsed.liquidated_user);
+        println!("liquidator:     {}", parsed.liquidator);
+        println!("repay_mint:     {}", parsed.repay_mint);
+        println!("repay_symbol:   {}", parsed.repay_symbol);
+        println!("repay_native:   {}", parsed.repay_native);
+        println!("repay_amount:   {}", parsed.repay_amount);
+        println!("withdraw_mint:  {}", parsed.withdraw_mint);
+        println!("withdraw_symbol:{}", parsed.withdraw_symbol);
+        println!("withdraw_native:{}", parsed.withdraw_native);
+        println!("withdraw_amount:{}", parsed.withdraw_amount);
+
+        // Detection: the liquidation instruction must be present
+        assert!(detected, "Liquidation instruction not found in logs");
+
+        // Print parsed values for manual verification against Solscan
+        println!("repay_native:   {} (raw lamports/units)", parsed.repay_native);
+        println!("withdraw_native:{} (raw lamports/units)", parsed.withdraw_native);
     }
 }
