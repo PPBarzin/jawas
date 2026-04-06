@@ -7,6 +7,10 @@ edition = "2021"
 name = "jawas"
 path = "src/main.rs"
 
+[[bin]]
+name = "liquidate_one"
+path = "tools/liquidate_one.rs"
+
 [dependencies]
 tokio       = { version = "1", features = ["full"] }
 solana-client = "2"
@@ -19,3 +23,5 @@ anyhow            = "1"
 borsh             = "1"
 tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
 futures-util      = "0.3"
+sha2              = "0.10"
+base64            = "0.22"

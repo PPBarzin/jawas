@@ -5,6 +5,7 @@ use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::StreamingRpcClient;
 use crate::utils::utc_now;
+use std::io::Write;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Instruction: LiquidateObligationAndRedeemReserveCollateral";
@@ -26,11 +27,39 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
         let mut rx = self.rpc.subscribe_to_logs(KAMINO_PROGRAM_ID).await?;
         let mut liquidations_logged: u64 = 0;
 
+        // Raw event log — liquidation-related events appended as JSON lines.
+        // Only active when LOG_FILE env var is explicitly set.
+        // Not set → writes to /dev/null (no-op), so tests don't pollute the real file.
+        let log_path = std::env::var("LOG_FILE").unwrap_or_else(|_| "/dev/null".to_string());
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| anyhow::anyhow!("Cannot open log file {}: {}", log_path, e))?;
+
         let mut events_received: u64 = 0;
         while let Some(entry) = rx.recv().await {
             events_received += 1;
             if events_received % 1000 == 0 {
                 eprintln!("[observer] {} Kamino events received so far ({} liquidations logged)", events_received, liquidations_logged);
+            }
+
+            // Append to log file only if any log line mentions liquidation (case-insensitive)
+            let has_liquidation_keyword = entry.logs.iter()
+                .any(|l| l.to_ascii_lowercase().contains("liquidat"));
+            if has_liquidation_keyword {
+                let logs_json = entry.logs.iter()
+                    .map(|l| format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let line = format!(
+                    "{{\"ts\":\"{}\",\"sig\":\"{}\",\"err\":{},\"logs\":[{}]}}\n",
+                    utc_now(),
+                    entry.signature,
+                    entry.is_error,
+                    logs_json
+                );
+                let _ = log_file.write_all(line.as_bytes());
             }
 
             if entry.is_error {
