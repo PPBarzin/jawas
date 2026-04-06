@@ -122,8 +122,8 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
     let mut liquidator = "N/A".to_string();
     let mut repay_mint = "N/A".to_string();
     let mut withdraw_mint = "N/A".to_string();
-    let mut repay_native: u64 = 0;
-    let mut withdraw_native: u64 = 0;
+    let mut repay_native: Option<u64> = None;
+    let mut withdraw_native: Option<u64> = None;
 
     for line in logs {
         let content = strip_program_log_prefix(line);
@@ -141,9 +141,8 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 liquidated_user = v;
             } else if let Some(v) = extract_token(content, "borrower:") {
                 liquidated_user = v;
-            } else if let Some(v) = extract_token(content, "obligation:") {
-                liquidated_user = v;
             }
+            // `obligation:` is intentionally excluded — it is the PDA address, not the borrower's wallet
         }
 
         if liquidator == "N/A" {
@@ -168,19 +167,19 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
             }
         }
 
-        if repay_native == 0 {
+        if repay_native.is_none() {
             if let Some(v) = extract_u64(content, "repay_amount:") {
-                repay_native = v;
+                repay_native = Some(v);
             } else if let Some(v) = extract_u64(content, "repaid_amount:") {
-                repay_native = v;
+                repay_native = Some(v);
             }
         }
 
-        if withdraw_native == 0 {
+        if withdraw_native.is_none() {
             if let Some(v) = extract_u64(content, "withdraw_amount:") {
-                withdraw_native = v;
+                withdraw_native = Some(v);
             } else if let Some(v) = extract_u64(content, "withdrawn_amount:") {
-                withdraw_native = v;
+                withdraw_native = Some(v);
             }
         }
     }
@@ -188,6 +187,9 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
     // Normalization and symbols
     let repay_symbol = token_info(&repay_mint).map(|i| i.symbol.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
     let withdraw_symbol = token_info(&withdraw_mint).map(|i| i.symbol.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
+
+    let repay_native = repay_native.unwrap_or(0);
+    let withdraw_native = withdraw_native.unwrap_or(0);
 
     let repay_amount = native_to_human(repay_native, &repay_mint).unwrap_or_else(|| {
         if repay_native > 0 {
@@ -309,7 +311,7 @@ mod tests {
                 "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]".to_string(),
                 "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
                 "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF".to_string(),
-                "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111".to_string(),
+                "Program log: obligation_owner: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111".to_string(),
                 "Program log: liquidator: BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz".to_string(),
                 "Program log: repay_reserve: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
                 "Program log: withdraw_reserve: So11111111111111111111111111111111111111112".to_string(),
@@ -351,7 +353,7 @@ mod tests {
             "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]",
             "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
             "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF",
-            "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111",
+            "Program log: obligation_owner: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111",
             "Program log: liquidator: BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz",
             "Program log: repay_reserve: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             "Program log: withdraw_reserve: So11111111111111111111111111111111111111112",
@@ -429,6 +431,37 @@ mod tests {
         assert_eq!(p.repay_amount, 0.0, "unknown mint must yield 0.0 human amount");
         assert_eq!(p.withdraw_symbol, "SOL");
         assert!((p.withdraw_amount - 2.0).abs() < 1e-9);
+    }
+
+    /// `obligation:` is a PDA address, not the borrower's wallet — must not populate liquidated_user.
+    #[test]
+    fn obligation_pda_does_not_set_liquidated_user() {
+        let logs = make_logs(&[
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral",
+            "Program log: obligation: SomePdaAddress1111111111111111111111111111111",
+            "Program log: liquidator: BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz",
+        ]);
+
+        let p = parse_liquidation_logs(&logs);
+
+        assert_eq!(p.liquidated_user, "N/A", "obligation PDA must not be used as liquidated_user");
+        assert_eq!(p.liquidator, "BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz");
+    }
+
+    /// A repay_amount of 0 must be captured, not skipped due to a zero guard.
+    #[test]
+    fn zero_repay_amount_is_captured() {
+        let logs = make_logs(&[
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral",
+            "Program log: repay_amount: 0",
+            "Program log: repaid_amount: 9999999",  // fallback must NOT override the explicit 0
+            "Program log: withdraw_amount: 500000000",
+        ]);
+
+        let p = parse_liquidation_logs(&logs);
+
+        assert_eq!(p.repay_native, 0, "explicit repay_amount: 0 must be stored, not skipped");
+        assert_eq!(p.withdraw_native, 500_000_000);
     }
 
     /// jSOL / bSOL variants are recognized by the catalogue.
