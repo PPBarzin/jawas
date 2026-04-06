@@ -11,6 +11,7 @@ RUN rm -rf src/ tools/
 
 # Build the real binary
 COPY src ./src
+COPY tools ./tools
 # Trigger rebuild of the main binary
 RUN touch src/main.rs
 RUN cargo build --release
