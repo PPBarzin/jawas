@@ -7,7 +7,7 @@ use crate::ports::rpc::StreamingRpcClient;
 use crate::utils::utc_now;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Liquidate";
+const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Instruction: LiquidateObligationAndRedeemReserveCollateral";
 
 pub struct ObserverService<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> {
     rpc: R,
@@ -33,7 +33,7 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
             let is_liquidation = entry
                 .logs
                 .iter()
-                .any(|log| log.to_lowercase().contains(&KAMINO_LIQUIDATE_INSTRUCTION.to_lowercase()));
+                .any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
             if !is_liquidation {
                 continue;
             }
@@ -307,7 +307,7 @@ mod tests {
             received_at: std::time::Instant::now(),
             logs: vec![
                 "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]".to_string(),
-                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2".to_string(),
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
                 "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF".to_string(),
                 "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111".to_string(),
                 "Program log: liquidator: BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz".to_string(),
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn falls_back_gracefully_when_logs_missing() {
         let logs = make_logs(&[
-            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral",
         ]);
 
         let p = parse_liquidation_logs(&logs);

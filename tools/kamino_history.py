@@ -98,7 +98,7 @@ def is_liquidation(tx_data):
     logs = tx_data["meta"].get("logMessages")
     if not logs:
         return False
-    return any("Liquidate" in log for log in logs)
+    return any("Instruction: LiquidateObligationAndRedeemReserveCollateral" in log for log in logs)
 
 def main():
     parser = argparse.ArgumentParser(description="Scan Kamino liquidation history.")
