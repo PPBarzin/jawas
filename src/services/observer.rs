@@ -7,7 +7,7 @@ use crate::ports::rpc::StreamingRpcClient;
 use crate::utils::utc_now;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const LIQUIDATE_LOG_MARKER: &str = "Instruction: LiquidateObligation";
+const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Liquidate";
 
 pub struct ObserverService<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> {
     rpc: R,
@@ -33,7 +33,7 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
             let is_liquidation = entry
                 .logs
                 .iter()
-                .any(|log| log.contains(LIQUIDATE_LOG_MARKER));
+                .any(|log| log.to_lowercase().contains(&KAMINO_LIQUIDATE_INSTRUCTION.to_lowercase()));
             if !is_liquidation {
                 continue;
             }
@@ -307,7 +307,7 @@ mod tests {
             received_at: std::time::Instant::now(),
             logs: vec![
                 "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]".to_string(),
-                "Program log: Instruction: LiquidateObligation".to_string(),
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2".to_string(),
                 "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF".to_string(),
                 "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111".to_string(),
                 "Program log: liquidator: BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz".to_string(),
@@ -349,7 +349,7 @@ mod tests {
     fn parses_actual_klend_log_format() {
         let logs = make_logs(&[
             "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]",
-            "Program log: Instruction: LiquidateObligation",
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
             "Program log: lending_market: 7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF",
             "Program log: obligation: 9XCpqnGzLLLrHDHJPBHHHJDDabcLiquidatedUser1111",
             "Program log: liquidator: BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz",
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn parses_full_liquidation_normalization() {
         let logs = make_logs(&[
-            "Program log: Instruction: LiquidateObligation",
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
             "Program log: repay_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             "Program log: repay_amount: 5000000",    // 5.0 USDC
             "Program log: withdraw_mint: So11111111111111111111111111111111111111112",
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn falls_back_gracefully_when_logs_missing() {
         let logs = make_logs(&[
-            "Program log: Instruction: LiquidateObligation",
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
         ]);
 
         let p = parse_liquidation_logs(&logs);
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn unknown_mint_keeps_native_amount() {
         let logs = make_logs(&[
-            "Program log: Instruction: LiquidateObligation",
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
             "Program log: repay_mint: UnknownMint111111111111111111111111111111111",
             "Program log: repay_amount: 999999",
             "Program log: withdraw_mint: So11111111111111111111111111111111111111112",
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn parses_jito_sol_withdraw() {
         let logs = make_logs(&[
-            "Program log: Instruction: LiquidateObligation",
+            "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
             "Program log: repay_reserve: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             "Program log: repay_amount: 1000000",  // 1.0 USDC
             "Program log: withdraw_reserve: J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
