@@ -5,9 +5,9 @@ WORKDIR /app
 
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && mkdir -p tools && echo 'fn main() {}' > tools/liquidate_one.rs
 RUN cargo build --release
-RUN rm -rf src/
+RUN rm -rf src/ tools/
 
 # Build the real binary
 COPY src ./src
