@@ -77,7 +77,6 @@ async fn flush_batch(
                     "Repaid USD":            event.repaid_usd,
                     "Withdrawn USD":         event.withdrawn_usd,
                     "Profit USD":            event.profit_usd,
-                    "Net_Profit_Liquidation": event.profit_usd,
                     "Timestamp":             event.timestamp,
                     "Delay MS":              event.delay_ms,
                     "Competing Bots":        event.competing_bots.to_string(),
