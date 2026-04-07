@@ -5,10 +5,53 @@ use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::{RpcClient, StreamingRpcClient, TransactionInfo};
 use crate::utils::utc_now;
+use std::collections::VecDeque;
 use std::io::Write;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Instruction: LiquidateObligationAndRedeemReserveCollateral";
+const COMPETING_BOTS_WINDOW_MS: u64 = 30_000;
+
+/// Represents a failed liquidation attempt observed on-chain.
+/// Used to estimate competition for successful liquidations.
+struct FailedLiquidationAttempt {
+    received_at_ms: u64,
+    signature: String,
+    market: String,
+    repay_mint: String,
+    withdraw_mint: String,
+    repay_native: u64,
+}
+
+/// Buckets the repay amount to allow for small variations in failed attempts
+/// while still matching the same liquidation opportunity.
+///
+/// Logic: Keeps the 2 most significant digits and truncates the rest.
+/// Example: 1,234,567 -> 1,200,000.
+fn bucket_repay_native(value: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let mut v = value;
+    let mut scale = 1u64;
+    while v >= 100 {
+        v /= 10;
+        scale *= 10;
+    }
+    v * scale
+}
+
+/// Removes entries from the buffer that are older than COMPETING_BOTS_WINDOW_MS.
+fn purge_old_failed_attempts(buffer: &mut VecDeque<FailedLiquidationAttempt>, current_ts_ms: u64) {
+    let cutoff = current_ts_ms.saturating_sub(COMPETING_BOTS_WINDOW_MS);
+    while let Some(att) = buffer.front() {
+        if att.received_at_ms < cutoff {
+            buffer.pop_front();
+        } else {
+            break;
+        }
+    }
+}
 
 pub struct ObserverService<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> {
     rpc: R,
@@ -26,6 +69,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
     pub async fn watch(&self) -> anyhow::Result<()> {
         let mut rx = self.rpc.subscribe_to_logs(KAMINO_PROGRAM_ID).await?;
         let mut liquidations_logged: u64 = 0;
+        let mut failed_attempts: VecDeque<FailedLiquidationAttempt> = VecDeque::new();
 
         // Raw event log — liquidation-related events appended as JSON lines.
         // Only active when LOG_FILE env var is explicitly set.
@@ -68,11 +112,48 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 let _ = log_file.write_all(line.as_bytes());
             }
 
-            if entry.is_error || !is_liquidation {
+            if !is_liquidation {
+                continue;
+            }
+
+            if entry.is_error {
+                let parsed = parse_liquidation_logs(&entry.logs);
+                // Only track if we have all fields for the fingerprint
+                if parsed.market != "N/A" && parsed.repay_mint != "N/A" && parsed.withdraw_mint != "N/A" {
+                    // Purge on addition to keep buffer size bounded
+                    purge_old_failed_attempts(&mut failed_attempts, entry.received_at_ms);
+
+                    // Minimal deduplication: don't add if already in buffer
+                    // (30s buffer is small enough for a linear check)
+                    let already_tracked = failed_attempts.iter().any(|att| att.signature == entry.signature);
+                    if !already_tracked {
+                        failed_attempts.push_back(FailedLiquidationAttempt {
+                            received_at_ms: entry.received_at_ms,
+                            signature: entry.signature.clone(),
+                            market: parsed.market,
+                            repay_mint: parsed.repay_mint,
+                            withdraw_mint: parsed.withdraw_mint,
+                            repay_native: parsed.repay_native,
+                        });
+                    }
+                }
                 continue;
             }
 
             let parsed = parse_liquidation_logs(&entry.logs);
+
+            // Calculate competing bots
+            purge_old_failed_attempts(&mut failed_attempts, entry.received_at_ms);
+
+            let bucketed_repay = bucket_repay_native(parsed.repay_native);
+            let competing_bots = failed_attempts.iter()
+                .filter(|att| {
+                    att.market == parsed.market &&
+                    att.repay_mint == parsed.repay_mint &&
+                    att.withdraw_mint == parsed.withdraw_mint &&
+                    bucket_repay_native(att.repay_native) == bucketed_repay
+                })
+                .count();
 
             // Enrich liquidated_user, liquidator, and delay_ms from getTransaction.
             // delay_ms = websocket receive time − on-chain block time (Phase 1 approximation).
@@ -150,7 +231,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 withdrawn_usd,
                 profit_usd,
                 delay_ms,
-                competing_bots: 0,
+                competing_bots: competing_bots as u32,
                 status: "WATCHED".to_string(),
             };
 
@@ -414,7 +495,6 @@ mod tests {
             Ok("mock-1.0".to_string())
         }
         async fn get_transaction(&self, _signature: &str) -> anyhow::Result<TransactionInfo> {
-            // Return empty — tests use log-parsed values as fallback.
             Ok(TransactionInfo {
                 account_keys: vec![],
                 instruction_accounts: vec![],
@@ -458,6 +538,153 @@ mod tests {
                 _ => Ok(0.0),
             }
         }
+    }
+
+    #[test]
+    fn test_purge_old_failed_attempts() {
+        let mut buffer = VecDeque::new();
+        buffer.push_back(FailedLiquidationAttempt {
+            received_at_ms: 1000,
+            signature: "1".to_string(),
+            market: "M".to_string(),
+            repay_mint: "R".to_string(),
+            withdraw_mint: "W".to_string(),
+            repay_native: 100,
+        });
+        buffer.push_back(FailedLiquidationAttempt {
+            received_at_ms: 40_000,
+            signature: "2".to_string(),
+            market: "M".to_string(),
+            repay_mint: "R".to_string(),
+            withdraw_mint: "W".to_string(),
+            repay_native: 100,
+        });
+
+        // Window is 30s. At 40_001ms, cutoff is 10_001. Entry "1" should be purged.
+        purge_old_failed_attempts(&mut buffer, 40_001);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].signature, "2");
+    }
+
+    #[test]
+    fn test_bucket_repay_native() {
+        assert_eq!(bucket_repay_native(0), 0);
+        assert_eq!(bucket_repay_native(50), 50);
+        assert_eq!(bucket_repay_native(99), 99);
+        assert_eq!(bucket_repay_native(100), 100);
+        assert_eq!(bucket_repay_native(123), 120);
+        assert_eq!(bucket_repay_native(999), 990);
+        assert_eq!(bucket_repay_native(1000), 1000);
+        assert_eq!(bucket_repay_native(1234567), 1200000);
+    }
+
+    #[tokio::test]
+    async fn test_competing_bots_counting() {
+        let (tx, rx) = mpsc::channel(10);
+        let mock_rpc = MockRpcClient::new(rx);
+        let (mock_logger, events_shared) = MockLogger::new();
+        let mock_oracle = MockPriceOracle;
+        let service = ObserverService::new(mock_rpc, mock_logger, mock_oracle);
+
+        let market = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
+        let repay_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let withdraw_mint = "So11111111111111111111111111111111111111112";
+
+        // 1. Failed attempt 1: Out of window (will be purged on next insertion or success)
+        tx.send(LogEntry {
+            signature: "failed_out".to_string(),
+            is_error: true,
+            received_at_ms: 500,
+            logs: vec![
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
+                format!("Program log: lending_market: {}", market),
+                format!("Program log: repay_reserve: {}", repay_mint),
+                format!("Program log: withdraw_reserve: {}", withdraw_mint),
+                "Program log: repay_amount: 10000000".to_string(),
+            ],
+        }).await.unwrap();
+
+        // 2. Failed attempt 2: Duplicate signature (should be ignored)
+        tx.send(LogEntry {
+            signature: "failed_out".to_string(),
+            is_error: true,
+            received_at_ms: 600,
+            logs: vec![
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
+                format!("Program log: lending_market: {}", market),
+                format!("Program log: repay_reserve: {}", repay_mint),
+                format!("Program log: withdraw_reserve: {}", withdraw_mint),
+                "Program log: repay_amount: 10000000".to_string(),
+            ],
+        }).await.unwrap();
+
+        // 3. Failed attempt 3: Matching
+        tx.send(LogEntry {
+            signature: "failed_1".to_string(),
+            is_error: true,
+            received_at_ms: 1000,
+            logs: vec![
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
+                format!("Program log: lending_market: {}", market),
+                format!("Program log: repay_reserve: {}", repay_mint),
+                format!("Program log: withdraw_reserve: {}", withdraw_mint),
+                "Program log: repay_amount: 10000000".to_string(),
+            ],
+        }).await.unwrap();
+
+        // 4. Failed attempt 4: Matching (slight variation in repay_amount, should bucket to same)
+        tx.send(LogEntry {
+            signature: "failed_2".to_string(),
+            is_error: true,
+            received_at_ms: 2000,
+            logs: vec![
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
+                format!("Program log: lending_market: {}", market),
+                format!("Program log: repay_reserve: {}", repay_mint),
+                format!("Program log: withdraw_reserve: {}", withdraw_mint),
+                "Program log: repay_amount: 10000001".to_string(),
+            ],
+        }).await.unwrap();
+
+        // 5. Failed attempt 5: Missing withdraw_mint (should be ignored)
+        tx.send(LogEntry {
+            signature: "failed_no_withdraw".to_string(),
+            is_error: true,
+            received_at_ms: 4000,
+            logs: vec![
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
+                format!("Program log: lending_market: {}", market),
+                format!("Program log: repay_reserve: {}", repay_mint),
+                // Missing withdraw_reserve
+                "Program log: repay_amount: 10000000".to_string(),
+            ],
+        }).await.unwrap();
+
+        // 6. Successful liquidation
+        tx.send(LogEntry {
+            signature: "success".to_string(),
+            is_error: false,
+            received_at_ms: 31000, // 30.5s after failed_out (out), 30s after failed_1 (in)
+            logs: vec![
+                "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),
+                format!("Program log: lending_market: {}", market),
+                format!("Program log: repay_reserve: {}", repay_mint),
+                format!("Program log: withdraw_reserve: {}", withdraw_mint),
+                "Program log: repay_amount: 10000000".to_string(),
+                "Program log: withdraw_amount: 500000000".to_string(),
+            ],
+        }).await.unwrap();
+
+        drop(tx);
+        service.watch().await.expect("watch() failed");
+
+        let events = events_shared.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.signature, "success");
+        // Should match failed_1 and failed_2.
+        // failed_out is purged.
+        assert_eq!(event.competing_bots, 2);
     }
 
     #[tokio::test]
@@ -510,9 +737,6 @@ mod tests {
         lines.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Logs matching the actual KLend Anchor event format observed on mainnet.
-    /// Uses `lending_market`, `obligation`, `repay_reserve`, `withdraw_reserve`
-    /// as emitted by KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD.
     #[test]
     fn parses_actual_klend_log_format() {
         let logs = make_logs(&[
@@ -538,11 +762,10 @@ mod tests {
         assert_eq!(p.withdraw_symbol, "SOL");
         assert_eq!(p.repay_native, 10_000_000);
         assert_eq!(p.withdraw_native, 500_000_000);
-        assert!((p.repay_amount - 10.0).abs() < 1e-9, "repay_amount={}", p.repay_amount);
-        assert!((p.withdraw_amount - 0.5).abs() < 1e-9, "withdraw_amount={}", p.withdraw_amount);
+        assert!((p.repay_amount - 10.0).abs() < 1e-9);
+        assert!((p.withdraw_amount - 0.5).abs() < 1e-9);
     }
 
-    /// repay_mint / withdraw_mint take priority over reserve fallbacks when both are present.
     #[test]
     fn parses_full_liquidation_normalization() {
         let logs = make_logs(&[
@@ -561,7 +784,6 @@ mod tests {
         assert!((p.withdraw_amount - 0.1).abs() < 1e-9);
     }
 
-    /// Missing fields stay at their default "N/A" / 0 values without panic.
     #[test]
     fn falls_back_gracefully_when_logs_missing() {
         let logs = make_logs(&[
@@ -579,7 +801,6 @@ mod tests {
         assert_eq!(p.withdraw_amount, 0.0);
     }
 
-    /// Unknown mints produce symbol "UNKNOWN" and amount 0.0, but native amount is preserved.
     #[test]
     fn unknown_mint_keeps_native_amount() {
         let logs = make_logs(&[
@@ -594,12 +815,11 @@ mod tests {
 
         assert_eq!(p.repay_symbol, "UNKNOWN");
         assert_eq!(p.repay_native, 999_999);
-        assert_eq!(p.repay_amount, 0.0, "unknown mint must yield 0.0 human amount");
+        assert_eq!(p.repay_amount, 0.0);
         assert_eq!(p.withdraw_symbol, "SOL");
         assert!((p.withdraw_amount - 2.0).abs() < 1e-9);
     }
 
-    /// `obligation:` is a PDA address, not the borrower's wallet — must not populate liquidated_user.
     #[test]
     fn obligation_pda_does_not_set_liquidated_user() {
         let logs = make_logs(&[
@@ -610,35 +830,33 @@ mod tests {
 
         let p = parse_liquidation_logs(&logs);
 
-        assert_eq!(p.liquidated_user, "N/A", "obligation PDA must not be used as liquidated_user");
+        assert_eq!(p.liquidated_user, "N/A");
         assert_eq!(p.liquidator, "BotLiquidatorPubkeyAbCdEfGhIjKlMnOpQrStUvWxYz");
     }
 
-    /// A repay_amount of 0 must be captured, not skipped due to a zero guard.
     #[test]
     fn zero_repay_amount_is_captured() {
         let logs = make_logs(&[
             "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral",
             "Program log: repay_amount: 0",
-            "Program log: repaid_amount: 9999999",  // fallback must NOT override the explicit 0
+            "Program log: repaid_amount: 9999999",
             "Program log: withdraw_amount: 500000000",
         ]);
 
         let p = parse_liquidation_logs(&logs);
 
-        assert_eq!(p.repay_native, 0, "explicit repay_amount: 0 must be stored, not skipped");
+        assert_eq!(p.repay_native, 0);
         assert_eq!(p.withdraw_native, 500_000_000);
     }
 
-    /// jSOL / bSOL variants are recognized by the catalogue.
     #[test]
     fn parses_jito_sol_withdraw() {
         let logs = make_logs(&[
             "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateralV2",
             "Program log: repay_reserve: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "Program log: repay_amount: 1000000",  // 1.0 USDC
+            "Program log: repay_amount: 1000000",
             "Program log: withdraw_reserve: J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
-            "Program log: withdraw_amount: 1000000000", // 1.0 JitoSOL
+            "Program log: withdraw_amount: 1000000000",
         ]);
 
         let p = parse_liquidation_logs(&logs);
@@ -649,11 +867,6 @@ mod tests {
         assert!((p.withdraw_amount - 1.0).abs() < 1e-9);
     }
 
-    /// Integration test: fetches a known real liquidation from mainnet (Apr 05 2026)
-    /// and validates detection + parsing against amounts confirmed on Solscan.
-    ///
-    /// Requires a live RPC endpoint in .env (RPC_URL).
-    /// Run with: cargo test integration_real_liquidation_apr05_2026 -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
     async fn integration_real_liquidation_apr05_2026() {
@@ -683,11 +896,10 @@ mod tests {
 
         let json: serde_json::Value = resp.json().await.expect("Failed to parse RPC response");
         let result = json.get("result").expect("No 'result' field in RPC response");
-        assert!(!result.is_null(), "Transaction not found — node may not have history for this slot");
+        assert!(!result.is_null());
 
-        // Transaction must be successful (meta.err == null)
         let err = &result["meta"]["err"];
-        assert!(err.is_null(), "Expected meta.err == null (success), got: {}", err);
+        assert!(err.is_null());
 
         let logs: Vec<String> = result["meta"]["logMessages"]
             .as_array()
@@ -696,39 +908,11 @@ mod tests {
             .map(|v| v.as_str().unwrap_or("").to_string())
             .collect();
 
-        // Write full logs to file for inspection (terminal truncates long lines)
-        let log_dump = logs.join("\n");
-        std::fs::write("/tmp/kamino_real_logs.txt", &log_dump)
-            .expect("Failed to write log dump");
-        println!("\n--- Program logs ({} lines) written to /tmp/kamino_real_logs.txt ---", logs.len());
-
-        // 1. Detection: the liquidation instruction must be present
         let detected = logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
-        assert!(detected, "Liquidation instruction not found in logs — detection is broken");
+        assert!(detected);
 
-        // 2. Parsing: amounts must match Solscan (Apr 05 2026, block 411200593)
-        //    Repay:    67.014738  USDC → native 67_014_738  (6 decimals)
-        //    Withdraw:  0.860053474 WSOL → native 860_053_474 (9 decimals)
         let parsed = parse_liquidation_logs(&logs);
-
-        println!("\n--- Parsed result ---");
-        println!("market:         {}", parsed.market);
-        println!("liquidated_user:{}", parsed.liquidated_user);
-        println!("liquidator:     {}", parsed.liquidator);
-        println!("repay_mint:     {}", parsed.repay_mint);
-        println!("repay_symbol:   {}", parsed.repay_symbol);
-        println!("repay_native:   {}", parsed.repay_native);
-        println!("repay_amount:   {}", parsed.repay_amount);
-        println!("withdraw_mint:  {}", parsed.withdraw_mint);
-        println!("withdraw_symbol:{}", parsed.withdraw_symbol);
-        println!("withdraw_native:{}", parsed.withdraw_native);
-        println!("withdraw_amount:{}", parsed.withdraw_amount);
-
-        // Detection: the liquidation instruction must be present
-        assert!(detected, "Liquidation instruction not found in logs");
-
-        // Print parsed values for manual verification against Solscan
-        println!("repay_native:   {} (raw lamports/units)", parsed.repay_native);
-        println!("withdraw_native:{} (raw lamports/units)", parsed.withdraw_native);
+        assert_eq!(parsed.repay_native, 67_014_738);
+        assert_eq!(parsed.withdraw_native, 860_053_474);
     }
 }
