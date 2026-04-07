@@ -3,20 +3,20 @@
 use crate::domain::token::{native_to_human, token_info, token_mint_by_symbol};
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
-use crate::ports::rpc::StreamingRpcClient;
+use crate::ports::rpc::{RpcClient, StreamingRpcClient, TransactionInfo};
 use crate::utils::utc_now;
 use std::io::Write;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Instruction: LiquidateObligationAndRedeemReserveCollateral";
 
-pub struct ObserverService<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> {
+pub struct ObserverService<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> {
     rpc: R,
     logger: L,
     oracle: O,
 }
 
-impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverService<R, L, O> {
+impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> ObserverService<R, L, O> {
     pub fn new(rpc: R, logger: L, oracle: O) -> Self {
         Self { rpc, logger, oracle }
     }
@@ -40,9 +40,15 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
         let mut events_received: u64 = 0;
         while let Some(entry) = rx.recv().await {
             events_received += 1;
+
             if events_received % 1000 == 0 {
-                eprintln!("[observer] {} Kamino events received so far ({} liquidations logged)", events_received, liquidations_logged);
+                eprintln!(
+                    "[observer] {} Kamino events received ({} liquidations logged)",
+                    events_received, liquidations_logged
+                );
             }
+
+            let is_liquidation = entry.logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
 
             // Append to log file only if any log line mentions liquidation (case-insensitive)
             let has_liquidation_keyword = entry.logs.iter()
@@ -62,19 +68,34 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
                 let _ = log_file.write_all(line.as_bytes());
             }
 
-            if entry.is_error {
-                continue;
-            }
-
-            let is_liquidation = entry
-                .logs
-                .iter()
-                .any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
-            if !is_liquidation {
+            if entry.is_error || !is_liquidation {
                 continue;
             }
 
             let parsed = parse_liquidation_logs(&entry.logs);
+
+            // Enrich liquidated_user, liquidator, and delay_ms from getTransaction.
+            // delay_ms = websocket receive time − on-chain block time (Phase 1 approximation).
+            // Falls back to log-parsed values if getTransaction fails or accounts are missing.
+            let (liquidated_user, liquidator, delay_ms) =
+                match self.rpc.get_transaction(&entry.signature).await {
+                    Ok(tx) => {
+                        let delay = tx.block_time
+                            .map(|bt| entry.received_at_ms.saturating_sub(bt * 1000))
+                            .unwrap_or(0);
+                        match extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID) {
+                            Some((_pda, owner, liq)) => (owner, liq, delay),
+                            None => {
+                                eprintln!("[observer] could not extract liquidation accounts for {}", entry.signature);
+                                (parsed.liquidated_user, parsed.liquidator, delay)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[observer] get_transaction failed for liquidation {}: {}", entry.signature, e);
+                        (parsed.liquidated_user, parsed.liquidator, 0u64)
+                    }
+                };
 
             // Prices from KLend logs take priority (exact prices used at liquidation time);
             // fall back to oracle for tokens absent from the RefreshReservesBatch log.
@@ -92,15 +113,14 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
             let repaid_usd = parsed.repay_amount * repay_price;
             let withdrawn_usd = parsed.withdraw_amount * withdraw_price;
             let profit_usd = withdrawn_usd - repaid_usd;
-            let delay_ms = entry.received_at.elapsed().as_millis() as u64;
 
             println!(
                 "[observer] liquidation | sig={} market={} borrower={} liquidator={} \
                  repay={} {} (native={}, ${:.2}) withdraw={} {} (native={}, ${:.2}) profit=${:.2} delay={}ms",
                 entry.signature,
                 parsed.market,
-                parsed.liquidated_user,
-                parsed.liquidator,
+                liquidated_user,
+                liquidator,
                 parsed.repay_amount,
                 parsed.repay_symbol,
                 parsed.repay_native,
@@ -118,8 +138,8 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
                 signature: entry.signature.clone(),
                 protocol: "Kamino".to_string(),
                 market: parsed.market,
-                liquidated_user: parsed.liquidated_user,
-                liquidator: parsed.liquidator,
+                liquidated_user,
+                liquidator,
                 repay_mint: parsed.repay_mint,
                 withdraw_mint: parsed.withdraw_mint,
                 repay_symbol: parsed.repay_symbol,
@@ -143,6 +163,36 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
 
         Ok(())
     }
+}
+
+// ── Transaction account extraction ───────────────────────────────────────────
+
+/// Extracts (obligation_pda, obligation_owner, liquidator) from a liquidation transaction.
+///
+/// KLend `LiquidateObligationAndRedeemReserveCollateralV2` account layout (IDL order):
+///   accounts[0] = liquidator, accounts[1] = obligation, accounts[3] = obligation_owner
+///
+/// We identify the liquidation instruction as the KLend instruction with the most accounts
+/// (it has ~17 accounts; RefreshObligation/RefreshReservesBatch have far fewer).
+fn extract_klend_liquidation_accounts(
+    tx: &TransactionInfo,
+    klend_program_id: &str,
+) -> Option<(String, String, String)> {
+    let (instr_idx, _) = tx
+        .instruction_programs
+        .iter()
+        .enumerate()
+        .filter(|(_, &prog_idx)| {
+            tx.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(klend_program_id)
+        })
+        .max_by_key(|(i, _)| tx.instruction_accounts.get(*i).map(|a| a.len()).unwrap_or(0))?;
+
+    let accounts = &tx.instruction_accounts[instr_idx];
+    let liquidator   = tx.account_keys.get(*accounts.get(0)?)?.clone();
+    let obligation   = tx.account_keys.get(*accounts.get(1)?)?.clone();
+    let owner        = tx.account_keys.get(*accounts.get(3)?)?.clone();
+
+    Some((obligation, owner, liquidator))
 }
 
 // ── Log parsing ───────────────────────────────────────────────────────────────
@@ -345,7 +395,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
-    use crate::ports::rpc::LogEntry;
+    use crate::ports::rpc::{LogEntry, TransactionInfo};
 
     struct MockRpcClient {
         rx: Arc<Mutex<Option<mpsc::Receiver<LogEntry>>>>,
@@ -356,6 +406,21 @@ mod tests {
             Self {
                 rx: Arc::new(Mutex::new(Some(rx))),
             }
+        }
+    }
+
+    impl RpcClient for MockRpcClient {
+        async fn get_version(&self) -> anyhow::Result<String> {
+            Ok("mock-1.0".to_string())
+        }
+        async fn get_transaction(&self, _signature: &str) -> anyhow::Result<TransactionInfo> {
+            // Return empty — tests use log-parsed values as fallback.
+            Ok(TransactionInfo {
+                account_keys: vec![],
+                instruction_accounts: vec![],
+                instruction_programs: vec![],
+                block_time: None,
+            })
         }
     }
 
@@ -407,7 +472,7 @@ mod tests {
         let log_entry = LogEntry {
             signature: "test_signature".to_string(),
             is_error: false,
-            received_at: std::time::Instant::now(),
+            received_at_ms: 0,
             logs: vec![
                 "Program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD invoke [1]".to_string(),
                 "Program log: Instruction: LiquidateObligationAndRedeemReserveCollateral".to_string(),

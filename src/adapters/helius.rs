@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Client as HttpClient;
 use serde_json::json;
 use solana_client::rpc_client::RpcClient as SolanaRpcClient;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::ports::rpc::{LogEntry, RpcClient, StreamingRpcClient};
+use crate::ports::rpc::{LogEntry, RpcClient, StreamingRpcClient, TransactionInfo};
 
 pub struct HeliusAdapter {
     client: SolanaRpcClient,
     ws_url: String,
+    rpc_url: String,
+    http_client: HttpClient,
 }
 
 impl HeliusAdapter {
@@ -19,8 +22,10 @@ impl HeliusAdapter {
         let url = rpc_url.trim_end_matches('/').to_string();
         let ws = ws_url.trim_end_matches('/').to_string();
         Self {
-            client: SolanaRpcClient::new(url),
+            client: SolanaRpcClient::new(url.clone()),
             ws_url: ws,
+            rpc_url: url,
+            http_client: HttpClient::new(),
         }
     }
 }
@@ -32,6 +37,60 @@ impl RpcClient for HeliusAdapter {
             .get_version()
             .context("Failed to reach Solana RPC — check RPC_URL")?;
         Ok(version.solana_core)
+    }
+
+    async fn get_transaction(&self, signature: &str) -> Result<TransactionInfo> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+        });
+
+        let resp = self.http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("getTransaction HTTP request failed")?;
+
+        let body: serde_json::Value = resp.json().await.context("getTransaction response parse failed")?;
+
+        let result = &body["result"];
+        if result.is_null() {
+            anyhow::bail!("getTransaction returned null for signature {}", signature);
+        }
+
+        let account_keys: Vec<String> = result["transaction"]["message"]["accountKeys"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+
+        let raw_instructions = result["transaction"]["message"]["instructions"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .clone();
+
+        let mut instruction_accounts: Vec<Vec<usize>> = Vec::new();
+        let mut instruction_programs: Vec<usize> = Vec::new();
+
+        for instr in &raw_instructions {
+            let prog_idx = instr["programIdIndex"].as_u64().unwrap_or(0) as usize;
+            let accounts: Vec<usize> = instr["accounts"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect();
+            instruction_programs.push(prog_idx);
+            instruction_accounts.push(accounts);
+        }
+
+        let block_time = result["blockTime"].as_u64();
+
+        Ok(TransactionInfo { account_keys, instruction_accounts, instruction_programs, block_time })
     }
 }
 
@@ -71,7 +130,10 @@ impl StreamingRpcClient for HeliusAdapter {
                             eprintln!("[helius] failed to send subscribe: {e}");
                         } else {
                             while let Some(msg) = ws_stream.next().await {
-                                let received_at = std::time::Instant::now();
+                                let received_at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
                                 match msg {
                                     Ok(Message::Text(text)) => {
                                         if let Ok(value) =
@@ -103,7 +165,7 @@ impl StreamingRpcClient for HeliusAdapter {
                                                     signature,
                                                     logs,
                                                     is_error,
-                                                    received_at,
+                                                    received_at_ms,
                                                 };
                                                 if tx.send(entry).await.is_err() {
                                                     // Downstream receiver dropped — stop.
