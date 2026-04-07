@@ -1,6 +1,6 @@
 // Phase 1: Observes liquidations executed by other bots on Kamino.
 
-use crate::domain::token::{native_to_human, token_info};
+use crate::domain::token::{native_to_human, token_info, token_mint_by_symbol};
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::StreamingRpcClient;
@@ -76,9 +76,18 @@ impl<R: StreamingRpcClient, L: LiquidationLogger, O: PriceOracle> ObserverServic
 
             let parsed = parse_liquidation_logs(&entry.logs);
 
-            // Fetch prices for USD estimation
-            let repay_price = self.oracle.get_price_usd(&parsed.repay_mint).await.unwrap_or(0.0);
-            let withdraw_price = self.oracle.get_price_usd(&parsed.withdraw_mint).await.unwrap_or(0.0);
+            // Prices from KLend logs take priority (exact prices used at liquidation time);
+            // fall back to oracle for tokens absent from the RefreshReservesBatch log.
+            let repay_price = if parsed.repay_price_usd > 0.0 {
+                parsed.repay_price_usd
+            } else {
+                self.oracle.get_price_usd(&parsed.repay_mint).await.unwrap_or(0.0)
+            };
+            let withdraw_price = if parsed.withdraw_price_usd > 0.0 {
+                parsed.withdraw_price_usd
+            } else {
+                self.oracle.get_price_usd(&parsed.withdraw_mint).await.unwrap_or(0.0)
+            };
 
             let repaid_usd = parsed.repay_amount * repay_price;
             let withdrawn_usd = parsed.withdraw_amount * withdraw_price;
@@ -151,6 +160,10 @@ struct ParsedLiquidation {
     withdraw_native: u64,
     repay_amount: f64,
     withdraw_amount: f64,
+    /// Price extracted from KLend `Token: SYMBOL Price: X` log line (0.0 if absent).
+    repay_price_usd: f64,
+    /// Price extracted from KLend `Token: SYMBOL Price: X` log line (0.0 if absent).
+    withdraw_price_usd: f64,
 }
 
 /// Scans KLend Anchor program logs for liquidation data.
@@ -162,6 +175,11 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
     let mut withdraw_mint = "N/A".to_string();
     let mut repay_native: Option<u64> = None;
     let mut withdraw_native: Option<u64> = None;
+    // Keyed by raw symbol from log (e.g. "tBTC", "SOL") — populated before mint lookup.
+    let mut token_prices: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    // Raw symbols extracted from Borrow:/Deposit: lines — used for price lookup regardless of catalogue.
+    let mut repay_log_symbol: Option<String> = None;
+    let mut withdraw_log_symbol: Option<String> = None;
 
     for line in logs {
         let content = strip_program_log_prefix(line);
@@ -194,6 +212,14 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 repay_mint = v;
             } else if let Some(v) = extract_token(content, "repay_reserve:") {
                 repay_mint = v;
+            } else if let Some(rest) = content.strip_prefix("Borrow: ") {
+                // Real KLend production format: "Borrow: SYMBOL amount: X value: Y ..."
+                if let Some(sym) = rest.split_whitespace().next() {
+                    repay_log_symbol = Some(sym.to_string());
+                    if let Some(mint) = token_mint_by_symbol(sym) {
+                        repay_mint = mint.to_string();
+                    }
+                }
             }
         }
 
@@ -202,6 +228,24 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 withdraw_mint = v;
             } else if let Some(v) = extract_token(content, "withdraw_reserve:") {
                 withdraw_mint = v;
+            } else if let Some(rest) = content.strip_prefix("Deposit: ") {
+                // Real KLend production format: "Deposit: SYMBOL amount: X value: Y ..."
+                if let Some(sym) = rest.split_whitespace().next() {
+                    withdraw_log_symbol = Some(sym.to_string());
+                    if let Some(mint) = token_mint_by_symbol(sym) {
+                        withdraw_mint = mint.to_string();
+                    }
+                }
+            }
+        }
+
+        // Real KLend production format: "Token: SYMBOL Price: X.XXXX"
+        if let Some(rest) = content.strip_prefix("Token: ") {
+            let mut parts = rest.splitn(3, ' ');
+            if let (Some(sym), Some("Price:"), Some(price_str)) = (parts.next(), parts.next(), parts.next()) {
+                if let Ok(price) = price_str.trim().parse::<f64>() {
+                    token_prices.insert(sym.to_string(), price);
+                }
             }
         }
 
@@ -233,6 +277,16 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
     let repay_symbol = token_info(&repay_mint).map(|i| i.symbol.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
     let withdraw_symbol = token_info(&withdraw_mint).map(|i| i.symbol.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
 
+    // Use raw log symbol for price lookup — works even for tokens absent from the catalogue.
+    let repay_price_usd = repay_log_symbol.as_deref()
+        .and_then(|s| token_prices.get(s))
+        .copied()
+        .unwrap_or_else(|| token_prices.get(&repay_symbol).copied().unwrap_or(0.0));
+    let withdraw_price_usd = withdraw_log_symbol.as_deref()
+        .and_then(|s| token_prices.get(s))
+        .copied()
+        .unwrap_or_else(|| token_prices.get(&withdraw_symbol).copied().unwrap_or(0.0));
+
     let repay_native = repay_native.unwrap_or(0);
     let withdraw_native = withdraw_native.unwrap_or(0);
 
@@ -262,6 +316,8 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
         withdraw_native,
         repay_amount,
         withdraw_amount,
+        repay_price_usd,
+        withdraw_price_usd,
     }
 }
 

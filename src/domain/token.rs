@@ -8,6 +8,24 @@ pub struct TokenInfo {
     pub decimals: u8,
 }
 
+/// Look up a token's mint address by its symbol.
+/// Returns `None` for unknown symbols.
+pub fn token_mint_by_symbol(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "USDC" => Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        "USDT" => Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
+        "SOL" | "WSOL" => Some("So11111111111111111111111111111111111111112"),
+        "JitoSOL" | "JITOSOL" => Some("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"),
+        "mSOL" => Some("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"),
+        "bSOL" => Some("bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"),
+        "BONK" => Some("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"),
+        "WIF" => Some("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"),
+        "tBTC" => Some("6DNSN2BJsaPFdFFc1zP37kkeNe4Usc1Sqkzr9C9vPWcU"),
+        "USDG" => Some("2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH"),
+        _ => None,
+    }
+}
+
 /// Look up token metadata by mint address.
 /// Returns `None` for unknown mints.
 pub fn token_info(mint: &str) -> Option<TokenInfo> {
@@ -45,6 +63,14 @@ pub fn token_info(mint: &str) -> Option<TokenInfo> {
         }),
         "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm" => Some(TokenInfo {
             symbol: "WIF",
+            decimals: 6,
+        }),
+        "6DNSN2BJsaPFdFFc1zP37kkeNe4Usc1Sqkzr9C9vPWcU" => Some(TokenInfo {
+            symbol: "tBTC",
+            decimals: 8,
+        }),
+        "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH" => Some(TokenInfo {
+            symbol: "USDG",
             decimals: 6,
         }),
         _ => None,
