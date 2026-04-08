@@ -96,8 +96,22 @@ async fn main() -> anyhow::Result<()> {
     let oracle_for_observer = oracle;
     let rpc_for_observer = rpc;
     tokio::spawn(async move {
-        if let Err(e) = ObserverService::new(rpc_for_observer, logger_for_observer, oracle_for_observer, protocol).watch().await {
-            eprintln!("[observer] exited with error: {}", e);
+        loop {
+            println!("[observer] Starting watch loop for {}...", protocol.name());
+            let service = ObserverService::new(
+                rpc_for_observer.clone(), 
+                logger_for_observer.clone(), 
+                oracle_for_observer.clone(), 
+                protocol
+            );
+            
+            if let Err(e) = service.watch().await {
+                eprintln!("[observer] loop exited with error: {}. Restarting in 5s...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            } else {
+                println!("[observer] loop closed normally. Restarting in 5s...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
         }
     });
 

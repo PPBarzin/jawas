@@ -152,8 +152,8 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
 
             if events_received % 1000 == 0 {
                 eprintln!(
-                    "[observer] {} Kamino events received ({} liquidations logged)",
-                    events_received, liquidations_logged
+                    "[observer] {} {} events received ({} liquidations logged)",
+                    events_received, self.protocol.name(), liquidations_logged
                 );
             }
 
@@ -174,7 +174,10 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                     entry.is_error,
                     logs_json
                 );
-                let _ = log_file.write_all(line.as_bytes());
+                if let Err(e) = log_file.write_all(line.as_bytes()) {
+                    eprintln!("[observer] failed to write to log file: {}", e);
+                }
+                let _ = log_file.flush();
             }
 
             if !is_liquidation {
