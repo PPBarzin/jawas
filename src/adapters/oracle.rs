@@ -5,6 +5,7 @@ use crate::ports::oracle::PriceOracle;
 ///
 /// In Phase 2, this will be replaced or supplemented by a real-time
 /// oracle adapter (Pyth, Jupiter, etc.).
+#[derive(Clone)]
 pub struct SimplePriceOracle;
 
 impl SimplePriceOracle {

@@ -8,6 +8,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ports::rpc::{LogEntry, RpcClient, StreamingRpcClient, TransactionInfo};
 
+#[derive(Clone)]
 pub struct HeliusAdapter {
     client: SolanaRpcClient,
     ws_url: String,
