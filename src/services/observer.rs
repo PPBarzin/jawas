@@ -9,7 +9,8 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const KAMINO_LIQUIDATE_INSTRUCTION: &str = "Instruction: LiquidateObligationAndRedeemReserveCollateral";
+const KAMINO_LIQUIDATE_FILTER: &str = "Liquidate";
+const RPC_TIMEOUT_SECONDS: u64 = 120;
 const COMPETING_BOTS_WINDOW_MS: u64 = 30_000;
 
 /// Represents a failed liquidation attempt observed on-chain.
@@ -82,7 +83,46 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             .map_err(|e| anyhow::anyhow!("Cannot open log file {}: {}", log_path, e))?;
 
         let mut events_received: u64 = 0;
-        while let Some(entry) = rx.recv().await {
+        loop {
+            let next_entry = tokio::time::timeout(
+                std::time::Duration::from_secs(RPC_TIMEOUT_SECONDS),
+                rx.recv()
+            ).await;
+
+            let entry = match next_entry {
+                Ok(Some(e)) => e,
+                Ok(None) => break, // Stream closed
+                Err(_) => {
+                    let msg = format!("RPC stream timeout: no messages received for {} seconds", RPC_TIMEOUT_SECONDS);
+                    eprintln!("[observer] {}", msg);
+                    
+                    // Log timeout event to Airtable for infrastructure monitoring
+                    let timeout_event = ObservationEvent {
+                        timestamp: utc_now(),
+                        signature: format!("TIMEOUT_{}", utc_now()),
+                        protocol: "SYSTEM".to_string(),
+                        market: "N/A".to_string(),
+                        liquidated_user: "N/A".to_string(),
+                        liquidator: "N/A".to_string(),
+                        repay_mint: "N/A".to_string(),
+                        withdraw_mint: "N/A".to_string(),
+                        repay_symbol: "TIMEOUT".to_string(),
+                        withdraw_symbol: "WATCHDOG".to_string(),
+                        repay_amount: 0.0,
+                        withdraw_amount: 0.0,
+                        repaid_usd: 0.0,
+                        withdrawn_usd: 0.0,
+                        profit_usd: 0.0,
+                        delay_ms: 0,
+                        competing_bots: 0,
+                        status: "RPC_TIMEOUT".to_string(),
+                    };
+                    let _ = self.logger.log_observation(&timeout_event).await;
+
+                    return Err(anyhow::anyhow!("{}. Force reconnecting...", msg));
+                }
+            };
+
             events_received += 1;
 
             if events_received % 1000 == 0 {
@@ -92,7 +132,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 );
             }
 
-            let is_liquidation = entry.logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
+            let is_liquidation = entry.logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_FILTER));
 
             // Append to log file only if any log line mentions liquidation (case-insensitive)
             let has_liquidation_keyword = entry.logs.iter()
@@ -405,8 +445,24 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
     }
 
     // Normalization and symbols
-    let repay_symbol = token_info(&repay_mint).map(|i| i.symbol.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
-    let withdraw_symbol = token_info(&withdraw_mint).map(|i| i.symbol.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
+    let repay_symbol = token_info(&repay_mint)
+        .map(|i| i.symbol.to_string())
+        .unwrap_or_else(|| {
+            if repay_mint != "N/A" {
+                format!("UNK-{}", &repay_mint[..repay_mint.len().min(4)])
+            } else {
+                "N/A".to_string()
+            }
+        });
+    let withdraw_symbol = token_info(&withdraw_mint)
+        .map(|i| i.symbol.to_string())
+        .unwrap_or_else(|| {
+            if withdraw_mint != "N/A" {
+                format!("UNK-{}", &withdraw_mint[..withdraw_mint.len().min(4)])
+            } else {
+                "N/A".to_string()
+            }
+        });
 
     // Use raw log symbol for price lookup — works even for tokens absent from the catalogue.
     let repay_price_usd = repay_log_symbol.as_deref()
@@ -813,7 +869,7 @@ mod tests {
 
         let p = parse_liquidation_logs(&logs);
 
-        assert_eq!(p.repay_symbol, "UNKNOWN");
+        assert_eq!(p.repay_symbol, "UNK-Unkn");
         assert_eq!(p.repay_native, 999_999);
         assert_eq!(p.repay_amount, 0.0);
         assert_eq!(p.withdraw_symbol, "SOL");
@@ -908,7 +964,7 @@ mod tests {
             .map(|v| v.as_str().unwrap_or("").to_string())
             .collect();
 
-        let detected = logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_INSTRUCTION));
+        let detected = logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_FILTER));
         assert!(detected);
 
         let parsed = parse_liquidation_logs(&logs);

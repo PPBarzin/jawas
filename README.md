@@ -63,10 +63,12 @@ Pour voir ce que fait le bot en temps réel :
 docker logs -f jawas
 ```
 
-### 💓 Battement de cœur (LIFEBIT)
+### 💓 Battement de cœur (LIFEBIT) & Watchdog
 Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable (colonne `Tx Signature`).
 - Si vous voyez un LIFEBIT récent : **Tout va bien.**
 - Si le dernier LIFEBIT date de plus de 20 minutes : **Alerte.** Le bot est peut-être figé ou le RPC est déconnecté.
+
+**Nouveauté (Fiabilité) :** Le bot inclut désormais un **Watchdog RPC**. Si aucune donnée n'est reçue pendant 2 minutes, le bot considère la connexion comme "zombie" et force automatiquement une reconnexion pour ne rater aucune liquidation.
 
 ---
 
