@@ -90,8 +90,38 @@ impl RpcClient for HeliusAdapter {
 
         let block_time = result["blockTime"].as_u64();
 
-        Ok(TransactionInfo { account_keys, instruction_accounts, instruction_programs, block_time })
+        let pre_token_balances = parse_json_token_balances(&result["meta"]["preTokenBalances"]);
+        let post_token_balances = parse_json_token_balances(&result["meta"]["postTokenBalances"]);
+
+        Ok(TransactionInfo {
+            account_keys,
+            instruction_accounts,
+            instruction_programs,
+            block_time,
+            pre_token_balances,
+            post_token_balances,
+        })
     }
+}
+
+fn parse_json_token_balances(value: &serde_json::Value) -> Vec<crate::ports::rpc::TokenBalance> {
+    value
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|v| {
+            let account_index = v["accountIndex"].as_u64()? as usize;
+            let mint = v["mint"].as_str()?.to_string();
+            let owner = v["owner"].as_str()?.to_string();
+            let ui_amount = v["uiTokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
+            Some(crate::ports::rpc::TokenBalance {
+                account_index,
+                mint,
+                owner,
+                ui_amount,
+            })
+        })
+        .collect()
 }
 
 impl StreamingRpcClient for HeliusAdapter {

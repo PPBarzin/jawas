@@ -220,26 +220,48 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 })
                 .count();
 
-            // Enrich liquidated_user, liquidator, and delay_ms from getTransaction.
+            // Enrich liquidated_user, liquidator, delay_ms and amounts from getTransaction.
             // delay_ms = websocket receive time − on-chain block time (Phase 1 approximation).
             // Falls back to log-parsed values if getTransaction fails or accounts are missing.
-            let (liquidated_user, liquidator, delay_ms) =
+            let (liquidated_user, liquidator, delay_ms, repay_amount, withdraw_amount) =
                 match self.rpc.get_transaction(&entry.signature).await {
                     Ok(tx) => {
                         let delay = tx.block_time
                             .map(|bt| entry.received_at_ms.saturating_sub(bt * 1000))
                             .unwrap_or(0);
-                        match extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID) {
-                            Some((_pda, owner, liq)) => (owner, liq, delay),
-                            None => {
-                                eprintln!("[observer] could not extract liquidation accounts for {}", entry.signature);
-                                (parsed.liquidated_user, parsed.liquidator, delay)
+                        
+                        let (owner, liq) = match extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID) {
+                            Some((_pda, owner, liq)) => (owner, liq),
+                            None => (parsed.liquidated_user, parsed.liquidator),
+                        };
+
+                        // Fallback for amounts: if logs gave 0.0, try to infer from token balance changes
+                        let mut r_amt = parsed.repay_amount;
+                        let mut w_amt = parsed.withdraw_amount;
+
+                        if r_amt == 0.0 || w_amt == 0.0 {
+                            // Find balance change for the liquidator wallet
+                            for pre in &tx.pre_token_balances {
+                                if pre.owner == liq {
+                                    for post in &tx.post_token_balances {
+                                        if post.owner == liq && post.mint == pre.mint {
+                                            let diff = post.ui_amount - pre.ui_amount;
+                                            if post.mint == parsed.repay_mint && diff < 0.0 {
+                                                r_amt = diff.abs();
+                                            } else if post.mint == parsed.withdraw_mint && diff > 0.0 {
+                                                w_amt = diff;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
+
+                        (owner, liq, delay, r_amt, w_amt)
                     }
                     Err(e) => {
                         eprintln!("[observer] get_transaction failed for liquidation {}: {}", entry.signature, e);
-                        (parsed.liquidated_user, parsed.liquidator, 0u64)
+                        (parsed.liquidated_user, parsed.liquidator, 0u64, parsed.repay_amount, parsed.withdraw_amount)
                     }
                 };
 
@@ -256,8 +278,8 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 self.oracle.get_price_usd(&parsed.withdraw_mint).await.unwrap_or(0.0)
             };
 
-            let repaid_usd = parsed.repay_amount * repay_price;
-            let withdrawn_usd = parsed.withdraw_amount * withdraw_price;
+            let repaid_usd = repay_amount * repay_price;
+            let withdrawn_usd = withdraw_amount * withdraw_price;
             let profit_usd = withdrawn_usd - repaid_usd;
 
             println!(
@@ -267,11 +289,11 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 parsed.market,
                 liquidated_user,
                 liquidator,
-                parsed.repay_amount,
+                repay_amount,
                 parsed.repay_symbol,
                 parsed.repay_native,
                 repaid_usd,
-                parsed.withdraw_amount,
+                withdraw_amount,
                 parsed.withdraw_symbol,
                 parsed.withdraw_native,
                 withdrawn_usd,
@@ -290,8 +312,8 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 withdraw_mint: parsed.withdraw_mint,
                 repay_symbol: parsed.repay_symbol,
                 withdraw_symbol: parsed.withdraw_symbol,
-                repay_amount: parsed.repay_amount,
-                withdraw_amount: parsed.withdraw_amount,
+                repay_amount,
+                withdraw_amount,
                 repaid_usd,
                 withdrawn_usd,
                 profit_usd,
@@ -385,6 +407,8 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 market = v;
             } else if let Some(v) = extract_token(content, "market:") {
                 market = v;
+            } else if let Some(v) = extract_token(content, "lending_market_info:") {
+                market = v;
             }
         }
 
@@ -408,6 +432,8 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 repay_mint = v;
             } else if let Some(v) = extract_token(content, "repay_reserve:") {
                 repay_mint = v;
+            } else if let Some(v) = extract_token(content, "repay_reserve_info:") {
+                repay_mint = v;
             } else if let Some(rest) = content.strip_prefix("Borrow: ") {
                 // Real KLend production format: "Borrow: SYMBOL amount: X value: Y ..."
                 if let Some(sym) = rest.split_whitespace().next() {
@@ -423,6 +449,8 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
             if let Some(v) = extract_token(content, "withdraw_mint:") {
                 withdraw_mint = v;
             } else if let Some(v) = extract_token(content, "withdraw_reserve:") {
+                withdraw_mint = v;
+            } else if let Some(v) = extract_token(content, "withdraw_reserve_info:") {
                 withdraw_mint = v;
             } else if let Some(rest) = content.strip_prefix("Deposit: ") {
                 // Real KLend production format: "Deposit: SYMBOL amount: X value: Y ..."
@@ -581,6 +609,8 @@ mod tests {
                 instruction_accounts: vec![],
                 instruction_programs: vec![],
                 block_time: None,
+                pre_token_balances: vec![],
+                post_token_balances: vec![],
             })
         }
     }

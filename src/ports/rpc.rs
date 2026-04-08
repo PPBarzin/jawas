@@ -19,6 +19,18 @@ pub struct TransactionInfo {
     pub instruction_programs: Vec<usize>,
     /// On-chain block time (Unix seconds) from getTransaction, if available.
     pub block_time: Option<u64>,
+    /// Token balances before the transaction.
+    pub pre_token_balances: Vec<TokenBalance>,
+    /// Token balances after the transaction.
+    pub post_token_balances: Vec<TokenBalance>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenBalance {
+    pub account_index: usize,
+    pub mint: String,
+    pub owner: String,
+    pub ui_amount: f64,
 }
 
 /// Minimal RPC port for Phase 1 (read-only).
