@@ -9,9 +9,32 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const KAMINO_LIQUIDATE_FILTER: &str = "Liquidate";
+const SOLEND_PROGRAM_ID: &str = "So1endD96SRUGbs7MQLHUnJvTzMuSrf3An93Yyc9ghGi";
+const LIQUIDATE_FILTER: &str = "Liquidate";
 const RPC_TIMEOUT_SECONDS: u64 = 120;
 const COMPETING_BOTS_WINDOW_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Protocol {
+    Kamino,
+    Solend,
+}
+
+impl Protocol {
+    pub fn program_id(&self) -> &'static str {
+        match self {
+            Protocol::Kamino => KAMINO_PROGRAM_ID,
+            Protocol::Solend => SOLEND_PROGRAM_ID,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Protocol::Kamino => "Kamino",
+            Protocol::Solend => "Solend",
+        }
+    }
+}
 
 /// Represents a failed liquidation attempt observed on-chain.
 /// Used to estimate competition for successful liquidations.
@@ -58,17 +81,19 @@ pub struct ObserverService<R: StreamingRpcClient + RpcClient, L: LiquidationLogg
     rpc: R,
     logger: L,
     oracle: O,
+    protocol: Protocol,
 }
 
 impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> ObserverService<R, L, O> {
-    pub fn new(rpc: R, logger: L, oracle: O) -> Self {
-        Self { rpc, logger, oracle }
+    pub fn new(rpc: R, logger: L, oracle: O, protocol: Protocol) -> Self {
+        Self { rpc, logger, oracle, protocol }
     }
 
-    /// Subscribes to Kamino program logs and forwards each observed liquidation
+    /// Subscribes to program logs and forwards each observed liquidation
     /// to the logger. Runs until the WebSocket stream closes.
     pub async fn watch(&self) -> anyhow::Result<()> {
-        let mut rx = self.rpc.subscribe_to_logs(KAMINO_PROGRAM_ID).await?;
+        let program_id = self.protocol.program_id();
+        let mut rx = self.rpc.subscribe_to_logs(program_id).await?;
         let mut liquidations_logged: u64 = 0;
         let mut failed_attempts: VecDeque<FailedLiquidationAttempt> = VecDeque::new();
 
@@ -132,7 +157,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 );
             }
 
-            let is_liquidation = entry.logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_FILTER));
+            let is_liquidation = entry.logs.iter().any(|log| log.contains(LIQUIDATE_FILTER));
 
             // Append to log file only if any log line mentions liquidation (case-insensitive)
             let has_liquidation_keyword = entry.logs.iter()
@@ -257,7 +282,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             let event = ObservationEvent {
                 timestamp: utc_now(),
                 signature: entry.signature.clone(),
-                protocol: "Kamino".to_string(),
+                protocol: self.protocol.name().to_string(),
                 market: parsed.market,
                 liquidated_user,
                 liquidator,
@@ -640,7 +665,7 @@ mod tests {
         let mock_rpc = MockRpcClient::new(rx);
         let (mock_logger, events_shared) = MockLogger::new();
         let mock_oracle = MockPriceOracle;
-        let service = ObserverService::new(mock_rpc, mock_logger, mock_oracle);
+        let service = ObserverService::new(mock_rpc, mock_logger, mock_oracle, Protocol::Kamino);
 
         let market = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
         let repay_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -749,7 +774,7 @@ mod tests {
         let mock_rpc = MockRpcClient::new(rx);
         let (mock_logger, events_shared) = MockLogger::new();
         let mock_oracle = MockPriceOracle;
-        let service = ObserverService::new(mock_rpc, mock_logger, mock_oracle);
+        let service = ObserverService::new(mock_rpc, mock_logger, mock_oracle, Protocol::Kamino);
 
         // Inject a valid Kamino liquidation log
         let log_entry = LogEntry {
@@ -964,7 +989,7 @@ mod tests {
             .map(|v| v.as_str().unwrap_or("").to_string())
             .collect();
 
-        let detected = logs.iter().any(|log| log.contains(KAMINO_LIQUIDATE_FILTER));
+        let detected = logs.iter().any(|log| log.contains(LIQUIDATE_FILTER));
         assert!(detected);
 
         let parsed = parse_liquidation_logs(&logs);

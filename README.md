@@ -4,7 +4,11 @@
 
 ## 🎯 Objectifs du Projet
 
-Jawas est un bot de liquidation spécialisé sur le protocole **Kamino Finance** (Solana). Sa stratégie repose sur deux phases distinctes :
+Jawas est un bot de liquidation multi-protocole spécialisé sur **Solana**. Il surveille actuellement :
+- **Kamino Finance**
+- **Save Finance** (ex-Solend)
+
+Sa stratégie repose sur deux phases distinctes :
 
 - **Phase 1 : Spectateur (Watch/Observation)** — Actuellement active. Le bot observe les liquidations exécutées par d'autres acteurs sur la blockchain. Il ne dépense aucun capital et n'envoie aucune transaction. L'objectif est de collecter des données réelles pour valider la rentabilité d'une future Phase 2.
 - **Phase 2 : Chasseur de prime (Hunt/Execution)** — Non active. Le bot exécutera ses propres liquidations de manière autonome une fois la Phase 1 jugée concluante.
@@ -19,7 +23,7 @@ Chaque ligne dans Airtable représente une liquidation observée.
 | :--- | :--- |
 | **Name** | Identifiant unique (WATCH + Timestamp). |
 | **Tx Signature** | Signature de la transaction sur Solana (lien vers Solscan). |
-| **Protocol** | Le protocole ciblé (Kamino). |
+| **Protocol** | Le protocole ciblé (Kamino, Solend). |
 | **Market** | Le marché de prêt (Main, Jito, etc.). |
 | **Liquidated User** | Adresse du portefeuille liquidé. |
 | **Liquidator** | Adresse du bot ayant effectué la liquidation. |
@@ -35,20 +39,24 @@ Chaque ligne dans Airtable représente une liquidation observée.
 | **Timestamp** | Moment de l'observation (Unix ms). |
 | **Delay MS** | Temps écoulé entre la validation du bloc et la détection du bot. |
 | **Competing Bots** | Nombre d'autres bots ayant tenté la même liquidation. |
-| **Status** | Statut de l'observation (SUCCESS, FAILED). |
+| **Status** | Statut de l'observation (SUCCESS, FAILED, RPC_TIMEOUT). |
 
 ---
 
 ## 🚀 Déploiement
 
-Le bot est conteneurisé pour une stabilité maximale.
+Le bot est conteneurisé. Chaque protocole tourne dans son propre container pour une isolation maximale.
 
 1. **Préparation :** Assurez-vous d'avoir un fichier `.env` configuré à la racine.
-2. **Lancement :**
+2. **Lancement (Tous les protocoles) :**
    ```bash
    docker-compose up -d --build
    ```
-3. **Arrêt :**
+3. **Lancement d'un protocole spécifique (ex: Kamino) :**
+   ```bash
+   docker-compose up -d jawas-watch-kamino
+   ```
+4. **Arrêt :**
    ```bash
    docker-compose down
    ```
@@ -58,9 +66,10 @@ Le bot est conteneurisé pour une stabilité maximale.
 ## 📜 Surveillance & Monitoring
 
 ### Lecture des Logs
-Pour voir ce que fait le bot en temps réel :
+Chaque container a son propre flux de logs :
 ```bash
-docker logs -f jawas
+docker logs -f jawas-watch-kamino
+docker logs -f jawas-watch-solend
 ```
 
 ### 💓 Battement de cœur (LIFEBIT) & Watchdog
@@ -153,6 +162,19 @@ AIRTABLE_TABLE_WATCH=Jawas-Watch
 # Solana Gateway (QuickNode)
 RPC_URL=https://votre-endpoint-quicknode.com/
 WS_URL=wss://votre-endpoint-quicknode.com/
+```
+
+### Configuration Avancée (Multi-Tables)
+Par défaut, tous les containers envoient leurs données dans la même table Airtable (identifiée par le champ `Protocol`). Si vous souhaitez utiliser des tables séparées :
+1. Modifiez le fichier `docker-compose.yml`.
+2. Ajoutez la variable `AIRTABLE_TABLE_WATCH` sous la section `environment` du service concerné.
+
+Exemple pour Solend :
+```yaml
+  jawas-watch-solend:
+    environment:
+      - TARGET_PROTOCOL=SOLEND
+      - AIRTABLE_TABLE_WATCH=Jawas-Watch-Solend
 ```
 
 ---

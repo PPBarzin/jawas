@@ -1,12 +1,30 @@
 services:
-  jawas:
+  jawas-watch-kamino:
     build: .
-    container_name: JAWAS
+    container_name: jawas-watch-kamino
+    environment:
+      - TARGET_PROTOCOL=KAMINO
+      - LOG_FILE=kamino_raw.jsonl
     env_file:
       - .env
     restart: always
     deploy:
       resources:
         limits:
-          cpus: "1.0"
-          memory: 512M
+          cpus: "0.5"
+          memory: 256M
+
+  jawas-watch-solend:
+    build: .
+    container_name: jawas-watch-solend
+    environment:
+      - TARGET_PROTOCOL=SOLEND
+      - LOG_FILE=solend_raw.jsonl
+    env_file:
+      - .env
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M

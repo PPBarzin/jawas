@@ -10,7 +10,7 @@ use ports::{
     rpc::RpcClient,
 };
 use services::heartbeat::HeartbeatService;
-use services::observer::ObserverService;
+use services::observer::{ObserverService, Protocol};
 use utils::utc_now;
 
 #[tokio::main]
@@ -35,6 +35,14 @@ async fn main() -> anyhow::Result<()> {
     let table_watch = std::env::var("AIRTABLE_TABLE_WATCH")
         .unwrap_or_else(|_| "Jawas-Watch".to_string());
 
+    let target_protocol = std::env::var("TARGET_PROTOCOL")
+        .unwrap_or_else(|_| "KAMINO".to_string());
+
+    let protocol = match target_protocol.to_uppercase().as_str() {
+        "SOLEND" | "SAVE" => Protocol::Solend,
+        _ => Protocol::Kamino,
+    };
+
     // ── 2. Build adapters ────────────────────────────────────────────────────
     let rpc = HeliusAdapter::new(&rpc_url, &ws_url);
     let logger = AirtableAdapter::new(airtable_token, airtable_base_id, table_watch);
@@ -54,8 +62,8 @@ async fn main() -> anyhow::Result<()> {
     print!("  [Airtable] Sending boot ping... ");
     let ping_event = ObservationEvent {
         timestamp: utc_now(),
-        signature: "Jawas is alive".to_string(),
-        protocol: "N/A".to_string(),
+        signature: format!("Jawas {} is alive", protocol.name()),
+        protocol: protocol.name().to_string(),
         market: "N/A".to_string(),
         liquidated_user: "health-check".to_string(),
         liquidator: "N/A".to_string(),
@@ -81,13 +89,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("Jawas Phase 1: Ready. Watching Kamino...");
+    println!("Jawas Phase 1: Ready. Watching {}...", protocol.name());
 
     // ── 5. Spawn observer ────────────────────────────────────────────────────
     let logger_for_observer = logger.clone();
     let oracle_for_observer = oracle;
+    let rpc_for_observer = rpc;
     tokio::spawn(async move {
-        if let Err(e) = ObserverService::new(rpc, logger_for_observer, oracle_for_observer).watch().await {
+        if let Err(e) = ObserverService::new(rpc_for_observer, logger_for_observer, oracle_for_observer, protocol).watch().await {
             eprintln!("[observer] exited with error: {}", e);
         }
     });
