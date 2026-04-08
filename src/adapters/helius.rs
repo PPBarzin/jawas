@@ -8,9 +8,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ports::rpc::{LogEntry, RpcClient, StreamingRpcClient, TransactionInfo};
 
+use std::sync::Arc;
+
 #[derive(Clone)]
 pub struct HeliusAdapter {
-    client: SolanaRpcClient,
+    client: Arc<SolanaRpcClient>,
     ws_url: String,
     rpc_url: String,
     http_client: HttpClient,
@@ -23,7 +25,7 @@ impl HeliusAdapter {
         let url = rpc_url.trim_end_matches('/').to_string();
         let ws = ws_url.trim_end_matches('/').to_string();
         Self {
-            client: SolanaRpcClient::new(url.clone()),
+            client: Arc::new(SolanaRpcClient::new(url.clone())),
             ws_url: ws,
             rpc_url: url,
             http_client: HttpClient::new(),
