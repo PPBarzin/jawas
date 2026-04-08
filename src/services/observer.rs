@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const SOLEND_PROGRAM_ID: &str = "So1endD96SRUGbs7MQLHUnJvTzMuSrf3An93Yyc9ghGi";
+const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 const LIQUIDATE_FILTER: &str = "Liquidate";
 const RPC_TIMEOUT_SECONDS: u64 = 120;
 const COMPETING_BOTS_WINDOW_MS: u64 = 30_000;
