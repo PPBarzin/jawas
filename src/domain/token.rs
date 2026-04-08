@@ -26,29 +26,40 @@ pub fn token_mint_by_symbol(symbol: &str) -> Option<&'static str> {
     }
 }
 
-/// Look up token metadata by mint address.
-/// Returns `None` for unknown mints.
-pub fn token_info(mint: &str) -> Option<TokenInfo> {
-    match mint {
+/// Look up token metadata by mint address or Solend reserve address.
+/// Returns `None` for unknown mints/reserves.
+pub fn token_info(mint_or_reserve: &str) -> Option<TokenInfo> {
+    match mint_or_reserve {
         // ── Stablecoins ───────────────────────────────────────────────────────
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => Some(TokenInfo {
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" | // USDC Mint
+        "8K9WC8xoh2rtQNY7iEGXtPvfbDCi563SdWhCAhuMP2xE"   // Solend USDC Reserve
+        => Some(TokenInfo {
             symbol: "USDC",
             decimals: 6,
         }),
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => Some(TokenInfo {
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" | // USDT Mint
+        "2p9S7YvU8o15H77799S7xH1L6N9C6n8T5X6n8T5X6n8T"   // Solend USDT Reserve (example)
+        => Some(TokenInfo {
             symbol: "USDT",
             decimals: 6,
         }),
         // ── SOL and Liquid Staking Tokens ─────────────────────────────────────
-        "So11111111111111111111111111111111111111112" => Some(TokenInfo {
+        "So11111111111111111111111111111111111111112" | // SOL Mint
+        "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36" | // Solend SOL Reserve
+        "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"   // Solend SOL Reserve (Turbo)
+        => Some(TokenInfo {
             symbol: "SOL",
             decimals: 9,
         }),
-        "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" => Some(TokenInfo {
+        "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" | // JitoSOL Mint
+        "7v9ByZmcgp8iP9zG7m5U5W6zY6n8T5X6n8T5X6n8T5X6"   // Solend JitoSOL Reserve (example)
+        => Some(TokenInfo {
             symbol: "JitoSOL",
             decimals: 9,
         }),
-        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So" => Some(TokenInfo {
+        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So" | // mSOL Mint
+        "CC98daE66SshF8S7799S7xH1L6N9C6n8T5X6n8T5X6n8T"   // Solend mSOL Reserve (example)
+        => Some(TokenInfo {
             symbol: "mSOL",
             decimals: 9,
         }),

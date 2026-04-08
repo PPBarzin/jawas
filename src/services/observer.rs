@@ -243,16 +243,34 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                         let mut w_amt = parsed.withdraw_amount;
 
                         if r_amt == 0.0 || w_amt == 0.0 {
+                            let repay_info = token_info(&parsed.repay_mint);
+                            let withdraw_info = token_info(&parsed.withdraw_mint);
+
                             // Find balance change for the liquidator wallet
                             for pre in &tx.pre_token_balances {
                                 if pre.owner == liq {
                                     for post in &tx.post_token_balances {
                                         if post.owner == liq && post.mint == pre.mint {
                                             let diff = post.ui_amount - pre.ui_amount;
+                                            
+                                            // 1. Direct Mint match
                                             if post.mint == parsed.repay_mint && diff < 0.0 {
                                                 r_amt = diff.abs();
                                             } else if post.mint == parsed.withdraw_mint && diff > 0.0 {
                                                 w_amt = diff;
+                                            } 
+                                            // 2. Symbol match (for Solend where log gives Reserve Address instead of Mint)
+                                            else if let Some(post_info) = token_info(&post.mint) {
+                                                if let Some(ri) = &repay_info {
+                                                    if ri.symbol == post_info.symbol && diff < 0.0 {
+                                                        r_amt = diff.abs();
+                                                    }
+                                                }
+                                                if let Some(wi) = &withdraw_info {
+                                                    if wi.symbol == post_info.symbol && diff > 0.0 {
+                                                        w_amt = diff;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
