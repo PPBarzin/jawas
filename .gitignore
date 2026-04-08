@@ -16,3 +16,5 @@ Thumbs.db
 # Project Specific
 .gemini/
 .claude/
+*.jsonl
+*.csv
