@@ -417,12 +417,16 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
                 liquidated_user = v;
             } else if let Some(v) = extract_token(content, "borrower:") {
                 liquidated_user = v;
+            } else if let Some(v) = extract_token(content, "obligation_info:") {
+                liquidated_user = v;
             }
             // `obligation:` is intentionally excluded — it is the PDA address, not the borrower's wallet
         }
 
         if liquidator == "N/A" {
             if let Some(v) = extract_token(content, "liquidator:") {
+                liquidator = v;
+            } else if let Some(v) = extract_token(content, "user_transfer_authority_info:") {
                 liquidator = v;
             }
         }
