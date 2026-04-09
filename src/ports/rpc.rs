@@ -33,6 +33,8 @@ pub struct TokenBalance {
     pub ui_amount: f64,
 }
 
+use solana_sdk::hash::Hash;
+
 /// Minimal RPC port for Phase 1 (read-only).
 /// Expanded in Phase 2 as needed.
 #[allow(async_fn_in_trait)]
@@ -41,6 +43,8 @@ pub trait RpcClient: Send + Sync {
     async fn get_version(&self) -> Result<String>;
     /// Returns account keys and instruction accounts for a confirmed transaction.
     async fn get_transaction(&self, signature: &str) -> Result<TransactionInfo>;
+    /// Returns the latest blockhash from the network.
+    async fn get_latest_blockhash(&self) -> Result<Hash>;
 }
 
 /// Port for real-time streaming of Solana logs.

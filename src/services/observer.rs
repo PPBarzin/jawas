@@ -77,16 +77,26 @@ fn purge_old_failed_attempts(buffer: &mut VecDeque<FailedLiquidationAttempt>, cu
     }
 }
 
+use crate::domain::opportunity::LiquidationOpportunity;
+use crate::domain::position::Position;
+use tokio::sync::mpsc;
+
 pub struct ObserverService<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> {
     rpc: R,
     logger: L,
     oracle: O,
     protocol: Protocol,
+    opportunity_tx: Option<mpsc::Sender<LiquidationOpportunity>>,
 }
 
 impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> ObserverService<R, L, O> {
     pub fn new(rpc: R, logger: L, oracle: O, protocol: Protocol) -> Self {
-        Self { rpc, logger, oracle, protocol }
+        Self { rpc, logger, oracle, protocol, opportunity_tx: None }
+    }
+
+    pub fn with_opportunity_channel(mut self, tx: mpsc::Sender<LiquidationOpportunity>) -> Self {
+        self.opportunity_tx = Some(tx);
+        self
     }
 
     /// Subscribes to program logs and forwards each observed liquidation
@@ -233,7 +243,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                             .map(|bt| entry.received_at_ms.saturating_sub(bt * 1000))
                             .unwrap_or(0);
                         
-                        let (obligation_pda, owner, liq) = match self.protocol {
+                        let (_obligation_pda, owner, liq) = match self.protocol {
                             Protocol::Kamino => extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID)
                                 .unwrap_or(("N/A".to_string(), parsed.liquidated_user.clone(), parsed.liquidator.clone())),
                             Protocol::Solend => extract_solend_liquidation_accounts(&tx, SOLEND_PROGRAM_ID)
@@ -328,13 +338,13 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 timestamp: utc_now(),
                 signature: entry.signature.clone(),
                 protocol: self.protocol.name().to_string(),
-                market: parsed.market,
-                liquidated_user,
-                liquidator,
-                repay_mint: parsed.repay_mint,
-                withdraw_mint: parsed.withdraw_mint,
-                repay_symbol: parsed.repay_symbol,
-                withdraw_symbol: parsed.withdraw_symbol,
+                market: parsed.market.clone(),
+                liquidated_user: liquidated_user.clone(),
+                liquidator: liquidator.clone(),
+                repay_mint: parsed.repay_mint.clone(),
+                withdraw_mint: parsed.withdraw_mint.clone(),
+                repay_symbol: parsed.repay_symbol.clone(),
+                withdraw_symbol: parsed.withdraw_symbol.clone(),
                 repay_amount,
                 withdraw_amount,
                 repaid_usd,
@@ -344,6 +354,30 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 competing_bots: competing_bots as u32,
                 status: "WATCHED".to_string(),
             };
+
+            // Phase 2: Send opportunity to HunterService
+            if let Some(tx) = &self.opportunity_tx {
+                let opportunity = LiquidationOpportunity {
+                    position: Position {
+                        wallet: liquidated_user,
+                        collateral_token: parsed.withdraw_symbol,
+                        collateral_amount: withdraw_amount,
+                        collateral_value_usd: withdrawn_usd,
+                        debt_token: parsed.repay_symbol,
+                        debt_amount: repay_amount,
+                        debt_value_usd: repaid_usd,
+                        last_updated_slot: 0, // Not available from logs easily
+                    },
+                    liquidation_threshold: 0.0, // Should be fetched from Reserve in Phase 2
+                    bonus_pct: if repaid_usd > 0.0 { profit_usd / repaid_usd } else { 0.0 },
+                    detected_at_ms: entry.received_at_ms,
+                    repay_mint: parsed.repay_mint,
+                    withdraw_mint: parsed.withdraw_mint,
+                    repay_amount_native: parsed.repay_native,
+                    withdraw_amount_native: parsed.withdraw_native,
+                };
+                let _ = tx.send(opportunity).await;
+            }
 
             if let Err(e) = self.logger.log_observation(&event).await {
                 eprintln!("[observer] failed to log {}: {}", entry.signature, e);

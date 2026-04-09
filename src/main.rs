@@ -4,36 +4,55 @@ mod adapters;
 mod services;
 mod utils;
 
-use adapters::{airtable::AirtableAdapter, helius::HeliusAdapter, oracle::SimplePriceOracle};
-use ports::{
-    logger::{LiquidationLogger, ObservationEvent},
-    rpc::RpcClient,
+use adapters::{
+    airtable::AirtableAdapter, 
+    helius::HeliusAdapter, 
+    oracle::SimplePriceOracle,
+    jito::JitoAdapter,
+    jupiter::JupiterAdapter,
 };
+use ports::rpc::RpcClient;
 use services::heartbeat::HeartbeatService;
 use services::observer::{ObserverService, Protocol};
-use utils::utc_now;
+use services::hunter::HunterService;
+use solana_sdk::signature::read_keypair_file;
+use solana_sdk::signer::Signer;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    println!("Jawas Phase 1: Booting...");
+    println!("Jawas Phase 2: Booting...");
 
     // ── 1. Load config from environment ─────────────────────────────────────
-    let rpc_url = std::env::var("RPC_URL")
-        .expect("RPC_URL must be set in .env or environment");
+    let observer_rpc_url = std::env::var("OBSERVER_RPC_URL")
+        .or_else(|_| std::env::var("RPC_URL"))
+        .expect("OBSERVER_RPC_URL or RPC_URL must be set");
 
-    let ws_url = std::env::var("WS_URL")
-        .expect("WS_URL must be set in .env or environment");
+    let observer_ws_url = std::env::var("OBSERVER_WS_URL")
+        .or_else(|_| std::env::var("WS_URL"))
+        .expect("OBSERVER_WS_URL or WS_URL must be set");
+
+    let hunter_rpc_url = std::env::var("HUNTER_RPC_URL")
+        .or_else(|_| std::env::var("RPC_URL"))
+        .expect("HUNTER_RPC_URL or RPC_URL must be set");
+
+    let hunter_ws_url = std::env::var("HUNTER_WS_URL")
+        .or_else(|_| std::env::var("WS_URL"))
+        .expect("HUNTER_WS_URL or WS_URL must be set");
 
     let airtable_token = std::env::var("AIRTABLE_TOKEN")
-        .expect("AIRTABLE_TOKEN must be set in .env or environment");
+        .expect("AIRTABLE_TOKEN must be set");
 
     let airtable_base_id = std::env::var("AIRTABLE_BASE_ID")
-        .expect("AIRTABLE_BASE_ID must be set in .env or environment");
+        .expect("AIRTABLE_BASE_ID must be set");
 
-    let table_watch = std::env::var("AIRTABLE_TABLE_WATCH")
-        .unwrap_or_else(|_| "Jawas-Watch".to_string());
+    let keypair_path = std::env::var("SOLANA_KEYPAIR_PATH").ok();
+    
+    let jito_url = std::env::var("JITO_URL")
+        .unwrap_or_else(|_| "https://mainnet.block-engine.jito.wtf/api/v1/bundles".to_string());
 
     let target_protocol = std::env::var("TARGET_PROTOCOL")
         .unwrap_or_else(|_| "KAMINO".to_string());
@@ -44,13 +63,37 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── 2. Build adapters ────────────────────────────────────────────────────
-    let rpc = HeliusAdapter::new(&rpc_url, &ws_url);
-    let logger = AirtableAdapter::new(airtable_token, airtable_base_id, table_watch);
+    let observer_rpc = HeliusAdapter::new(&observer_rpc_url, &observer_ws_url);
+    let hunter_rpc = HeliusAdapter::new(&hunter_rpc_url, &hunter_ws_url);
+    let logger = AirtableAdapter::new(airtable_token, airtable_base_id, "Jawas-Watch".to_string());
     let oracle = SimplePriceOracle::new();
+    let jito = JitoAdapter::new(&jito_url);
+    let jupiter = JupiterAdapter::new(None);
 
-    // ── 3. Health check — Solana RPC ─────────────────────────────────────────
-    print!("  [RPC] Connecting to Solana... ");
-    match rpc.get_version().await {
+    // ── 3. Load Keypair if Hunter mode is enabled ───────────────────────────
+    let hunter_service = if let Some(path) = keypair_path {
+        println!("  [Hunter] Loading keypair from {}...", path);
+        let keypair = Arc::new(read_keypair_file(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read keypair: {}", e))?);
+        println!("  [Hunter] Wallet: {}", keypair.pubkey());
+        
+        Some(HunterService::new(
+            hunter_rpc.clone(),
+            jito,
+            jupiter,
+            oracle.clone(),
+            logger.clone(), // AirtableAdapter implements ConfigPort
+            keypair,
+            540.0, // Max 500 EUR approx
+        ))
+    } else {
+        println!("  [Hunter] No keypair provided. Running in WATCH mode only.");
+        None
+    };
+
+    // ── 4. Health check — Solana RPC ─────────────────────────────────────────
+    print!("  [RPC] Connecting to Solana (Observer)... ");
+    match observer_rpc.get_version().await {
         Ok(version) => println!("OK (solana-core {})", version),
         Err(e) => {
             eprintln!("FAILED\n  → {}", e);
@@ -58,43 +101,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── 4. Health check — Airtable ───────────────────────────────────────────
-    print!("  [Airtable] Sending boot ping... ");
-    let ping_event = ObservationEvent {
-        timestamp: utc_now(),
-        signature: format!("Jawas {} is alive", protocol.name()),
-        protocol: protocol.name().to_string(),
-        market: "N/A".to_string(),
-        liquidated_user: "health-check".to_string(),
-        liquidator: "N/A".to_string(),
-        repay_mint: "N/A".to_string(),
-        withdraw_mint: "N/A".to_string(),
-        repay_symbol: "N/A".to_string(),
-        withdraw_symbol: "N/A".to_string(),
-        repay_amount: 0.0,
-        withdraw_amount: 0.0,
-        repaid_usd: 0.0,
-        withdrawn_usd: 0.0,
-        profit_usd: 0.0,
-        delay_ms: 0,
-        competing_bots: 0,
-        status: "WATCHED".to_string(),
-    };
+    // ── 5. Setup Communication ──────────────────────────────────────────────
+    let (opp_tx, opp_rx) = mpsc::channel(100);
 
-    match logger.log_observation(&ping_event).await {
-        Ok(_) => println!("OK"),
-        Err(e) => {
-            eprintln!("FAILED\n  → {}", e);
-            std::process::exit(1);
-        }
+    // ── 6. Spawn Hunter ──────────────────────────────────────────────────────
+    if let Some(hunter) = hunter_service {
+        tokio::spawn(async move {
+            if let Err(e) = hunter.run(opp_rx).await {
+                eprintln!("[hunter] service exited with error: {}", e);
+            }
+        });
     }
 
-    println!("Jawas Phase 1: Ready. Watching {}...", protocol.name());
-
-    // ── 5. Spawn observer ────────────────────────────────────────────────────
+    // ── 7. Spawn observer ────────────────────────────────────────────────────
     let logger_for_observer = logger.clone();
     let oracle_for_observer = oracle;
-    let rpc_for_observer = rpc;
+    let rpc_for_observer = observer_rpc;
     tokio::spawn(async move {
         loop {
             println!("[observer] Starting watch loop for {}...", protocol.name());
@@ -103,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 logger_for_observer.clone(), 
                 oracle_for_observer.clone(), 
                 protocol
-            );
+            ).with_opportunity_channel(opp_tx.clone());
             
             if let Err(e) = service.watch().await {
                 eprintln!("[observer] loop exited with error: {}. Restarting in 5s...", e);
@@ -115,16 +137,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ── 6. Spawn heartbeat — every 15 minutes ────────────────────────────────
+    // ── 8. Spawn heartbeat ───────────────────────────────────────────────────
     let logger_for_heartbeat = logger.clone();
     tokio::spawn(async move {
         let heartbeat = HeartbeatService::new(logger_for_heartbeat);
         heartbeat.run(tokio::time::Duration::from_secs(15 * 60)).await;
     });
 
-    // ── 7. Wait for termination ──────────────────────────────────────────────
+    // ── 9. Wait for termination ──────────────────────────────────────────────
     tokio::signal::ctrl_c().await?;
-    println!("Jawas Phase 1: Shutdown requested. Bye!");
+    println!("Jawas Phase 2: Shutdown requested. Bye!");
 
     Ok(())
 }

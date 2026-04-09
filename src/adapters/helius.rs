@@ -105,6 +105,33 @@ impl RpcClient for HeliusAdapter {
             post_token_balances,
         })
     }
+
+    async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": []
+        });
+
+        let resp = self.http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("getLatestBlockhash HTTP request failed")?;
+
+        let body: serde_json::Value = resp.json().await.context("getLatestBlockhash response parse failed")?;
+        let hash_str = body["result"]["value"]["blockhash"]
+            .as_str()
+            .context("blockhash missing in response")?;
+
+        use std::str::FromStr;
+        let hash = solana_sdk::hash::Hash::from_str(hash_str)
+            .map_err(|e| anyhow::anyhow!("Invalid blockhash format: {}", e))?;
+
+        Ok(hash)
+    }
 }
 
 fn parse_json_token_balances(value: &serde_json::Value) -> Vec<crate::ports::rpc::TokenBalance> {

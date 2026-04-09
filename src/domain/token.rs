@@ -38,7 +38,8 @@ pub fn token_info(mint_or_reserve: &str) -> Option<TokenInfo> {
             decimals: 6,
         }),
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" | // USDT Mint
-        "2p9S7YvU8o15H77799S7xH1L6N9C6n8T5X6n8T5X6n8T"   // Solend USDT Reserve (example)
+        "2p9S7YvU8o15H77799S7xH1L6N9C6n8T5X6n8T5X6n8T" | // Solend USDT Reserve (example)
+        "8739Sstz9LueAnSgpKbaL6Z8atY6YdZPyv7mB7U75JAs"   // Solend USDT Reserve (Real)
         => Some(TokenInfo {
             symbol: "USDT",
             decimals: 6,
@@ -52,7 +53,8 @@ pub fn token_info(mint_or_reserve: &str) -> Option<TokenInfo> {
             decimals: 9,
         }),
         "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" | // JitoSOL Mint
-        "7v9ByZmcgp8iP9zG7m5U5W6zY6n8T5X6n8T5X6n8T5X6"   // Solend JitoSOL Reserve (example)
+        "7v9ByZmcgp8iP9zG7m5U5W6zY6n8T5X6n8T5X6n8T5X6" | // Solend JitoSOL Reserve (example)
+        "6757fL8Y2Nf86QWp86Z99tWhUshAonqWfNnEAn85BPh"   // Solend JitoSOL Reserve (Real)
         => Some(TokenInfo {
             symbol: "JitoSOL",
             decimals: 9,
@@ -63,6 +65,7 @@ pub fn token_info(mint_or_reserve: &str) -> Option<TokenInfo> {
             symbol: "mSOL",
             decimals: 9,
         }),
+
         "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1" => Some(TokenInfo {
             symbol: "bSOL",
             decimals: 9,

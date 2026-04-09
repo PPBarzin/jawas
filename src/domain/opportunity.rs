@@ -12,4 +12,10 @@ pub struct LiquidationOpportunity {
     pub bonus_pct: f64,
     /// Unix timestamp (ms) when the opportunity was detected
     pub detected_at_ms: u64,
+
+    // Phase 2: Actionable fields for the executor
+    pub repay_mint: String,
+    pub withdraw_mint: String,
+    pub repay_amount_native: u64,
+    pub withdraw_amount_native: u64,
 }
