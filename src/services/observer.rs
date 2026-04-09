@@ -233,9 +233,11 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                             .map(|bt| entry.received_at_ms.saturating_sub(bt * 1000))
                             .unwrap_or(0);
                         
-                        let (owner, liq) = match extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID) {
-                            Some((_pda, owner, liq)) => (owner, liq),
-                            None => (parsed.liquidated_user, parsed.liquidator),
+                        let (obligation_pda, owner, liq) = match self.protocol {
+                            Protocol::Kamino => extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID)
+                                .unwrap_or(("N/A".to_string(), parsed.liquidated_user.clone(), parsed.liquidator.clone())),
+                            Protocol::Solend => extract_solend_liquidation_accounts(&tx, SOLEND_PROGRAM_ID)
+                                .unwrap_or(("N/A".to_string(), parsed.liquidated_user.clone(), parsed.liquidator.clone())),
                         };
 
                         // Fallback for amounts: if logs gave 0.0, try to infer from token balance changes
@@ -259,7 +261,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                                             } else if post.mint == parsed.withdraw_mint && diff > 0.0 {
                                                 w_amt = diff;
                                             } 
-                                            // 2. Symbol match (for Solend where log gives Reserve Address instead of Mint)
+                                            // 2. Symbol match (handles Solend where log gives Reserve Address instead of Mint)
                                             else if let Some(post_info) = token_info(&post.mint) {
                                                 if let Some(ri) = &repay_info {
                                                     if ri.symbol == post_info.symbol && diff < 0.0 {
@@ -380,6 +382,32 @@ fn extract_klend_liquidation_accounts(
     let liquidator   = tx.account_keys.get(*accounts.get(0)?)?.clone();
     let obligation   = tx.account_keys.get(*accounts.get(1)?)?.clone();
     let owner        = tx.account_keys.get(*accounts.get(3)?)?.clone();
+
+    Some((obligation, owner, liquidator))
+}
+
+/// Extracts (obligation_pda, obligation_owner, liquidator) from a Solend liquidation transaction.
+///
+/// Solend `LiquidateObligationAndRedeemReserveCollateral` account layout (IDL order):
+///   accounts[5] = obligation, accounts[8] = liquidator (user_transfer_authority)
+/// Note: Solend doesn't include the obligation_owner in the instruction accounts.
+fn extract_solend_liquidation_accounts(
+    tx: &TransactionInfo,
+    solend_program_id: &str,
+) -> Option<(String, String, String)> {
+    let (instr_idx, _) = tx
+        .instruction_programs
+        .iter()
+        .enumerate()
+        .filter(|(_, &prog_idx)| {
+            tx.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(solend_program_id)
+        })
+        .max_by_key(|(i, _)| tx.instruction_accounts.get(*i).map(|a| a.len()).unwrap_or(0))?;
+
+    let accounts = &tx.instruction_accounts[instr_idx];
+    let liquidator = tx.account_keys.get(*accounts.get(8)?)?.clone();
+    let obligation = tx.account_keys.get(*accounts.get(5)?)?.clone();
+    let owner      = "N/A".to_string(); // Not in accounts, logs might have it
 
     Some((obligation, owner, liquidator))
 }
