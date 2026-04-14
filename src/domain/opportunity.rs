@@ -5,6 +5,7 @@ use crate::domain::position::Position;
 /// Pure domain struct — zero external dependencies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiquidationOpportunity {
+    pub market: String,
     pub position: Position,
     /// Kamino liquidation threshold (e.g. 0.85 for 85% LTV)
     pub liquidation_threshold: f64,

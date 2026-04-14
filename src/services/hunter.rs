@@ -112,7 +112,9 @@ fn ix_refresh_obligation(
     Instruction { program_id: *klend, accounts, data: disc.to_vec() }
 }
 
-pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + Clone> {
+use crate::ports::logger::{LiquidationLogger, ObservationEvent};
+
+pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + LiquidationLogger + Clone> {
     hunter_rpc: R,
     jito: JI,
     jupiter: JU,
@@ -122,7 +124,7 @@ pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOr
     max_repay_usd: f64,
 }
 
-impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + Clone + 'static> HunterService<R, JI, JU, O, C> {
+impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + LiquidationLogger + Clone + 'static> HunterService<R, JI, JU, O, C> {
     pub fn new(
         hunter_rpc: R,
         jito: JI,
@@ -243,11 +245,11 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         let timestamp = crate::utils::utc_now();
         
         // Base event for logging
-        let mut event = crate::ports::logger::ObservationEvent {
+        let mut event = ObservationEvent {
             timestamp: timestamp.clone(),
             signature: "N/A".to_string(),
             protocol: "Kamino".to_string(),
-            market: opportunity.position.market.clone(),
+            market: opportunity.market.clone(),
             liquidated_user: opportunity.position.wallet.clone(),
             liquidator: self.keypair.pubkey().to_string(),
             repay_mint: opportunity.repay_mint.clone(),

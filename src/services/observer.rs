@@ -358,6 +358,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             // Phase 2: Send opportunity to HunterService
             if let Some(tx) = &self.opportunity_tx {
                 let opportunity = LiquidationOpportunity {
+                    market: parsed.market.clone(),
                     position: Position {
                         wallet: liquidated_user,
                         collateral_token: parsed.withdraw_symbol,
