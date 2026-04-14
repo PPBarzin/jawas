@@ -168,11 +168,12 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             }
 
             let is_liquidation = entry.logs.iter().any(|log| log.contains(LIQUIDATE_FILTER));
+            let is_truncated = entry.logs.iter().any(|log| log.contains("[truncated]"));
 
-            // Append to log file only if any log line mentions liquidation (case-insensitive)
+            // Append to log file only if any log line mentions liquidation OR if it's truncated (potential hidden liquidation)
             let has_liquidation_keyword = entry.logs.iter()
                 .any(|l| l.to_ascii_lowercase().contains("liquidat"));
-            if has_liquidation_keyword {
+            if has_liquidation_keyword || is_truncated {
                 let logs_json = entry.logs.iter()
                     .map(|l| format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")))
                     .collect::<Vec<_>>()
@@ -190,7 +191,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 let _ = log_file.flush();
             }
 
-            if !is_liquidation {
+            if !is_liquidation && !is_truncated {
                 continue;
             }
 
@@ -243,12 +244,17 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                             .map(|bt| entry.received_at_ms.saturating_sub(bt * 1000))
                             .unwrap_or(0);
                         
-                        let (_obligation_pda, owner, liq) = match self.protocol {
+                        let (_obligation_pda, owner, mut liq) = match self.protocol {
                             Protocol::Kamino => extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID)
                                 .unwrap_or(("N/A".to_string(), parsed.liquidated_user.clone(), parsed.liquidator.clone())),
                             Protocol::Solend => extract_solend_liquidation_accounts(&tx, SOLEND_PROGRAM_ID)
                                 .unwrap_or(("N/A".to_string(), parsed.liquidated_user.clone(), parsed.liquidator.clone())),
                         };
+
+                        // Fallback: If liquidator is still N/A (e.g. truncated logs), use the transaction signer
+                        if (liq == "N/A" || liq.is_empty()) && !tx.account_keys.is_empty() {
+                            liq = tx.account_keys[0].clone();
+                        }
 
                         // Fallback for amounts: if logs gave 0.0, try to infer from token balance changes
                         let mut r_amt = parsed.repay_amount;
