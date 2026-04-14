@@ -243,6 +243,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 
     async fn handle_opportunity(&self, opportunity: LiquidationOpportunity) -> anyhow::Result<()> {
         let timestamp = crate::utils::utc_now();
+        println!("[hunter] analyzing opportunity for user {} on {}...", opportunity.position.wallet, opportunity.market);
         
         // Base event for logging
         let mut event = ObservationEvent {
@@ -268,6 +269,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 
         // 1. Filter by amount
         if opportunity.position.debt_value_usd > self.max_repay_usd {
+            println!("[hunter] opportunity ignored: debt ({:.2} USD) exceeds max_repay_usd ({:.2} USD)", opportunity.position.debt_value_usd, self.max_repay_usd);
             event.status = "IGNORED_CAPITAL".to_string();
             let _ = self.config.log_observation(&event).await;
             return Ok(());
@@ -290,6 +292,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         event.profit_usd = estimated_profit_usd;
         
         if estimated_profit_usd < 1.0 { // Minimum 1$ profit
+            println!("[hunter] opportunity ignored: estimated profit ({:.2} USD) is too low (threshold: 1.00 USD)", estimated_profit_usd);
             event.status = "IGNORED_LOW_PROFIT".to_string();
             let _ = self.config.log_observation(&event).await;
             return Ok(());

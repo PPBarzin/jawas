@@ -50,60 +50,72 @@ impl RpcClient for HeliusAdapter {
             "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
         });
 
-        let resp = self.http_client
-            .post(&self.rpc_url)
-            .json(&payload)
-            .send()
-            .await
-            .context("getTransaction HTTP request failed")?;
+        let mut attempts = 0;
+        let max_attempts = 3;
 
-        let body: serde_json::Value = resp.json().await.context("getTransaction response parse failed")?;
+        loop {
+            let resp = self.http_client
+                .post(&self.rpc_url)
+                .json(&payload)
+                .send()
+                .await
+                .context("getTransaction HTTP request failed")?;
 
-        let result = &body["result"];
-        if result.is_null() {
-            anyhow::bail!("getTransaction returned null for signature {}", signature);
+            let body: serde_json::Value = resp.json().await.context("getTransaction response parse failed")?;
+
+            let result = &body["result"];
+            
+            if !result.is_null() {
+                let account_keys: Vec<String> = result["transaction"]["message"]["accountKeys"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+
+                let raw_instructions = result["transaction"]["message"]["instructions"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .clone();
+
+                let mut instruction_accounts: Vec<Vec<usize>> = Vec::new();
+                let mut instruction_programs: Vec<usize> = Vec::new();
+
+                for instr in &raw_instructions {
+                    let prog_idx = instr["programIdIndex"].as_u64().unwrap_or(0) as usize;
+                    let accounts: Vec<usize> = instr["accounts"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect();
+                    instruction_programs.push(prog_idx);
+                    instruction_accounts.push(accounts);
+                }
+
+                let block_time = result["blockTime"].as_u64();
+
+                let pre_token_balances = parse_json_token_balances(&result["meta"]["preTokenBalances"]);
+                let post_token_balances = parse_json_token_balances(&result["meta"]["postTokenBalances"]);
+
+                return Ok(TransactionInfo {
+                    account_keys,
+                    instruction_accounts,
+                    instruction_programs,
+                    block_time,
+                    pre_token_balances,
+                    post_token_balances,
+                });
+            }
+
+            attempts += 1;
+            if attempts >= max_attempts {
+                anyhow::bail!("getTransaction returned null for signature {} after {} attempts", signature, max_attempts);
+            }
+
+            // Wait 500ms before retrying to allow the RPC to index the transaction
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
-
-        let account_keys: Vec<String> = result["transaction"]["message"]["accountKeys"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-
-        let raw_instructions = result["transaction"]["message"]["instructions"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .clone();
-
-        let mut instruction_accounts: Vec<Vec<usize>> = Vec::new();
-        let mut instruction_programs: Vec<usize> = Vec::new();
-
-        for instr in &raw_instructions {
-            let prog_idx = instr["programIdIndex"].as_u64().unwrap_or(0) as usize;
-            let accounts: Vec<usize> = instr["accounts"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .collect();
-            instruction_programs.push(prog_idx);
-            instruction_accounts.push(accounts);
-        }
-
-        let block_time = result["blockTime"].as_u64();
-
-        let pre_token_balances = parse_json_token_balances(&result["meta"]["preTokenBalances"]);
-        let post_token_balances = parse_json_token_balances(&result["meta"]["postTokenBalances"]);
-
-        Ok(TransactionInfo {
-            account_keys,
-            instruction_accounts,
-            instruction_programs,
-            block_time,
-            pre_token_balances,
-            post_token_balances,
-        })
     }
 
     async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash> {
