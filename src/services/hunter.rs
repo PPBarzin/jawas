@@ -120,7 +120,6 @@ pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOr
     config: C,
     keypair: Arc<Keypair>,
     max_repay_usd: f64,
-    whitelist: Arc<RwLock<Vec<String>>>,
 }
 
 impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + Clone + 'static> HunterService<R, JI, JU, O, C> {
@@ -141,37 +140,12 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             config,
             keypair,
             max_repay_usd,
-            whitelist: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     pub async fn run(&self, mut rx: mpsc::Receiver<LiquidationOpportunity>) -> anyhow::Result<()> {
         println!("[hunter] Hunter service started. Wallet: {} | Max repay: ${:.2}", self.keypair.pubkey(), self.max_repay_usd);
         
-        // Initial whitelist fetch
-        if let Ok(wl) = self.config.fetch_whitelist().await {
-            let mut lock = self.whitelist.write().await;
-            *lock = wl;
-            println!("[hunter] Whitelist loaded: {} tokens", lock.len());
-        }
-
-        // Spawn background refresh for whitelist (every 5 minutes)
-        let config_clone = self.config.clone();
-        let whitelist_clone = self.whitelist.clone();
-        tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(300)).await;
-                match config_clone.fetch_whitelist().await {
-                    Ok(wl) => {
-                        let mut lock = whitelist_clone.write().await;
-                        *lock = wl;
-                        println!("[hunter] Whitelist refreshed: {} tokens", lock.len());
-                    }
-                    Err(e) => eprintln!("[hunter] Failed to refresh whitelist: {}", e),
-                }
-            }
-        });
-
         while let Some(opportunity) = rx.recv().await {
             let _ = self.handle_opportunity(opportunity).await;
         }
@@ -297,28 +271,15 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             return Ok(());
         }
 
-        // 2. Filter by whitelist
+        // Fill symbols for logging
         {
-            let wl = self.whitelist.read().await;
             let repay_info = crate::domain::token::token_info(&opportunity.repay_mint);
             let withdraw_info = crate::domain::token::token_info(&opportunity.withdraw_mint);
-            
             if let Some(r) = &repay_info { event.repay_symbol = r.symbol.to_string(); }
             if let Some(w) = &withdraw_info { event.withdraw_symbol = w.symbol.to_string(); }
-
-            let is_whitelisted = match (repay_info, withdraw_info) {
-                (Some(r), Some(w)) => wl.contains(&r.symbol.to_string()) && wl.contains(&w.symbol.to_string()),
-                _ => false,
-            };
-
-            if !is_whitelisted {
-                event.status = "IGNORED_WHITELIST".to_string();
-                let _ = self.config.log_observation(&event).await;
-                return Ok(());
-            }
         }
 
-        // 3. Profit Check (Basic Phase 2 calculation)
+        // 2. Profit Check (Basic Phase 2 calculation)
         let tip_lamports = self.jito.get_tip_recommendation().await.unwrap_or(100_000);
         let tip_usd = (tip_lamports as f64 / 1_000_000_000.0) * 150.0; // Hardcoded SOL price
         
