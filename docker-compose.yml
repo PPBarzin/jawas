@@ -1,7 +1,7 @@
 services:
-  jawas-watch-kamino:
+  jawas-kamino:
     build: .
-    container_name: jawas-watch-kamino
+    container_name: jawas-kamino
     environment:
       - TARGET_PROTOCOL=KAMINO
       - LOG_FILE=kamino_raw.jsonl
@@ -17,9 +17,9 @@ services:
           cpus: "0.5"
           memory: 256M
 
-  jawas-watch-solend:
+  jawas-solend:
     build: .
-    container_name: jawas-watch-solend
+    container_name: jawas-solend
     environment:
       - TARGET_PROTOCOL=SOLEND
       - LOG_FILE=solend_raw.jsonl

@@ -12,6 +12,7 @@ use adapters::{
     jupiter::JupiterAdapter,
 };
 use ports::rpc::RpcClient;
+use ports::logger::{LiquidationLogger, ObservationEvent};
 use services::heartbeat::HeartbeatService;
 use services::observer::{ObserverService, Protocol};
 use services::hunter::HunterService;
@@ -19,6 +20,7 @@ use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use utils::utc_now;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -99,6 +101,37 @@ async fn main() -> anyhow::Result<()> {
     print!("  [RPC] Connecting to Solana (Observer)... ");
     match observer_rpc.get_version().await {
         Ok(version) => println!("OK (solana-core {})", version),
+        Err(e) => {
+            eprintln!("FAILED\n  → {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // ── 4. Health check — Airtable ───────────────────────────────────────────
+    print!("  [Airtable] Sending boot ping... ");
+    let ping_event = ObservationEvent {
+        timestamp: utc_now(),
+        signature: format!("Jawas {} is alive", protocol.name()),
+        protocol: protocol.name().to_string(),
+        market: "N/A".to_string(),
+        liquidated_user: "health-check".to_string(),
+        liquidator: "N/A".to_string(),
+        repay_mint: "N/A".to_string(),
+        withdraw_mint: "N/A".to_string(),
+        repay_symbol: "N/A".to_string(),
+        withdraw_symbol: "N/A".to_string(),
+        repay_amount: 0.0,
+        withdraw_amount: 0.0,
+        repaid_usd: 0.0,
+        withdrawn_usd: 0.0,
+        profit_usd: 0.0,
+        delay_ms: 0,
+        competing_bots: 0,
+        status: "WATCHED".to_string(),
+    };
+
+    match logger.log_observation(&ping_event).await {
+        Ok(_) => println!("OK"),
         Err(e) => {
             eprintln!("FAILED\n  → {}", e);
             std::process::exit(1);

@@ -54,7 +54,7 @@ Le bot est conteneurisé. Chaque protocole tourne dans son propre container pour
    ```
 3. **Lancement d'un protocole spécifique (ex: Kamino) :**
    ```bash
-   docker-compose up -d jawas-watch-kamino
+   docker-compose up -d jawas-kamino
    ```
 4. **Arrêt :**
    ```bash
@@ -68,8 +68,8 @@ Le bot est conteneurisé. Chaque protocole tourne dans son propre container pour
 ### Lecture des Logs
 Chaque container a son propre flux de logs :
 ```bash
-docker logs -f jawas-watch-kamino
-docker logs -f jawas-watch-solend
+docker logs -f jawas-kamino
+docker logs -f jawas-solend
 ```
 
 ### 💓 Battement de cœur (LIFEBIT) & Watchdog
@@ -187,7 +187,7 @@ Par défaut, tous les containers envoient leurs données dans la même table Air
 
 Exemple pour Solend :
 ```yaml
-  jawas-watch-solend:
+  jawas-solend:
     environment:
       - TARGET_PROTOCOL=SOLEND
       - AIRTABLE_TABLE_WATCH=Jawas-Watch-Solend
