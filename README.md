@@ -151,7 +151,10 @@ Ce script Python scanne les dernières transactions réelles de Kamino et génè
 
 ## ⚙️ Configuration (.env)
 
-Créer un fichier `.env` à la racine (ignoré par Git) :
+Jawas utilise une stratégie de double-flux RPC pour optimiser les performances et les coûts.
+
+### 1. Variables d'environnement
+Créer un fichier `.env` à la racine :
 
 ```bash
 # Airtable Config
@@ -159,10 +162,23 @@ AIRTABLE_TOKEN=votre_token
 AIRTABLE_BASE_ID=appmvsotfJe4SO1Ll
 AIRTABLE_TABLE_WATCH=Jawas-Watch
 
-# Solana Gateway (QuickNode)
-RPC_URL=https://votre-endpoint-quicknode.com/
-WS_URL=wss://votre-endpoint-quicknode.com/
+# Flux OBSERVATION (Recommandé : Helius)
+# Utilisé pour surveiller les transactions des concurrents (WebSocket intensif)
+OBSERVER_RPC_URL=https://mainnet.helius-rpc.com/?api-key=votre_cle
+OBSERVER_WS_URL=wss://mainnet.helius-rpc.com/?api-key=votre_cle
+
+# Flux CHASSE / HUNTER (Recommandé : QuickNode)
+# Utilisé pour simuler et envoyer nos propres liquidations (Vitesse critique)
+HUNTER_RPC_URL=https://votre-endpoint-quicknode.com/
+HUNTER_WS_URL=wss://votre-endpoint-quicknode.com/
+
+# Keypair (Phase 2)
+SOLANA_KEYPAIR_PATH=/app/secrets/keypair.json
 ```
+
+### 2. Choix des fournisseurs RPC
+*   **Helius (Observer)** : Idéal pour le flux de "Watch" grâce à sa gestion très robuste des WebSockets et son plan gratuit généreux.
+*   **QuickNode (Hunter)** : Recommandé pour la Phase 2 (Hunt) pour sa faible latence lors de l'envoi des transactions et ses options de Priority Fees.
 
 ### Configuration Avancée (Multi-Tables)
 Par défaut, tous les containers envoient leurs données dans la même table Airtable (identifiée par le champ `Protocol`). Si vous souhaitez utiliser des tables séparées :
