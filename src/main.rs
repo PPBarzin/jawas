@@ -70,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
     let jito = JitoAdapter::new(&jito_url);
     let jupiter = JupiterAdapter::new(None);
 
+    let max_repay_usd = std::env::var("MAX_REPAY_USD")
+        .map(|v| v.parse::<f64>().unwrap_or(300.0))
+        .unwrap_or(300.0);
+
     // ── 3. Load Keypair if Hunter mode is enabled ───────────────────────────
     let hunter_service = if let Some(path) = keypair_path {
         println!("  [Hunter] Loading keypair from {}...", path);
@@ -84,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
             oracle.clone(),
             logger.clone(), // AirtableAdapter implements ConfigPort
             keypair,
-            540.0, // Max 500 EUR approx
+            max_repay_usd,
         ))
     } else {
         println!("  [Hunter] No keypair provided. Running in WATCH mode only.");

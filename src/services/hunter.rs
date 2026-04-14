@@ -266,8 +266,34 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
     }
 
     async fn handle_opportunity(&self, opportunity: LiquidationOpportunity) -> anyhow::Result<()> {
+        let timestamp = crate::utils::utc_now();
+        
+        // Base event for logging
+        let mut event = crate::ports::logger::ObservationEvent {
+            timestamp: timestamp.clone(),
+            signature: "N/A".to_string(),
+            protocol: "Kamino".to_string(),
+            market: opportunity.position.market.clone(),
+            liquidated_user: opportunity.position.wallet.clone(),
+            liquidator: self.keypair.pubkey().to_string(),
+            repay_mint: opportunity.repay_mint.clone(),
+            withdraw_mint: opportunity.withdraw_mint.clone(),
+            repay_symbol: "N/A".to_string(),
+            withdraw_symbol: "N/A".to_string(),
+            repay_amount: opportunity.repay_amount_native as f64, // Placeholder native
+            withdraw_amount: opportunity.withdraw_amount_native as f64,
+            repaid_usd: opportunity.position.debt_value_usd,
+            withdrawn_usd: opportunity.position.collateral_value_usd,
+            profit_usd: 0.0,
+            delay_ms: 0,
+            competing_bots: 0,
+            status: "WATCHED".to_string(),
+        };
+
         // 1. Filter by amount
         if opportunity.position.debt_value_usd > self.max_repay_usd {
+            event.status = "IGNORED_CAPITAL".to_string();
+            let _ = self.config.log_observation(&event).await;
             return Ok(());
         }
 
@@ -277,24 +303,32 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             let repay_info = crate::domain::token::token_info(&opportunity.repay_mint);
             let withdraw_info = crate::domain::token::token_info(&opportunity.withdraw_mint);
             
+            if let Some(r) = &repay_info { event.repay_symbol = r.symbol.to_string(); }
+            if let Some(w) = &withdraw_info { event.withdraw_symbol = w.symbol.to_string(); }
+
             let is_whitelisted = match (repay_info, withdraw_info) {
                 (Some(r), Some(w)) => wl.contains(&r.symbol.to_string()) && wl.contains(&w.symbol.to_string()),
                 _ => false,
             };
 
             if !is_whitelisted {
+                event.status = "IGNORED_WHITELIST".to_string();
+                let _ = self.config.log_observation(&event).await;
                 return Ok(());
             }
         }
 
         // 3. Profit Check (Basic Phase 2 calculation)
-        // Bonus - Tip - Slippage
         let tip_lamports = self.jito.get_tip_recommendation().await.unwrap_or(100_000);
         let tip_usd = (tip_lamports as f64 / 1_000_000_000.0) * 150.0; // Hardcoded SOL price
         
-        let estimated_profit_usd = (opportunity.position.collateral_value_usd - opportunity.position.debt_value_usd) - tip_usd;
+        let gross_profit = opportunity.position.collateral_value_usd - opportunity.position.debt_value_usd;
+        let estimated_profit_usd = gross_profit - tip_usd;
+        event.profit_usd = estimated_profit_usd;
         
         if estimated_profit_usd < 1.0 { // Minimum 1$ profit
+            event.status = "IGNORED_LOW_PROFIT".to_string();
+            let _ = self.config.log_observation(&event).await;
             return Ok(());
         }
 
@@ -340,6 +374,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             );
             instructions.push(klend_ix);
         } else {
+            event.status = "ERROR_RESERVE_RESOLVE".to_string();
+            let _ = self.config.log_observation(&event).await;
             eprintln!("[hunter] could not resolve reserves for {}/{}", opportunity.repay_mint, opportunity.withdraw_mint);
             return Ok(());
         }
@@ -383,8 +419,17 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 
         // 6. Send Bundle
         match self.jito.send_bundle(vec![tx]).await {
-            Ok(bundle_id) => println!("[hunter] Bundle sent successfully! ID: {}", bundle_id),
-            Err(e) => eprintln!("[hunter] Failed to send bundle: {}", e),
+            Ok(bundle_id) => {
+                event.status = "HUNT_SENT".to_string();
+                event.signature = bundle_id.clone();
+                let _ = self.config.log_observation(&event).await;
+                println!("[hunter] Bundle sent successfully! ID: {}", bundle_id);
+            }
+            Err(e) => {
+                event.status = format!("HUNT_FAILED: {}", e);
+                let _ = self.config.log_observation(&event).await;
+                eprintln!("[hunter] Failed to send bundle: {}", e);
+            }
         }
 
         Ok(())
