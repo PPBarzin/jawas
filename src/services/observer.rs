@@ -77,26 +77,18 @@ fn purge_old_failed_attempts(buffer: &mut VecDeque<FailedLiquidationAttempt>, cu
     }
 }
 
-use crate::domain::opportunity::LiquidationOpportunity;
-use crate::domain::position::Position;
-use tokio::sync::mpsc;
+use std::collections::HashSet;
 
 pub struct ObserverService<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> {
     rpc: R,
     logger: L,
     oracle: O,
     protocol: Protocol,
-    opportunity_tx: Option<mpsc::Sender<LiquidationOpportunity>>,
 }
 
 impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> ObserverService<R, L, O> {
     pub fn new(rpc: R, logger: L, oracle: O, protocol: Protocol) -> Self {
-        Self { rpc, logger, oracle, protocol, opportunity_tx: None }
-    }
-
-    pub fn with_opportunity_channel(mut self, tx: mpsc::Sender<LiquidationOpportunity>) -> Self {
-        self.opportunity_tx = Some(tx);
-        self
+        Self { rpc, logger, oracle, protocol }
     }
 
     /// Subscribes to program logs and forwards each observed liquidation
@@ -106,6 +98,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
         let mut rx = self.rpc.subscribe_to_logs(program_id).await?;
         let mut liquidations_logged: u64 = 0;
         let mut failed_attempts: VecDeque<FailedLiquidationAttempt> = VecDeque::new();
+        let mut seen_signatures: HashSet<String> = HashSet::new();
 
         // Raw event log — liquidation-related events appended as JSON lines.
         // Only active when LOG_FILE env var is explicitly set.
@@ -192,6 +185,11 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             }
 
             if !is_liquidation && !is_truncated {
+                continue;
+            }
+
+            // Deduplicate: Helius WS can deliver the same tx twice (confirmed + finalized).
+            if !seen_signatures.insert(entry.signature.clone()) {
                 continue;
             }
 
@@ -360,31 +358,6 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 competing_bots: competing_bots as u32,
                 status: "WATCHED".to_string(),
             };
-
-            // Phase 2: Send opportunity to HunterService
-            if let Some(tx) = &self.opportunity_tx {
-                let opportunity = LiquidationOpportunity {
-                    market: parsed.market.clone(),
-                    position: Position {
-                        wallet: liquidated_user,
-                        collateral_token: parsed.withdraw_symbol,
-                        collateral_amount: withdraw_amount,
-                        collateral_value_usd: withdrawn_usd,
-                        debt_token: parsed.repay_symbol,
-                        debt_amount: repay_amount,
-                        debt_value_usd: repaid_usd,
-                        last_updated_slot: 0, // Not available from logs easily
-                    },
-                    liquidation_threshold: 0.0, // Should be fetched from Reserve in Phase 2
-                    bonus_pct: if repaid_usd > 0.0 { profit_usd / repaid_usd } else { 0.0 },
-                    detected_at_ms: entry.received_at_ms,
-                    repay_mint: parsed.repay_mint,
-                    withdraw_mint: parsed.withdraw_mint,
-                    repay_amount_native: parsed.repay_native,
-                    withdraw_amount_native: parsed.withdraw_native,
-                };
-                let _ = tx.send(opportunity).await;
-            }
 
             if let Err(e) = self.logger.log_observation(&event).await {
                 eprintln!("[observer] failed to log {}: {}", entry.signature, e);
@@ -702,10 +675,17 @@ mod tests {
                 account_keys: vec![],
                 instruction_accounts: vec![],
                 instruction_programs: vec![],
+                instruction_data: vec![],
                 block_time: None,
                 pre_token_balances: vec![],
                 post_token_balances: vec![],
             })
+        }
+        async fn get_account_info(&self, _pubkey: &str) -> anyhow::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        async fn get_latest_blockhash(&self) -> anyhow::Result<solana_sdk::hash::Hash> {
+            Ok(solana_sdk::hash::Hash::default())
         }
     }
 

@@ -5,6 +5,7 @@ use reqwest::Client;
 use solana_sdk::transaction::VersionedTransaction;
 use serde_json::json;
 
+#[derive(Clone)]
 pub struct JitoAdapter {
     client: Client,
     url: String,

@@ -8,10 +8,10 @@ Jawas est un bot de liquidation multi-protocole spécialisé sur **Solana**. Il 
 - **Kamino Finance**
 - **Save Finance** (ex-Solend)
 
-Sa stratégie repose sur deux phases distinctes :
+Sa stratégie repose sur deux modes distincts, activés selon la configuration :
 
-- **Phase 1 : Spectateur (Watch/Observation)** — Actuellement active. Le bot observe les liquidations exécutées par d'autres acteurs sur la blockchain. Il ne dépense aucun capital et n'envoie aucune transaction. L'objectif est de collecter des données réelles pour valider la rentabilité d'une future Phase 2.
-- **Phase 2 : Chasseur de prime (Hunt/Execution)** — Non active. Le bot exécutera ses propres liquidations de manière autonome une fois la Phase 1 jugée concluante.
+- **Phase 1 : Spectateur (Watch/Observation)** — Mode par défaut si aucun keypair n'est fourni. Le bot observe les liquidations exécutées par d'autres acteurs sur la blockchain. Il ne dépense aucun capital et n'envoie aucune transaction.
+- **Phase 2 : Chasseur de prime (Hunt/Execution)** — Activée dès que `SOLANA_KEYPAIR_PATH` est défini. Le bot exécute ses propres liquidations de manière **entièrement autonome** : chaque hunter (Kamino, Solend) possède son propre flux WebSocket QuikNode et n'est jamais bloqué par l'Observer.
 
 ---
 
@@ -72,12 +72,17 @@ docker logs -f jawas-kamino
 docker logs -f jawas-solend
 ```
 
-### 💓 Battement de cœur (LIFEBIT) & Watchdog
+### 💓 Battement de cœur (LIFEBIT) & Architecture
 Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable (colonne `Tx Signature`).
 - Si vous voyez un LIFEBIT récent : **Tout va bien.**
 - Si le dernier LIFEBIT date de plus de 20 minutes : **Alerte.** Le bot est peut-être figé ou le RPC est déconnecté.
 
-**Nouveauté (Fiabilité) :** Le bot inclut désormais un **Watchdog RPC**. Si aucune donnée n'est reçue pendant 2 minutes, le bot considère la connexion comme "zombie" et force automatiquement une reconnexion pour ne rater aucune liquidation.
+**Architecture des flux :**
+- **Observer** (Helius) : flux de logging uniquement. N'intervient jamais dans le cycle de liquidation.
+- **Hunter Kamino** (QuikNode) : flux autonome sur le programme Kamino. Détecte, construit et envoie via Jito en moins de 500ms.
+- **Hunter Solend** (QuikNode) : flux autonome sur le programme Solend. Même philosophie.
+
+> Les deux containers peuvent partager le **même endpoint QuikNode** (`HUNTER_RPC_URL` / `HUNTER_WS_URL` identiques). QuikNode supporte plusieurs connexions WS simultanées sur une même URL.
 
 ---
 

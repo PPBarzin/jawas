@@ -15,11 +15,10 @@ use ports::rpc::RpcClient;
 use ports::logger::{LiquidationLogger, ObservationEvent};
 use services::heartbeat::HeartbeatService;
 use services::observer::{ObserverService, Protocol};
-use services::hunter::HunterService;
+use services::hunter::{HunterService, load_wallet_tokens, WalletToken};
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use utils::utc_now;
 
 #[tokio::main]
@@ -138,41 +137,62 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── 5. Setup Communication ──────────────────────────────────────────────
-    let (opp_tx, opp_rx) = mpsc::channel(100);
-
-    // ── 6. Spawn Hunter ──────────────────────────────────────────────────────
+    // ── 5. Spawn Hunter ──────────────────────────────────────────────────────
+    // Both Kamino and Solend hunters are fully autonomous: own QuikNode WS,
+    // independent of the observer. Observer is logging-only.
     if let Some(hunter) = hunter_service {
+        let wallet_path = std::env::var("WALLET_TOML_PATH")
+            .unwrap_or_else(|_| "wallet.toml".to_string());
+        let wallet_tokens: Vec<WalletToken> = load_wallet_tokens(&wallet_path);
+
+        match protocol {
+            Protocol::Kamino => {
+                tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = hunter.run_kamino(wallet_tokens.clone()).await {
+                            eprintln!("[hunter-kamino] exited: {}. Restarting in 2s...", e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                });
+            }
+            Protocol::Solend => {
+                tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = hunter.run_solend(wallet_tokens.clone()).await {
+                            eprintln!("[hunter-solend] exited: {}. Restarting in 2s...", e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // ── 6. Spawn Observer (logging only, independent of hunter) ─────────────
+    {
+        let logger_for_observer = logger.clone();
+        let oracle_for_observer = oracle;
+        let rpc_for_observer = observer_rpc;
         tokio::spawn(async move {
-            if let Err(e) = hunter.run(opp_rx).await {
-                eprintln!("[hunter] service exited with error: {}", e);
+            loop {
+                println!("[observer] Starting watch loop for {}...", protocol.name());
+                let service = ObserverService::new(
+                    rpc_for_observer.clone(),
+                    logger_for_observer.clone(),
+                    oracle_for_observer.clone(),
+                    protocol,
+                );
+                if let Err(e) = service.watch().await {
+                    eprintln!("[observer] loop exited with error: {}. Restarting in 5s...", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                } else {
+                    println!("[observer] loop closed normally. Restarting in 5s...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
             }
         });
     }
-
-    // ── 7. Spawn observer ────────────────────────────────────────────────────
-    let logger_for_observer = logger.clone();
-    let oracle_for_observer = oracle;
-    let rpc_for_observer = observer_rpc;
-    tokio::spawn(async move {
-        loop {
-            println!("[observer] Starting watch loop for {}...", protocol.name());
-            let service = ObserverService::new(
-                rpc_for_observer.clone(), 
-                logger_for_observer.clone(), 
-                oracle_for_observer.clone(), 
-                protocol
-            ).with_opportunity_channel(opp_tx.clone());
-            
-            if let Err(e) = service.watch().await {
-                eprintln!("[observer] loop exited with error: {}. Restarting in 5s...", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            } else {
-                println!("[observer] loop closed normally. Restarting in 5s...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    });
 
     // ── 8. Spawn heartbeat ───────────────────────────────────────────────────
     let logger_for_heartbeat = logger.clone();

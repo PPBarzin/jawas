@@ -7,6 +7,7 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ports::rpc::{LogEntry, RpcClient, StreamingRpcClient, TransactionInfo};
+use bs58;
 
 use std::sync::Arc;
 
@@ -47,7 +48,7 @@ impl RpcClient for HeliusAdapter {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getTransaction",
-            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}]
         });
 
         let mut attempts = 0;
@@ -81,6 +82,7 @@ impl RpcClient for HeliusAdapter {
                 let mut instruction_accounts: Vec<Vec<usize>> = Vec::new();
                 let mut instruction_programs: Vec<usize> = Vec::new();
 
+                let mut instruction_data: Vec<Vec<u8>> = Vec::new();
                 for instr in &raw_instructions {
                     let prog_idx = instr["programIdIndex"].as_u64().unwrap_or(0) as usize;
                     let accounts: Vec<usize> = instr["accounts"]
@@ -89,8 +91,14 @@ impl RpcClient for HeliusAdapter {
                         .iter()
                         .filter_map(|v| v.as_u64().map(|n| n as usize))
                         .collect();
+                    // Instruction data is base58-encoded in JSON format.
+                    let data_bytes = instr["data"]
+                        .as_str()
+                        .and_then(|s| bs58::decode(s).into_vec().ok())
+                        .unwrap_or_default();
                     instruction_programs.push(prog_idx);
                     instruction_accounts.push(accounts);
+                    instruction_data.push(data_bytes);
                 }
 
                 let block_time = result["blockTime"].as_u64();
@@ -102,6 +110,7 @@ impl RpcClient for HeliusAdapter {
                     account_keys,
                     instruction_accounts,
                     instruction_programs,
+                    instruction_data,
                     block_time,
                     pre_token_balances,
                     post_token_balances,
@@ -116,6 +125,39 @@ impl RpcClient for HeliusAdapter {
             // Wait 500ms before retrying to allow the RPC to index the transaction
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
+    }
+
+    async fn get_account_info(&self, pubkey: &str) -> Result<Vec<u8>> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [pubkey, {"encoding": "base64"}]
+        });
+
+        let resp = self.http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("getAccountInfo HTTP request failed")?;
+
+        let body: serde_json::Value = resp.json().await.context("getAccountInfo response parse failed")?;
+
+        let data_arr = body["result"]["value"]["data"]
+            .as_array()
+            .context("getAccountInfo: missing data array")?;
+
+        let b64 = data_arr.first()
+            .and_then(|v| v.as_str())
+            .context("getAccountInfo: missing base64 data")?;
+
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            b64,
+        ).context("getAccountInfo: base64 decode failed")?;
+
+        Ok(bytes)
     }
 
     async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash> {

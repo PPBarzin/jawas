@@ -17,6 +17,9 @@ pub struct TransactionInfo {
     pub instruction_accounts: Vec<Vec<usize>>,
     /// For each instruction: index into `account_keys` identifying the program.
     pub instruction_programs: Vec<usize>,
+    /// For each instruction: raw serialized data bytes (base58-decoded).
+    /// Used to copy competitor instructions verbatim when building our tx.
+    pub instruction_data: Vec<Vec<u8>>,
     /// On-chain block time (Unix seconds) from getTransaction, if available.
     pub block_time: Option<u64>,
     /// Token balances before the transaction.
@@ -37,14 +40,15 @@ use solana_sdk::hash::Hash;
 
 /// Minimal RPC port for Phase 1 (read-only).
 /// Expanded in Phase 2 as needed.
-#[allow(async_fn_in_trait)]
 pub trait RpcClient: Send + Sync {
     /// Returns the node version string (used as a connectivity health-check).
-    async fn get_version(&self) -> Result<String>;
+    fn get_version(&self) -> impl std::future::Future<Output = Result<String>> + Send;
     /// Returns account keys and instruction accounts for a confirmed transaction.
-    async fn get_transaction(&self, signature: &str) -> Result<TransactionInfo>;
+    fn get_transaction(&self, signature: &str) -> impl std::future::Future<Output = Result<TransactionInfo>> + Send;
     /// Returns the latest blockhash from the network.
-    async fn get_latest_blockhash(&self) -> Result<Hash>;
+    fn get_latest_blockhash(&self) -> impl std::future::Future<Output = Result<Hash>> + Send;
+    /// Returns the raw data bytes of an account (base64-decoded).
+    fn get_account_info(&self, pubkey: &str) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
 }
 
 /// Port for real-time streaming of Solana logs.
