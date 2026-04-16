@@ -33,8 +33,6 @@ const SOLEND_LIQUIDATE_FILTER: &str = "LiquidateWithoutReceivingCtokens";
 // Kamino
 const KAMINO_LIQUIDATE_FILTER: &str = "LiquidateObligationAndRedeemReserveCollateralV2";
 
-/// Blockhash is refreshed every 2s. Valid for ~150 slots (~60s), so this gives plenty of margin.
-const BLOCKHASH_REFRESH_SECS: u64 = 2;
 /// Tip is refreshed every 60s.
 const TIP_REFRESH_SECS: u64 = 60;
 /// An obligation that was fired on within this window is skipped (prevents burst duplicates).
@@ -214,12 +212,17 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         let initial_blockhash = self.hunter_rpc.get_latest_blockhash().await
             .unwrap_or_default();
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(initial_blockhash));
+        let blockhash_refresh_secs = std::env::var("BLOCKHASH_REFRESH_SECS")
+            .unwrap_or_else(|_| "12".to_string())
+            .parse::<u64>()
+            .unwrap_or(12);
+
         {
             let rpc = self.hunter_rpc.clone();
             let bh = cached_blockhash.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(BLOCKHASH_REFRESH_SECS)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs)).await;
                     match rpc.get_latest_blockhash().await {
                         Ok(hash) => { *bh.write().await = hash; }
                         Err(e) => eprintln!("[hunter-kamino] blockhash refresh failed: {}", e),
@@ -324,12 +327,17 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         let initial_blockhash = self.hunter_rpc.get_latest_blockhash().await
             .unwrap_or_default();
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(initial_blockhash));
+        let blockhash_refresh_secs = std::env::var("BLOCKHASH_REFRESH_SECS")
+            .unwrap_or_else(|_| "12".to_string())
+            .parse::<u64>()
+            .unwrap_or(12);
+
         {
             let rpc = self.hunter_rpc.clone();
             let bh = cached_blockhash.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(BLOCKHASH_REFRESH_SECS)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs)).await;
                     match rpc.get_latest_blockhash().await {
                         Ok(hash) => { *bh.write().await = hash; }
                         Err(e) => eprintln!("[hunter-solend] blockhash refresh failed: {}", e),
