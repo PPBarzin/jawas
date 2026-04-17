@@ -5,7 +5,13 @@ WORKDIR /app
 
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && mkdir -p tools && echo 'fn main() {}' > tools/liquidate_one.rs
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && mkdir -p tools \
+    && echo 'fn main() {}' > tools/liquidate_one.rs \
+    && echo 'fn main() {}' > tools/inspect_kamino_obligation.rs \
+    && echo 'fn main() {}' > tools/inspect_solend_obligation.rs \
+    && echo 'fn main() {}' > tools/generate_weekly_token_report.rs
 RUN cargo build --release
 RUN rm -rf src/ tools/
 
