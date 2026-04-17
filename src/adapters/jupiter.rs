@@ -41,7 +41,6 @@ struct SwapInstructionsResponse {
     setup_instructions: Vec<JupiterInstruction>,
     swap_instruction: JupiterInstruction,
     cleanup_instruction: Option<JupiterInstruction>,
-    address_lookup_table_addresses: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]

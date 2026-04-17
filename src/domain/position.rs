@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Represents a borrower's position on a lending protocol.
 /// Pure domain logic — zero external dependencies.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub wallet: String,

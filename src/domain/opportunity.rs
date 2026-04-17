@@ -3,6 +3,7 @@ use crate::domain::position::Position;
 
 /// A liquidation opportunity detected on-chain.
 /// Pure domain struct — zero external dependencies.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiquidationOpportunity {
     pub market: String,

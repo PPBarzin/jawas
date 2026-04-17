@@ -38,6 +38,12 @@ pub struct TokenBalance {
 
 use solana_sdk::hash::Hash;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcCommitment {
+    Processed,
+    Confirmed,
+}
+
 /// Minimal RPC port for Phase 1 (read-only).
 /// Expanded in Phase 2 as needed.
 pub trait RpcClient: Send + Sync {
@@ -45,6 +51,13 @@ pub trait RpcClient: Send + Sync {
     fn get_version(&self) -> impl std::future::Future<Output = Result<String>> + Send;
     /// Returns account keys and instruction accounts for a confirmed transaction.
     fn get_transaction(&self, signature: &str) -> impl std::future::Future<Output = Result<TransactionInfo>> + Send;
+    /// Returns transaction data with caller-controlled retry behavior.
+    fn get_transaction_with_retries(
+        &self,
+        signature: &str,
+        max_attempts: usize,
+        retry_delay_ms: u64,
+    ) -> impl std::future::Future<Output = Result<TransactionInfo>> + Send;
     /// Returns the latest blockhash from the network.
     fn get_latest_blockhash(&self) -> impl std::future::Future<Output = Result<Hash>> + Send;
     /// Returns the raw data bytes of an account (base64-decoded).
@@ -56,5 +69,9 @@ pub trait RpcClient: Send + Sync {
 pub trait StreamingRpcClient: Send + Sync {
     /// Subscribe to logs for a specific program.
     /// Returns a receiver of per-transaction log bundles.
-    async fn subscribe_to_logs(&self, program_id: &str) -> Result<tokio::sync::mpsc::Receiver<LogEntry>>;
+    async fn subscribe_to_logs(
+        &self,
+        program_id: &str,
+        commitment: RpcCommitment,
+    ) -> Result<tokio::sync::mpsc::Receiver<LogEntry>>;
 }

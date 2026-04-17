@@ -6,7 +6,7 @@ use solana_client::rpc_client::RpcClient as SolanaRpcClient;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::ports::rpc::{LogEntry, RpcClient, StreamingRpcClient, TransactionInfo};
+use crate::ports::rpc::{LogEntry, RpcClient, RpcCommitment, StreamingRpcClient, TransactionInfo};
 use bs58;
 
 use std::sync::Arc;
@@ -44,6 +44,15 @@ impl RpcClient for HeliusAdapter {
     }
 
     async fn get_transaction(&self, signature: &str) -> Result<TransactionInfo> {
+        self.get_transaction_with_retries(signature, 3, 500).await
+    }
+
+    async fn get_transaction_with_retries(
+        &self,
+        signature: &str,
+        max_attempts: usize,
+        retry_delay_ms: u64,
+    ) -> Result<TransactionInfo> {
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -52,7 +61,7 @@ impl RpcClient for HeliusAdapter {
         });
 
         let mut attempts = 0;
-        let max_attempts = 3;
+        let max_attempts = max_attempts.max(1);
 
         loop {
             let resp = self.http_client
@@ -122,8 +131,7 @@ impl RpcClient for HeliusAdapter {
                 anyhow::bail!("getTransaction returned null for signature {} after {} attempts", signature, max_attempts);
             }
 
-            // Wait 500ms before retrying to allow the RPC to index the transaction
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(retry_delay_ms)).await;
         }
     }
 
@@ -212,10 +220,15 @@ impl StreamingRpcClient for HeliusAdapter {
     async fn subscribe_to_logs(
         &self,
         program_id: &str,
+        commitment: RpcCommitment,
     ) -> Result<tokio::sync::mpsc::Receiver<LogEntry>> {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         let program_id_owned = program_id.to_string();
         let ws_url = self.ws_url.clone();
+        let commitment = match commitment {
+            RpcCommitment::Processed => "processed",
+            RpcCommitment::Confirmed => "confirmed",
+        };
 
         tokio::spawn(async move {
             let mut backoff_secs: u64 = 1;
@@ -233,7 +246,7 @@ impl StreamingRpcClient for HeliusAdapter {
                             "method": "logsSubscribe",
                             "params": [
                                 { "mentions": [program_id_owned] },
-                                { "commitment": "confirmed" }
+                                { "commitment": commitment }
                             ]
                         });
 

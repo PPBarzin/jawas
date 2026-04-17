@@ -1,8 +1,9 @@
 use crate::ports::jito::JitoPort;
 use crate::ports::jupiter::JupiterPort;
 use crate::ports::oracle::PriceOracle;
-use crate::ports::rpc::{RpcClient, StreamingRpcClient};
+use crate::ports::rpc::{RpcClient, RpcCommitment, StreamingRpcClient};
 use crate::ports::config::ConfigPort;
+use borsh::BorshDeserialize;
 use solana_sdk::signature::Keypair;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
@@ -20,8 +21,6 @@ use std::collections::HashMap;
 
 const JITO_TIP_ACCOUNT: &str = "96g9sAg9u3P7Q9ebKsC6SA47cySvnV6S1S1K6ssB1vD";
 const KLEND_PROGRAM: &str    = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const LENDING_MARKET: &str   = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
-const LENDING_MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
 const TOKEN_PROGRAM: &str    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str      = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const FARMS_PROGRAM: &str    = "FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr";
@@ -45,6 +44,23 @@ pub struct WalletToken {
     pub mint: String,
     pub decimals: u8,
     pub max_repay_native: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WalletTokenRuntime {
+    symbol: String,
+    mint: String,
+    max_repay_native: u64,
+    source_ata: Pubkey,
+}
+
+#[derive(Debug, Clone)]
+struct KaminoReserveMeta {
+    lending_market: Pubkey,
+    pyth_oracle: Option<Pubkey>,
+    switchboard_price_oracle: Option<Pubkey>,
+    switchboard_twap_oracle: Option<Pubkey>,
+    scope_prices: Option<Pubkey>,
 }
 
 /// Parses wallet.toml and returns the list of available tokens.
@@ -104,6 +120,197 @@ fn parse_toml_u64(line: &str, key: &str) -> Option<u64> {
     clean.parse().ok()
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct BigFractionBytes {
+    value: [u64; 4],
+    padding: [u64; 2],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct LastUpdate {
+    slot: u64,
+    stale: u8,
+    price_status: u8,
+    placeholder: [u8; 6],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct PriceHeuristic {
+    lower: u64,
+    upper: u64,
+    exp: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct ScopeConfiguration {
+    price_feed: [u8; 32],
+    price_chain: [u16; 4],
+    twap_chain: [u16; 4],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct SwitchboardConfiguration {
+    price_aggregator: [u8; 32],
+    twap_aggregator: [u8; 32],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct PythConfiguration {
+    price: [u8; 32],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct TokenInfo {
+    name: [u8; 32],
+    heuristic: PriceHeuristic,
+    max_twap_divergence_bps: u64,
+    max_age_price_seconds: u64,
+    max_age_twap_seconds: u64,
+    scope_configuration: ScopeConfiguration,
+    switchboard_configuration: SwitchboardConfiguration,
+    pyth_configuration: PythConfiguration,
+    block_price_usage: u8,
+    reserved: [u8; 7],
+    padding: [u64; 19],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct ReserveFees {
+    origination_fee_sf: u64,
+    flash_loan_fee_sf: u64,
+    padding: [u8; 8],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct CurvePoint {
+    utilization_rate_bps: u32,
+    borrow_rate_bps: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct BorrowRateCurve {
+    points: [CurvePoint; 11],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct WithdrawalCaps {
+    config_capacity: i64,
+    current_total: i64,
+    last_interval_start_timestamp: u64,
+    config_interval_length_seconds: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct ReserveConfig {
+    status: u8,
+    padding_deprecated_asset_tier: u8,
+    host_fixed_interest_rate_bps: u16,
+    min_deleveraging_bonus_bps: u16,
+    block_ctoken_usage: u8,
+    reserved1: [u8; 6],
+    protocol_order_execution_fee_pct: u8,
+    protocol_take_rate_pct: u8,
+    protocol_liquidation_fee_pct: u8,
+    loan_to_value_pct: u8,
+    liquidation_threshold_pct: u8,
+    min_liquidation_bonus_bps: u16,
+    max_liquidation_bonus_bps: u16,
+    bad_debt_liquidation_bonus_bps: u16,
+    deleveraging_margin_call_period_secs: u64,
+    deleveraging_threshold_decrease_bps_per_day: u64,
+    fees: ReserveFees,
+    borrow_rate_curve: BorrowRateCurve,
+    borrow_factor_pct: u64,
+    deposit_limit: u64,
+    borrow_limit: u64,
+    token_info: TokenInfo,
+    deposit_withdrawal_cap: WithdrawalCaps,
+    debt_withdrawal_cap: WithdrawalCaps,
+    elevation_groups: [u8; 20],
+    disable_usage_as_coll_outside_emode: u8,
+    utilization_limit_block_borrowing_above_pct: u8,
+    autodeleverage_enabled: u8,
+    proposer_authority_locked: u8,
+    borrow_limit_outside_elevation_group: u64,
+    borrow_limit_against_this_collateral_in_elevation_group: [u64; 32],
+    deleveraging_bonus_increase_bps_per_day: u64,
+    debt_maturity_timestamp: u64,
+    debt_term_seconds: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct ReserveLiquidity {
+    mint_pubkey: [u8; 32],
+    supply_vault: [u8; 32],
+    fee_vault: [u8; 32],
+    total_available_amount: u64,
+    borrowed_amount_sf: u128,
+    market_price_sf: u128,
+    market_price_last_updated_ts: u64,
+    mint_decimals: u64,
+    deposit_limit_crossed_timestamp: u64,
+    borrow_limit_crossed_timestamp: u64,
+    cumulative_borrow_rate_bsf: BigFractionBytes,
+    accumulated_protocol_fees_sf: u128,
+    accumulated_referrer_fees_sf: u128,
+    pending_referrer_fees_sf: u128,
+    absolute_referral_rate_sf: u128,
+    token_program: [u8; 32],
+    padding2: [u64; 51],
+    padding3: [u128; 32],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct ReserveCollateral {
+    mint_pubkey: [u8; 32],
+    mint_total_supply: u64,
+    supply_vault: [u8; 32],
+    padding1: [u128; 32],
+    padding2: [u128; 32],
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct WithdrawQueue {
+    queued_collateral_amount: u64,
+    next_issued_ticket_sequence_number: u64,
+    next_withdrawable_ticket_sequence_number: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, BorshDeserialize)]
+struct Reserve {
+    version: u64,
+    last_update: LastUpdate,
+    lending_market: [u8; 32],
+    farm_collateral: [u8; 32],
+    farm_debt: [u8; 32],
+    liquidity: ReserveLiquidity,
+    reserve_liquidity_padding: [u64; 150],
+    collateral: ReserveCollateral,
+    reserve_collateral_padding: [u64; 150],
+    config: ReserveConfig,
+    config_padding: [u64; 114],
+    borrowed_amount_outside_elevation_group: u64,
+    borrowed_amounts_against_this_reserve_in_elevation_groups: [u64; 32],
+    withdraw_queue: WithdrawQueue,
+    padding: [u64; 204],
+}
+
 // ── Helper functions for instruction building ────────────────────────────────
 
 fn discriminator(name: &str) -> [u8; 8] {
@@ -121,19 +328,79 @@ fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
     ).0
 }
 
+fn optional_pubkey(bytes: [u8; 32]) -> Option<Pubkey> {
+    if bytes.iter().all(|b| *b == 0) {
+        None
+    } else {
+        Some(Pubkey::new_from_array(bytes))
+    }
+}
+
+fn build_wallet_token_index(
+    liquidator: &Pubkey,
+    wallet_tokens: &[WalletToken],
+) -> anyhow::Result<HashMap<String, WalletTokenRuntime>> {
+    let mut index = HashMap::new();
+    for token in wallet_tokens {
+        let mint_pk = Pubkey::from_str(&token.mint)?;
+        index.insert(
+            token.mint.clone(),
+            WalletTokenRuntime {
+                symbol: token.symbol.clone(),
+                mint: token.mint.clone(),
+                max_repay_native: token.max_repay_native,
+                source_ata: get_ata(liquidator, &mint_pk),
+            },
+        );
+    }
+    Ok(index)
+}
+
+fn decode_kamino_reserve(data: &[u8]) -> anyhow::Result<Reserve> {
+    if data.len() < 8 {
+        anyhow::bail!("reserve account too small");
+    }
+    let mut cursor = &data[8..];
+    Reserve::deserialize(&mut cursor).map_err(|e| anyhow::anyhow!("reserve decode failed: {}", e))
+}
+
+fn reserve_meta_from_account(data: &[u8]) -> anyhow::Result<KaminoReserveMeta> {
+    let reserve = decode_kamino_reserve(data)?;
+    Ok(KaminoReserveMeta {
+        lending_market: Pubkey::new_from_array(reserve.lending_market),
+        pyth_oracle: optional_pubkey(reserve.config.token_info.pyth_configuration.price),
+        switchboard_price_oracle: optional_pubkey(
+            reserve.config.token_info.switchboard_configuration.price_aggregator,
+        ),
+        switchboard_twap_oracle: optional_pubkey(
+            reserve.config.token_info.switchboard_configuration.twap_aggregator,
+        ),
+        scope_prices: optional_pubkey(reserve.config.token_info.scope_configuration.price_feed),
+    })
+}
+
 fn ix_refresh_reserve(
     klend: &Pubkey,
-    market: &Pubkey,
     reserve: &Pubkey,
+    meta: &KaminoReserveMeta,
 ) -> Instruction {
     let disc = discriminator("refresh_reserve");
-    let accounts = vec![
+    let mut accounts = vec![
         AccountMeta::new(*reserve, false),
-        AccountMeta::new_readonly(*market, false),
-        AccountMeta::new_readonly(*klend, false), // Pyth placeholder
-        AccountMeta::new_readonly(*klend, false), // Switchboard Price placeholder
-        AccountMeta::new_readonly(*klend, false), // Switchboard TWAP placeholder
+        AccountMeta::new_readonly(meta.lending_market, false),
     ];
+    if let Some(pk) = meta.pyth_oracle {
+        accounts.push(AccountMeta::new_readonly(pk, false));
+    }
+    if let Some(pk) = meta.switchboard_price_oracle {
+        accounts.push(AccountMeta::new_readonly(pk, false));
+    }
+    if let Some(pk) = meta.switchboard_twap_oracle {
+        accounts.push(AccountMeta::new_readonly(pk, false));
+    }
+    if let Some(pk) = meta.scope_prices {
+        accounts.push(AccountMeta::new_readonly(pk, false));
+    }
     Instruction { program_id: *klend, accounts, data: disc.to_vec() }
 }
 
@@ -152,6 +419,22 @@ fn ix_refresh_obligation(
         accounts.push(AccountMeta::new_readonly(**r, false));
     }
     Instruction { program_id: *klend, accounts, data: disc.to_vec() }
+}
+
+async fn get_or_fetch_kamino_reserve_meta<R: RpcClient>(
+    rpc: &R,
+    cache: &tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>,
+    reserve_pk: &Pubkey,
+) -> anyhow::Result<KaminoReserveMeta> {
+    let key = reserve_pk.to_string();
+    if let Some(meta) = cache.read().await.get(&key).cloned() {
+        return Ok(meta);
+    }
+
+    let data = rpc.get_account_info(&key).await?;
+    let meta = reserve_meta_from_account(&data)?;
+    cache.write().await.insert(key, meta.clone());
+    Ok(meta)
 }
 
 pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + Clone> {
@@ -201,6 +484,10 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         R: StreamingRpcClient + RpcClient + Clone + Send + Sync + 'static,
         JI: Clone + Send + Sync + 'static,
     {
+        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
         eprintln!(
             "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | tokens: {}",
             self.keypair.pubkey(),
@@ -213,9 +500,9 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             .unwrap_or_default();
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(initial_blockhash));
         let blockhash_refresh_secs = std::env::var("BLOCKHASH_REFRESH_SECS")
-            .unwrap_or_else(|_| "12".to_string())
+            .unwrap_or_else(|_| "3".to_string())
             .parse::<u64>()
-            .unwrap_or(12);
+            .unwrap_or(3);
 
         {
             let rpc = self.hunter_rpc.clone();
@@ -253,7 +540,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 
         // ── Main WS loop ─────────────────────────────────────────────────────
         loop {
-            let mut rx = match self.hunter_rpc.subscribe_to_logs(KLEND_PROGRAM).await {
+            let mut rx = match self.hunter_rpc.subscribe_to_logs(KLEND_PROGRAM, RpcCommitment::Processed).await {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[hunter-kamino] WS subscribe failed: {}. Retrying in 2s...", e);
@@ -283,15 +570,16 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                 let rpc         = self.hunter_rpc.clone();
                 let keypair     = self.keypair.clone();
                 let jito        = self.jito.clone();
-                let wt          = wallet_tokens.clone();
                 let bh          = cached_blockhash.clone();
                 let tip         = cached_tip.clone();
                 let dedup       = recent_obligations.clone();
                 let max_repay   = self.max_repay_usd;
+                let wallet_idx  = wallet_index.clone();
+                let reserve_cache = reserve_cache.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = execute_kamino_opportunity(
-                        sig, rpc, jito, keypair, wt, bh, tip, dedup, max_repay,
+                        sig, rpc, jito, keypair, wallet_idx, reserve_cache, bh, tip, dedup, max_repay,
                     ).await {
                         eprintln!("[hunter-kamino] opportunity error: {}", e);
                     }
@@ -317,6 +605,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         R: StreamingRpcClient + RpcClient + Clone + Send + Sync + 'static,
         JI: Clone + Send + Sync + 'static,
     {
+        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+
         eprintln!(
             "[hunter-solend] Starting autonomous hunter. Wallet: {} | tokens: {}",
             self.keypair.pubkey(),
@@ -368,7 +658,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 
         // ── Main WS loop ─────────────────────────────────────────────────────
         loop {
-            let mut rx = match self.hunter_rpc.subscribe_to_logs(SOLEND_PROGRAM).await {
+            let mut rx = match self.hunter_rpc.subscribe_to_logs(SOLEND_PROGRAM, RpcCommitment::Processed).await {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[hunter-solend] WS subscribe failed: {}. Retrying in 2s...", e);
@@ -396,14 +686,14 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                 let rpc       = self.hunter_rpc.clone();
                 let keypair   = self.keypair.clone();
                 let jito      = self.jito.clone();
-                let wt        = wallet_tokens.clone();
+                let wallet_idx = wallet_index.clone();
                 let bh        = cached_blockhash.clone();
                 let tip       = cached_tip.clone();
                 let dedup     = recent_obligations.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = execute_solend_opportunity(
-                        sig, rpc, jito, keypair, wt, bh, tip, dedup,
+                        sig, rpc, jito, keypair, wallet_idx, bh, tip, dedup,
                     ).await {
                         eprintln!("[hunter-solend] opportunity error: {}", e);
                     }
@@ -427,7 +717,8 @@ async fn execute_kamino_opportunity<R, JI>(
     rpc: R,
     jito: JI,
     keypair: Arc<Keypair>,
-    wallet_tokens: Vec<WalletToken>,
+    wallet_index: Arc<HashMap<String, WalletTokenRuntime>>,
+    reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>>,
     cached_blockhash: Arc<tokio::sync::RwLock<solana_sdk::hash::Hash>>,
     cached_tip: Arc<std::sync::atomic::AtomicU64>,
     dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
@@ -439,8 +730,8 @@ where
 {
     // ── 1. getTransaction — single attempt, 500ms hard timeout ───────────────
     let tx_info = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        rpc.get_transaction(&sig),
+        tokio::time::Duration::from_millis(350),
+        rpc.get_transaction_with_retries(&sig, 1, 0),
     ).await
     .map_err(|_| anyhow::anyhow!("getTransaction timeout"))?
     .map_err(|e| anyhow::anyhow!("getTransaction failed: {}", e))?;
@@ -490,6 +781,8 @@ where
     }
 
     let obligation_str    = resolve!(1);
+    let market_str        = resolve!(2);
+    let market_auth_str   = resolve!(3);
     let repay_reserve_str = resolve!(4);
     let repay_mint_str    = resolve!(5);
     let repay_supply_str  = resolve!(6);
@@ -511,8 +804,7 @@ where
     }
 
     // ── 5. Check we hold the repay token ────────────────────────────────────
-    let repay_token = wallet_tokens.iter()
-        .find(|t| t.mint == repay_mint_str)
+    let repay_token = wallet_index.get(repay_mint_str)
         .ok_or_else(|| anyhow::anyhow!("no wallet token for repay mint {}", &repay_mint_str[..8]))?;
 
     // Cap repay at max_repay_usd (approximate: we cap native amount, not USD)
@@ -521,6 +813,8 @@ where
 
     // ── 6. Parse pubkeys ─────────────────────────────────────────────────────
     let obligation_pk    = Pubkey::from_str(obligation_str)?;
+    let market_pk        = Pubkey::from_str(market_str)?;
+    let market_auth_pk   = Pubkey::from_str(market_auth_str)?;
     let repay_reserve_pk = Pubkey::from_str(repay_reserve_str)?;
     let repay_mint_pk    = Pubkey::from_str(repay_mint_str)?;
     let repay_supply_pk  = Pubkey::from_str(repay_supply_str)?;
@@ -532,23 +826,32 @@ where
     let wdr_fee_pk       = Pubkey::from_str(wdr_fee_str)?;
 
     let klend_pk      = Pubkey::from_str(KLEND_PROGRAM).unwrap();
-    let market_pk     = Pubkey::from_str(LENDING_MARKET).unwrap();
-    let market_auth_pk = Pubkey::from_str(LENDING_MARKET_AUTHORITY).unwrap();
     let token_prog_pk = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let farms_pk      = Pubkey::from_str(FARMS_PROGRAM).unwrap();
     let tip_account   = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
 
     let liquidator = keypair.pubkey();
+    let repay_reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &repay_reserve_pk).await?;
+    let withdraw_reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &wdr_reserve_pk).await?;
 
     // ── 7. Build instructions ────────────────────────────────────────────────
     // Compute budget: 350k CU is sufficient for refresh x2 + refresh_obligation + liquidate.
     // Optimistic: we include the refresh instructions so on-chain state is fresh.
     // If ObligationHealthy, tx fails and we lose only the priority fee.
+    let compute_unit_limit = std::env::var("KAMINO_COMPUTE_UNIT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(400_000);
+    let compute_unit_price = std::env::var("KAMINO_CU_PRICE_MICROLAMPORTS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5_000);
+
     let mut instructions: Vec<Instruction> = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(350_000),
-        ComputeBudgetInstruction::set_compute_unit_price(1),
-        ix_refresh_reserve(&klend_pk, &market_pk, &repay_reserve_pk),
-        ix_refresh_reserve(&klend_pk, &market_pk, &wdr_reserve_pk),
+        ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
+        ix_refresh_reserve(&klend_pk, &repay_reserve_pk, &repay_reserve_meta),
+        ix_refresh_reserve(&klend_pk, &wdr_reserve_pk, &withdraw_reserve_meta),
         ix_refresh_obligation(&klend_pk, &market_pk, &obligation_pk, &[&repay_reserve_pk, &wdr_reserve_pk]),
     ];
 
@@ -562,11 +865,11 @@ where
         data.extend_from_slice(&0u64.to_le_bytes()); // minAcceptableReceivedLiquidityAmount
         data.extend_from_slice(&0u64.to_le_bytes()); // maxAllowedLtvOverridePercent
 
-        let user_src     = get_ata(&liquidator, &repay_mint_pk);
+        let user_src     = repay_token.source_ata;
         let user_dst_col = get_ata(&liquidator, &wdr_col_mint_pk);
         let user_dst_liq = get_ata(&liquidator, &wdr_liq_mint_pk);
 
-        let accounts = vec![
+        let mut accounts = vec![
             AccountMeta::new_readonly(liquidator, true),
             AccountMeta::new(obligation_pk, false),
             AccountMeta::new_readonly(market_pk, false),
@@ -587,13 +890,30 @@ where
             AccountMeta::new_readonly(token_prog_pk, false), // repay liquidity token program
             AccountMeta::new_readonly(token_prog_pk, false), // withdraw liquidity token program
             AccountMeta::new_readonly(sysvar::instructions::id(), false),
-            // Farm accounts (klend_pk as placeholder — positions without farms use it as no-op)
-            AccountMeta::new(klend_pk, false),
-            AccountMeta::new(klend_pk, false),
-            AccountMeta::new(klend_pk, false),
-            AccountMeta::new(klend_pk, false),
-            AccountMeta::new_readonly(farms_pk, false),
         ];
+        if ix_accs.len() >= 25 {
+            for &account_idx in &ix_accs[20..24] {
+                let pk = Pubkey::from_str(
+                    tx_info.account_keys
+                        .get(account_idx)
+                        .ok_or_else(|| anyhow::anyhow!("missing farm account"))?,
+                )?;
+                accounts.push(AccountMeta::new(pk, false));
+            }
+            let farms_program_idx = *ix_accs.get(24).ok_or_else(|| anyhow::anyhow!("missing farms program"))?;
+            let farms_program_pk = Pubkey::from_str(
+                tx_info.account_keys
+                    .get(farms_program_idx)
+                    .ok_or_else(|| anyhow::anyhow!("missing farms program key"))?,
+            )?;
+            accounts.push(AccountMeta::new_readonly(farms_program_pk, false));
+        } else {
+            accounts.push(AccountMeta::new(klend_pk, false));
+            accounts.push(AccountMeta::new(klend_pk, false));
+            accounts.push(AccountMeta::new(klend_pk, false));
+            accounts.push(AccountMeta::new(klend_pk, false));
+            accounts.push(AccountMeta::new_readonly(farms_pk, false));
+        }
 
         instructions.push(Instruction { program_id: klend_pk, accounts, data });
     }
@@ -613,8 +933,8 @@ where
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
     eprintln!(
-        "[hunter-kamino] FIRING | obligation={} repay={} tip={}",
-        &obligation_str[..8], repay_token.symbol, tip_lamports
+        "[hunter-kamino] FIRING | obligation={} repay={} tip={} cu_price={}",
+        &obligation_str[..8], repay_token.symbol, tip_lamports, compute_unit_price
     );
 
     match jito.send_bundle(vec![tx]).await {
@@ -645,7 +965,7 @@ async fn execute_solend_opportunity<R, JI>(
     rpc: R,
     jito: JI,
     keypair: Arc<Keypair>,
-    wallet_tokens: Vec<WalletToken>,
+    wallet_index: Arc<HashMap<String, WalletTokenRuntime>>,
     cached_blockhash: Arc<tokio::sync::RwLock<solana_sdk::hash::Hash>>,
     cached_tip: Arc<std::sync::atomic::AtomicU64>,
     dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
@@ -656,8 +976,8 @@ where
 {
     // ── 1. getTransaction — single attempt, 500ms hard timeout ───────────────
     let tx_info = tokio::time::timeout(
-        tokio::time::Duration::from_millis(500),
-        rpc.get_transaction(&sig),
+        tokio::time::Duration::from_millis(350),
+        rpc.get_transaction_with_retries(&sig, 1, 0),
     ).await
     .map_err(|_| anyhow::anyhow!("getTransaction timeout"))?
     .map_err(|e| anyhow::anyhow!("getTransaction failed: {}", e))?;
@@ -696,9 +1016,10 @@ where
     // ── 5. Find repay token: competitor ATA that decreased (owned by competitor)
     // We look for a wallet_token whose mint appears in the balances for an
     // account owned by the competitor. That's the token they repaid with.
-    let repay_token = wallet_tokens.iter().find(|wt| {
-        balance_map.values().any(|(mint, owner)| mint == &wt.mint && owner == &competitor)
-    }).ok_or_else(|| anyhow::anyhow!("no matching wallet token for this liquidation"))?;
+    let repay_mint = balance_map.values()
+        .find(|(_, owner)| owner == &competitor)
+        .and_then(|(mint, _)| wallet_index.get(mint))
+        .ok_or_else(|| anyhow::anyhow!("no matching wallet token for this liquidation"))?;
 
     // ── 6. Dedup: skip if we fired on this obligation recently ───────────────
     // Obligation is at accounts[5] for LiquidateWithoutReceivingCtokens
@@ -724,9 +1045,18 @@ where
 
     // ── 7. Build instruction list ────────────────────────────────────────────
     // ComputeBudget: 350k CU (sufficient for refresh x2 + liquidate without flash loan)
+    let compute_unit_limit = std::env::var("SOLEND_COMPUTE_UNIT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(400_000);
+    let compute_unit_price = std::env::var("SOLEND_CU_PRICE_MICROLAMPORTS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5_000);
+
     let mut instructions: Vec<Instruction> = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(350_000),
-        ComputeBudgetInstruction::set_compute_unit_price(1),
+        ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
+        ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
     ];
 
     // Copy all Solend non-liquidate instructions (RefreshReserve, RefreshObligation)
@@ -766,9 +1096,11 @@ where
             if let Some((mint_str, owner)) = balance_map.get(&ai) {
                 if owner == &competitor {
                     // It's the competitor's token account — use our ATA for the same mint
+                    if let Some(runtime) = wallet_index.get(mint_str) {
+                        return AccountMeta::new(runtime.source_ata, false);
+                    }
                     if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
-                        let our_ata = get_ata(&liquidator, &mint_pk);
-                        return AccountMeta::new(our_ata, false);
+                        return AccountMeta::new(get_ata(&liquidator, &mint_pk), false);
                     }
                 }
             }
@@ -801,7 +1133,7 @@ where
 
         // Copy instruction data, replacing liquidity_amount (bytes 8-15) with our cap.
         let mut data = liq_data.clone();
-        let amount = repay_token.max_repay_native;
+        let amount = repay_mint.max_repay_native;
         data[8..16].copy_from_slice(&amount.to_le_bytes());
 
         instructions.push(Instruction { program_id: solend_pk, accounts: acc_metas, data });
@@ -828,7 +1160,7 @@ where
     eprintln!(
         "[hunter-solend] FIRING | obligation={} repay={} tip={}",
         &obligation_key_idx[..8.min(obligation_key_idx.len())],
-        repay_token.symbol,
+        repay_mint.symbol,
         tip_lamports,
     );
 

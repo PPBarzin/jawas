@@ -84,6 +84,54 @@ Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable 
 
 > Les deux containers peuvent partager le **même endpoint QuikNode** (`HUNTER_RPC_URL` / `HUNTER_WS_URL` identiques). QuikNode supporte plusieurs connexions WS simultanées sur une même URL.
 
+### Proposition d'Amélioration — Hunter Kamino
+Objectif : passer d'un hunter "réactif rapide" à un hunter "pré-armé" orienté vitesse pure.
+
+Principe :
+- Le wallet est géré manuellement. On ne chasse que les opportunités dont le `repay token` est déjà détenu.
+- Le hunter Kamino ne doit jamais dépendre de l'Observer.
+- Le hot path cible doit être : `QuickNode WS -> lookup mémoire -> build tx -> Jito`.
+
+Améliorations proposées :
+- Conserver une **whitelist manuelle** des tokens de chasse dans `wallet.toml`.
+- Précharger au démarrage les **ATA du wallet**, les **réserves Kamino utiles** et les **comptes oracle nécessaires aux refresh on-chain**.
+- Réduire au maximum les appels RPC dans le hot path : pas de calcul oracle off-chain, pas de lecture d'obligation à la demande, pas d'enrichissement de logs.
+- Maintenir un **cache mémoire des cibles prioritaires** (obligation, repay reserve, withdraw reserve, marché, comptes oracle).
+- Utiliser le flux hunter en **commitment `processed`** pour gagner les premières centaines de millisecondes.
+- Garder l'Observer en dehors du cycle de tir : il reste un composant de télémétrie uniquement.
+
+État visé :
+- Temps de réaction inférieur à 1 seconde de bout en bout.
+- Tir uniquement sur les paires explicitement préparées dans le wallet.
+- Pipeline Kamino focalisé sur la vitesse, pas sur la compatibilité universelle.
+
+Plan d'attaque immédiat :
+- Renommer l'outil Kamino `inspect_obligation.rs` en `inspect_kamino_obligation.rs` pour lever toute ambiguïté.
+- Ajouter un outil miroir `inspect_solend_obligation.rs` pour diagnostiquer les positions Solend.
+- Aligner progressivement le hunter Solend sur la même discipline que le hunter Kamino : wallet-driven, hot path court, observer totalement hors cycle.
+
+### Outils d'Inspection
+Commandes utiles pour diagnostiquer une obligation à la main :
+
+```bash
+cargo run --bin inspect_kamino_obligation <OBLIGATION_PUBKEY>
+cargo run --bin inspect_solend_obligation <OBLIGATION_PUBKEY>
+cargo run --bin generate_weekly_token_report
+```
+
+Usage :
+- `inspect_kamino_obligation` : affiche les agrégats Kamino on-chain et tente un refresh simulé.
+- `inspect_solend_obligation` : affiche les agrégats Solend décodés depuis le compte obligation.
+- `generate_weekly_token_report` : scanne on-chain les obligations Kamino et Solend proches du seuil de liquidation, agrège les `repay tokens` les plus probables à stocker en wallet, les paires associées, puis insère une ligne dans `jawas-weekly-token`.
+  Le scanner exclut les comptes non plausibles et les positions dont les réserves ne se résolvent pas proprement vers un mint de token.
+
+Variables utiles :
+- `AIRTABLE_TABLE_WEEKLY_TOKEN` : table cible, par défaut `jawas-weekly-token`.
+- `WEEKLY_REPORT_MIN_COLLATERAL_USD` : seuil minimum en USD pour conserver une obligation dans le rapport hebdo. Par défaut `1`. Le filtre est appliqué sur la valeur collatérale on-chain de l'obligation pour éliminer les positions trop petites.
+- `WEEKLY_REPORT_MIN_BORROW` : ancien nom encore accepté comme fallback, mais à remplacer.
+- `WEEKLY_REPORT_TOP_N` : nombre de positions proches retenues pour l'agrégation. Par défaut `50`.
+- `WEEKLY_REPORT_SHORTLIST_SIZE` : nombre de `repay tokens` à afficher dans `Shortlist`. Par défaut `10`. Le champ est formaté avec une pondération relative et le mint complet, par exemple `USDC [EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v] 42.0% (21)`.
+
 ---
 
 ## 🧠 Guide d'Analyse Stratégique (Phase 1)

@@ -95,7 +95,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
     /// to the logger. Runs until the WebSocket stream closes.
     pub async fn watch(&self) -> anyhow::Result<()> {
         let program_id = self.protocol.program_id();
-        let mut rx = self.rpc.subscribe_to_logs(program_id).await?;
+        let mut rx = self.rpc.subscribe_to_logs(program_id, crate::ports::rpc::RpcCommitment::Confirmed).await?;
         let mut liquidations_logged: u64 = 0;
         let mut failed_attempts: VecDeque<FailedLiquidationAttempt> = VecDeque::new();
         let mut seen_signatures: HashSet<String> = HashSet::new();
@@ -652,7 +652,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
-    use crate::ports::rpc::{LogEntry, TransactionInfo};
+    use crate::ports::rpc::{LogEntry, RpcCommitment, TransactionInfo};
 
     struct MockRpcClient {
         rx: Arc<Mutex<Option<mpsc::Receiver<LogEntry>>>>,
@@ -671,6 +671,14 @@ mod tests {
             Ok("mock-1.0".to_string())
         }
         async fn get_transaction(&self, _signature: &str) -> anyhow::Result<TransactionInfo> {
+            self.get_transaction_with_retries(_signature, 1, 0).await
+        }
+        async fn get_transaction_with_retries(
+            &self,
+            _signature: &str,
+            _max_attempts: usize,
+            _retry_delay_ms: u64,
+        ) -> anyhow::Result<TransactionInfo> {
             Ok(TransactionInfo {
                 account_keys: vec![],
                 instruction_accounts: vec![],
@@ -690,7 +698,11 @@ mod tests {
     }
 
     impl StreamingRpcClient for MockRpcClient {
-        async fn subscribe_to_logs(&self, _program_id: &str) -> anyhow::Result<mpsc::Receiver<LogEntry>> {
+        async fn subscribe_to_logs(
+            &self,
+            _program_id: &str,
+            _commitment: RpcCommitment,
+        ) -> anyhow::Result<mpsc::Receiver<LogEntry>> {
             let mut rx_lock = self.rx.lock().unwrap();
             rx_lock.take().ok_or_else(|| anyhow::anyhow!("Stream already consumed"))
         }

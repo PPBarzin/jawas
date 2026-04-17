@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Data logged for every liquidation observed (Phase 1 — watch mode).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationEvent {
     pub timestamp: String,

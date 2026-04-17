@@ -1,15 +1,18 @@
 /// Gross profit from a liquidation before fees.
 /// debt_to_repay in USD, bonus_pct as a decimal (e.g. 0.05 for 5%).
+#[allow(dead_code)]
 pub fn gross_profit(debt_to_repay: f64, bonus_pct: f64) -> f64 {
     debt_to_repay * bonus_pct
 }
 
 /// Net profit after Jito tip and swap fees.
+#[allow(dead_code)]
 pub fn net_profit(gross: f64, jito_tip: f64, swap_fee: f64) -> f64 {
     gross - jito_tip - swap_fee
 }
 
 /// Returns true if the net profit exceeds the configured minimum.
+#[allow(dead_code)]
 pub fn is_worth_it(net: f64, min_profit: f64) -> bool {
     net >= min_profit
 }
