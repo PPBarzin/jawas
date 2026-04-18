@@ -107,7 +107,7 @@ async fn flush_batch(
     buffer: &mut Vec<ObservationEvent>,
 ) -> Result<()> {
     let mut deduped: Vec<ObservationEvent> = Vec::with_capacity(buffer.len());
-    let mut local_seen_tx_signatures: HashSet<String> = HashSet::new();
+    let mut local_seen_keys: HashSet<String> = HashSet::new();
 
     for event in buffer.drain(..) {
         if !is_tx_signature_like(&event.signature) {
@@ -115,7 +115,8 @@ async fn flush_batch(
             continue;
         }
 
-        if local_seen_tx_signatures.insert(event.signature.clone()) {
+        let key = event_dedup_key(&event.signature, &event.status);
+        if local_seen_keys.insert(key) {
             deduped.push(event);
         }
     }
@@ -124,16 +125,16 @@ async fn flush_batch(
         return Ok(());
     }
 
-    let tx_signatures: Vec<String> = deduped
+    let tx_signature_status_pairs: Vec<(String, String)> = deduped
         .iter()
         .filter(|event| is_tx_signature_like(&event.signature))
-        .map(|event| event.signature.clone())
+        .map(|event| (event.signature.clone(), event.status.clone()))
         .collect();
 
-    let existing_signatures = if tx_signatures.is_empty() {
+    let existing_keys = if tx_signature_status_pairs.is_empty() {
         HashSet::new()
     } else {
-        fetch_existing_tx_signatures(client, api_token, base_id, table_watch, &tx_signatures).await?
+        fetch_existing_event_keys(client, api_token, base_id, table_watch, &tx_signature_status_pairs).await?
     };
 
     let url = format!("https://api.airtable.com/v0/{}/{}", base_id, table_watch);
@@ -141,7 +142,8 @@ async fn flush_batch(
     let records: Vec<_> = deduped
         .into_iter()
         .filter(|event| {
-            !is_tx_signature_like(&event.signature) || !existing_signatures.contains(&event.signature)
+            !is_tx_signature_like(&event.signature)
+                || !existing_keys.contains(&event_dedup_key(&event.signature, &event.status))
         })
         .map(|event| {
             json!({
@@ -215,21 +217,31 @@ fn airtable_formula_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\"', "\\\"")
 }
 
-async fn fetch_existing_tx_signatures(
+fn event_dedup_key(signature: &str, status: &str) -> String {
+    format!("{signature}::{status}")
+}
+
+async fn fetch_existing_event_keys(
     client: &Client,
     api_token: &str,
     base_id: &str,
     table_watch: &str,
-    signatures: &[String],
+    signature_status_pairs: &[(String, String)],
 ) -> Result<HashSet<String>> {
-    let unique_signatures: HashSet<&str> = signatures.iter().map(String::as_str).collect();
-    if unique_signatures.is_empty() {
+    let unique_pairs: HashSet<(String, String)> = signature_status_pairs.iter().cloned().collect();
+    if unique_pairs.is_empty() {
         return Ok(HashSet::new());
     }
 
-    let mut formulas: Vec<String> = unique_signatures
+    let mut formulas: Vec<String> = unique_pairs
         .into_iter()
-        .map(|signature| format!("{{Tx Signature}}=\"{}\"", airtable_formula_string(signature)))
+        .map(|(signature, status)| {
+            format!(
+                "AND({{Tx Signature}}=\"{}\",{{Status}}=\"{}\")",
+                airtable_formula_string(&signature),
+                airtable_formula_string(&status),
+            )
+        })
         .collect();
     formulas.sort();
     let filter_formula = if formulas.len() == 1 {
@@ -245,6 +257,7 @@ async fn fetch_existing_tx_signatures(
         .query(&[
             ("filterByFormula", filter_formula.as_str()),
             ("fields[]", "Tx Signature"),
+            ("fields[]", "Status"),
             ("pageSize", "100"),
         ])
         .send()
@@ -265,8 +278,11 @@ async fn fetch_existing_tx_signatures(
     let mut found = HashSet::new();
     if let Some(records) = payload["records"].as_array() {
         for record in records {
-            if let Some(signature) = record["fields"]["Tx Signature"].as_str() {
-                found.insert(signature.to_string());
+            if let (Some(signature), Some(status)) = (
+                record["fields"]["Tx Signature"].as_str(),
+                record["fields"]["Status"].as_str(),
+            ) {
+                found.insert(event_dedup_key(signature, status));
             }
         }
     }
@@ -287,7 +303,7 @@ impl LiquidationLogger for AirtableAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::is_tx_signature_like;
+    use super::{event_dedup_key, is_tx_signature_like};
 
     #[test]
     fn recognizes_realistic_transaction_signatures() {
@@ -296,5 +312,14 @@ mod tests {
         ));
         assert!(!is_tx_signature_like("Jawas Kamino is alive"));
         assert!(!is_tx_signature_like("TIMEOUT_2026-04-18T08:38:08Z"));
+    }
+
+    #[test]
+    fn dedup_key_includes_status() {
+        let signature = "4QRFN9kUnhGbEMAm1BC5ApaRFGzC4gGpyG2qw6UJVi9FRnh6Ma8Ln5EkC5xrHWVVvaooxNmqfAVVA88mtHBBgQFZ";
+        assert_ne!(
+            event_dedup_key(signature, "SUCCESS"),
+            event_dedup_key(signature, "HUNTER_BUNDLE_FAILED"),
+        );
     }
 }
