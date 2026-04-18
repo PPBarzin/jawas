@@ -28,7 +28,10 @@ impl JitoPort for JitoAdapter {
             .map(|tx| {
                 let bytes = bincode::serialize(tx)
                     .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
-                Ok(bs58::encode(bytes).into_string())
+                Ok(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bytes,
+                ))
             })
             .collect::<Result<Vec<String>>>()?;
 
@@ -36,7 +39,7 @@ impl JitoPort for JitoAdapter {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [serialized_txs]
+            "params": [serialized_txs, { "encoding": "base64" }]
         });
 
         let response = self.client.post(&self.url)

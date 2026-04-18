@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const JITO_TIP_ACCOUNT: &str = "96g9sAg9u3P7Q9ebKsC6SA47cySvnV6S1S1K6ssB1vD";
 const KLEND_PROGRAM: &str    = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const TOKEN_PROGRAM: &str    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str      = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
@@ -37,6 +36,16 @@ const SOLEND_LIQUIDATE_FILTER: &str = "LiquidateWithoutReceivingCtokens";
 const KAMINO_LIQUIDATE_FILTER: &str = "LiquidateObligationAndRedeemReserveCollateralV2";
 pub const DEFAULT_KAMINO_REPLAY_SIGNATURE: &str =
     "3V11m9fyEiUqbrihZPF1QJdXW9g6tr4mHS9VtCS2BNSunUeQWvRTgXf48uoC7gXgij8bKp7hSERZ1CZvNhSYgCLA";
+const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+];
 
 /// Tip is refreshed every 60s.
 const TIP_REFRESH_SECS: u64 = 60;
@@ -436,6 +445,37 @@ fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program,
     ).0
+}
+
+fn jito_tip_accounts() -> Vec<Pubkey> {
+    let configured = std::env::var("JITO_TIP_ACCOUNTS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|value| Pubkey::from_str(value.trim()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !configured.is_empty() {
+        return configured;
+    }
+
+    DEFAULT_JITO_TIP_ACCOUNTS
+        .iter()
+        .filter_map(|value| Pubkey::from_str(value).ok())
+        .collect()
+}
+
+fn select_jito_tip_account(seed: &str) -> anyhow::Result<Pubkey> {
+    let accounts = jito_tip_accounts();
+    if accounts.is_empty() {
+        anyhow::bail!("no valid Jito tip account configured");
+    }
+
+    let digest = Sha256::digest(seed.as_bytes());
+    let idx = (digest[0] as usize) % accounts.len();
+    Ok(accounts[idx])
 }
 
 fn optional_pubkey(bytes: [u8; 32]) -> Option<Pubkey> {
@@ -1218,7 +1258,7 @@ where
     let klend_pk      = Pubkey::from_str(KLEND_PROGRAM).unwrap();
     let token_prog_pk = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let farms_pk      = Pubkey::from_str(FARMS_PROGRAM).unwrap();
-    let tip_account   = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
+    let tip_account   = select_jito_tip_account(&sig)?;
 
     let liquidator = keypair.pubkey();
     let reserve_meta_started_at = Instant::now();
@@ -1344,7 +1384,7 @@ where
         repay_mint: Some(repay_mint_str.to_string()),
         repay_symbol: Some(repay_token.symbol.clone()),
         reason: None,
-        detail: Some(format!("tip={} cu_price={} {}", tip_lamports, compute_unit_price, timing_detail)),
+        detail: Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
@@ -1357,7 +1397,7 @@ where
         Some(obligation_str.to_string()),
         Some(liquidator.to_string()),
         Some(repay_token),
-        Some(format!("tip={} cu_price={} {}", tip_lamports, compute_unit_price, timing_detail)),
+        Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
         Some(elapsed_ms_since(ws_received_at_ms)),
     ).await;
     eprintln!(
@@ -1712,7 +1752,7 @@ where
 
     // Jito tip
     let tip_lamports = cached_tip.load(Ordering::Relaxed);
-    let tip_account = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
+    let tip_account = select_jito_tip_account(&sig)?;
     instructions.push(solana_sdk::system_instruction::transfer(
         &keypair.pubkey(), &tip_account, tip_lamports,
     ));
@@ -1748,7 +1788,7 @@ where
         repay_mint: Some(repay_mint.mint.clone()),
         repay_symbol: Some(repay_mint.symbol.clone()),
         reason: None,
-        detail: Some(format!("tip={} cu_price={} {}", tip_lamports, compute_unit_price, timing_detail)),
+        detail: Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
@@ -1761,7 +1801,7 @@ where
         Some(obligation_key_idx.clone()),
         Some(liquidator.to_string()),
         Some(repay_mint),
-        Some(format!("tip={} cu_price={} {}", tip_lamports, compute_unit_price, timing_detail)),
+        Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
         Some(elapsed_ms_since(ws_received_at_ms)),
     ).await;
     eprintln!(

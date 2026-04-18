@@ -303,6 +303,11 @@ OBSERVER_WS_URL=wss://mainnet.helius-rpc.com/?api-key=votre_cle
 # Utilisé pour simuler et envoyer nos propres liquidations (Vitesse critique)
 HUNTER_RPC_URL=https://votre-endpoint-quicknode.com/
 HUNTER_WS_URL=wss://votre-endpoint-quicknode.com/
+JITO_URL=https://mainnet.block-engine.jito.wtf/api/v1/bundles
+
+# Optionnel: override manuel de la liste des 8 tip accounts Jito
+# Sinon Jawas utilise la liste officielle intégrée et en choisit un pseudo-aléatoirement.
+JITO_TIP_ACCOUNTS=3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT,HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe
 
 # Keypair (Phase 2)
 SOLANA_KEYPAIR_PATH=secrets/keypair.json
