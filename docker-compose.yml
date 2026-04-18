@@ -5,11 +5,14 @@ services:
     environment:
       - TARGET_PROTOCOL=KAMINO
       - LOG_FILE=kamino_raw.jsonl
-      - SOLANA_KEYPAIR_PATH=/app/secrets/keypair.json
+      - SOLANA_KEYPAIR_PATH=secrets/keypair.json
+      - WALLET_TOML_PATH=wallet.toml
+      - HUNTER_REPLAY=false
     env_file:
       - .env
     volumes:
       - ./secrets:/app/secrets:ro
+      - ./wallet.toml:/app/wallet.toml:ro
     restart: always
     deploy:
       resources:
@@ -23,11 +26,14 @@ services:
     environment:
       - TARGET_PROTOCOL=SOLEND
       - LOG_FILE=solend_raw.jsonl
-      - SOLANA_KEYPAIR_PATH=/app/secrets/keypair.json
+      - SOLANA_KEYPAIR_PATH=secrets/keypair.json
+      - WALLET_TOML_PATH=wallet.toml
+      - HUNTER_REPLAY=false
     env_file:
       - .env
     volumes:
       - ./secrets:/app/secrets:ro
+      - ./wallet.toml:/app/wallet.toml:ro
     restart: always
     deploy:
       resources:
