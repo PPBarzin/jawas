@@ -274,6 +274,7 @@ async fn fetch_existing_tx_signatures(
     Ok(found)
 }
 
+#[async_trait]
 impl LiquidationLogger for AirtableAdapter {
     async fn log_observation(&self, event: &ObservationEvent) -> Result<()> {
         self.tx

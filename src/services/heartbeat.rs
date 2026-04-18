@@ -57,6 +57,7 @@ impl<L: LiquidationLogger> HeartbeatService<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use tokio::time::{Duration, sleep};
 
@@ -71,6 +72,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl LiquidationLogger for MockLogger {
         async fn log_observation(&self, event: &ObservationEvent) -> anyhow::Result<()> {
             self.events.lock().unwrap().push(event.clone());

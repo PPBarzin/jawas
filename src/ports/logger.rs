@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Data logged for every liquidation observed (Phase 1 — watch mode).
@@ -28,7 +29,7 @@ pub struct ObservationEvent {
 
 /// Port (interface) for logging liquidation events.
 /// Adapters must implement this trait; services depend only on this abstraction.
-#[allow(async_fn_in_trait)]
+#[async_trait]
 pub trait LiquidationLogger: Send + Sync {
     /// Log a liquidation observed on-chain (Phase 1).
     async fn log_observation(&self, event: &ObservationEvent) -> Result<()>;

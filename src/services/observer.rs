@@ -650,6 +650,7 @@ fn extract_u64(content: &str, keyword: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use crate::ports::rpc::{LogEntry, RpcCommitment, TransactionInfo};
@@ -719,6 +720,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl LiquidationLogger for MockLogger {
         async fn log_observation(&self, event: &ObservationEvent) -> anyhow::Result<()> {
             self.events.lock().unwrap().push(event.clone());

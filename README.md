@@ -123,6 +123,7 @@ Les items sont classés du meilleur ratio impact / coût au plus lourd.
 - La sélection de l'instruction Kamino ne repose plus uniquement sur "le plus grand nombre d'accounts" : le discriminator Anchor de liquidation est validé.
 - Un mode `HUNTER_DRY_RUN=true` permet de construire et signer la tx sans l'envoyer à Jito, pour tester le pipeline réel sans risque.
 - L'adapter Airtable filtre maintenant les doublons par `Tx Signature` avant insertion. La dédup en mémoire de l'observer reste utile, mais l'unicité finale est garantie côté écriture.
+- Le hunter pousse aussi ses propres événements dans Airtable via `Status` : `HUNTER_WS_RECEIVED`, `HUNTER_FIRING`, `HUNTER_BUNDLE_SENT`, `HUNTER_BUNDLE_FAILED`.
 
 #### P1 — Ce qui empêche de gagner souvent
 - **Supprimer la dépendance au `getTransaction` du concurrent.**
