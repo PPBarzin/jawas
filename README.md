@@ -119,8 +119,10 @@ Les items sont classés du meilleur ratio impact / coût au plus lourd.
 État actuel :
 - `getTransaction` est maintenant configurable via retries courts (`*_GET_TX_ATTEMPTS`, `*_GET_TX_RETRY_DELAY_MS`, `*_GET_TX_TIMEOUT_MS`) au lieu d'un unique tir brutal.
 - Le hunter écrit désormais un log JSONL structuré (`HUNTER_LOG_FILE`) avec `ws_received`, `skip`, `error`, `firing`, `bundle_sent` et les latences associées.
+- Les détails `firing`, `dry_run`, `bundle_sent` et `bundle_send_failed` incluent maintenant des timings de phase (`get_tx`, `resolve`, `prep`, `build`, `send_bundle`, `total`) pour comparer les RPC en conditions réelles.
 - La sélection de l'instruction Kamino ne repose plus uniquement sur "le plus grand nombre d'accounts" : le discriminator Anchor de liquidation est validé.
 - Un mode `HUNTER_DRY_RUN=true` permet de construire et signer la tx sans l'envoyer à Jito, pour tester le pipeline réel sans risque.
+- L'adapter Airtable filtre maintenant les doublons par `Tx Signature` avant insertion. La dédup en mémoire de l'observer reste utile, mais l'unicité finale est garantie côté écriture.
 
 #### P1 — Ce qui empêche de gagner souvent
 - **Supprimer la dépendance au `getTransaction` du concurrent.**
@@ -302,7 +304,11 @@ HUNTER_RPC_URL=https://votre-endpoint-quicknode.com/
 HUNTER_WS_URL=wss://votre-endpoint-quicknode.com/
 
 # Keypair (Phase 2)
-SOLANA_KEYPAIR_PATH=/app/secrets/keypair.json
+SOLANA_KEYPAIR_PATH=secrets/keypair.json
+
+# Activation fine des services
+ENABLE_HUNTER=true
+ENABLE_OBSERVER=true
 ```
 
 ### 2. Choix des fournisseurs RPC
@@ -319,6 +325,8 @@ Exemple pour Solend :
   jawas-solend:
     environment:
       - TARGET_PROTOCOL=SOLEND
+      - ENABLE_HUNTER=false
+      - ENABLE_OBSERVER=true
       - AIRTABLE_TABLE_WATCH=Jawas-Watch-Solend
 ```
 

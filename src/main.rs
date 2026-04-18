@@ -25,6 +25,16 @@ use solana_sdk::signer::Signer;
 use std::sync::Arc;
 use utils::utc_now;
 
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -61,14 +71,10 @@ async fn main() -> anyhow::Result<()> {
 
     let target_protocol = std::env::var("TARGET_PROTOCOL")
         .unwrap_or_else(|_| "KAMINO".to_string());
-    let replay_enabled = std::env::var("HUNTER_REPLAY")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false);
+    let replay_enabled = env_flag("HUNTER_REPLAY", false);
     let replay_signature = std::env::var("HUNTER_REPLAY_SIGNATURE").ok();
+    let enable_hunter = env_flag("ENABLE_HUNTER", true);
+    let enable_observer = env_flag("ENABLE_OBSERVER", true);
 
     let protocol = match target_protocol.to_uppercase().as_str() {
         "SOLEND" | "SAVE" => Protocol::Solend,
@@ -78,7 +84,9 @@ async fn main() -> anyhow::Result<()> {
     // ── 2. Build adapters ────────────────────────────────────────────────────
     let observer_rpc = HeliusAdapter::new(&observer_rpc_url, &observer_ws_url);
     let hunter_rpc = HeliusAdapter::new(&hunter_rpc_url, &hunter_ws_url);
-    let logger = AirtableAdapter::new(airtable_token, airtable_base_id, "Jawas-Watch".to_string());
+    let airtable_table_watch = std::env::var("AIRTABLE_TABLE_WATCH")
+        .unwrap_or_else(|_| "Jawas-Watch".to_string());
+    let logger = AirtableAdapter::new(airtable_token, airtable_base_id, airtable_table_watch);
     let oracle = SimplePriceOracle::new();
     let jito = JitoAdapter::new(&jito_url);
     let jupiter = JupiterAdapter::new(None);
@@ -88,7 +96,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(300.0);
 
     // ── 3. Load Keypair if Hunter mode is enabled ───────────────────────────
-    let hunter_service = if let Some(path) = keypair_path {
+    let hunter_service = if enable_hunter {
+        let path = keypair_path.ok_or_else(|| anyhow::anyhow!("ENABLE_HUNTER=true but SOLANA_KEYPAIR_PATH is not set"))?;
         println!("  [Hunter] Loading keypair from {}...", path);
         let keypair = Arc::new(read_keypair_file(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read keypair: {}", e))?);
@@ -104,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
             max_repay_usd,
         ))
     } else {
-        println!("  [Hunter] No keypair provided. Running in WATCH mode only.");
+        println!("  [Hunter] Disabled via ENABLE_HUNTER=false.");
         None
     };
 
@@ -200,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── 6. Spawn Observer (logging only, independent of hunter) ─────────────
-    {
+    if enable_observer {
         let logger_for_observer = logger.clone();
         let oracle_for_observer = oracle;
         let rpc_for_observer = observer_rpc;
@@ -222,6 +231,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    } else {
+        println!("  [Observer] Disabled via ENABLE_OBSERVER=false.");
     }
 
     // ── 8. Spawn heartbeat ───────────────────────────────────────────────────

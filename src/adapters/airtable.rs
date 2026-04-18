@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
@@ -105,10 +106,43 @@ async fn flush_batch(
     table_watch: &str,
     buffer: &mut Vec<ObservationEvent>,
 ) -> Result<()> {
+    let mut deduped: Vec<ObservationEvent> = Vec::with_capacity(buffer.len());
+    let mut local_seen_tx_signatures: HashSet<String> = HashSet::new();
+
+    for event in buffer.drain(..) {
+        if !is_tx_signature_like(&event.signature) {
+            deduped.push(event);
+            continue;
+        }
+
+        if local_seen_tx_signatures.insert(event.signature.clone()) {
+            deduped.push(event);
+        }
+    }
+
+    if deduped.is_empty() {
+        return Ok(());
+    }
+
+    let tx_signatures: Vec<String> = deduped
+        .iter()
+        .filter(|event| is_tx_signature_like(&event.signature))
+        .map(|event| event.signature.clone())
+        .collect();
+
+    let existing_signatures = if tx_signatures.is_empty() {
+        HashSet::new()
+    } else {
+        fetch_existing_tx_signatures(client, api_token, base_id, table_watch, &tx_signatures).await?
+    };
+
     let url = format!("https://api.airtable.com/v0/{}/{}", base_id, table_watch);
 
-    let records: Vec<_> = buffer
-        .drain(..)
+    let records: Vec<_> = deduped
+        .into_iter()
+        .filter(|event| {
+            !is_tx_signature_like(&event.signature) || !existing_signatures.contains(&event.signature)
+        })
         .map(|event| {
             json!({
                 "fields": {
@@ -136,6 +170,10 @@ async fn flush_batch(
         })
         .collect();
 
+    if records.is_empty() {
+        return Ok(());
+    }
+
     let body = json!({ "records": records });
 
     let response = client
@@ -157,6 +195,85 @@ async fn flush_batch(
     Ok(())
 }
 
+fn is_tx_signature_like(signature: &str) -> bool {
+    let len_ok = (64..=88).contains(&signature.len());
+    let base58_ok = signature
+        .bytes()
+        .all(|b| matches!(b,
+            b'1'..=b'9' |
+            b'A'..=b'H' |
+            b'J'..=b'N' |
+            b'P'..=b'Z' |
+            b'a'..=b'k' |
+            b'm'..=b'z'
+        ));
+
+    len_ok && base58_ok
+}
+
+fn airtable_formula_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\"', "\\\"")
+}
+
+async fn fetch_existing_tx_signatures(
+    client: &Client,
+    api_token: &str,
+    base_id: &str,
+    table_watch: &str,
+    signatures: &[String],
+) -> Result<HashSet<String>> {
+    let unique_signatures: HashSet<&str> = signatures.iter().map(String::as_str).collect();
+    if unique_signatures.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut formulas: Vec<String> = unique_signatures
+        .into_iter()
+        .map(|signature| format!("{{Tx Signature}}=\"{}\"", airtable_formula_string(signature)))
+        .collect();
+    formulas.sort();
+    let filter_formula = if formulas.len() == 1 {
+        formulas.remove(0)
+    } else {
+        format!("OR({})", formulas.join(","))
+    };
+
+    let url = format!("https://api.airtable.com/v0/{}/{}", base_id, table_watch);
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .query(&[
+            ("filterByFormula", filter_formula.as_str()),
+            ("fields[]", "Tx Signature"),
+            ("pageSize", "100"),
+        ])
+        .send()
+        .await
+        .context("Failed to reach Airtable API for duplicate check")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Airtable duplicate check error {}: {}", status, text);
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse Airtable duplicate-check response")?;
+
+    let mut found = HashSet::new();
+    if let Some(records) = payload["records"].as_array() {
+        for record in records {
+            if let Some(signature) = record["fields"]["Tx Signature"].as_str() {
+                found.insert(signature.to_string());
+            }
+        }
+    }
+
+    Ok(found)
+}
+
 impl LiquidationLogger for AirtableAdapter {
     async fn log_observation(&self, event: &ObservationEvent) -> Result<()> {
         self.tx
@@ -164,5 +281,19 @@ impl LiquidationLogger for AirtableAdapter {
             .await
             .context("Failed to send event to batcher")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_tx_signature_like;
+
+    #[test]
+    fn recognizes_realistic_transaction_signatures() {
+        assert!(is_tx_signature_like(
+            "4QRFN9kUnhGbEMAm1BC5ApaRFGzC4gGpyG2qw6UJVi9FRnh6Ma8Ln5EkC5xrHWVVvaooxNmqfAVVA88mtHBBgQFZ"
+        ));
+        assert!(!is_tx_signature_like("Jawas Kamino is alive"));
+        assert!(!is_tx_signature_like("TIMEOUT_2026-04-18T08:38:08Z"));
     }
 }

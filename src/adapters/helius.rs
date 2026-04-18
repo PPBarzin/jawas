@@ -76,12 +76,7 @@ impl RpcClient for HeliusAdapter {
             let result = &body["result"];
             
             if !result.is_null() {
-                let account_keys: Vec<String> = result["transaction"]["message"]["accountKeys"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect();
+                let account_keys = extract_account_keys(result);
 
                 let raw_instructions = result["transaction"]["message"]["instructions"]
                     .as_array()
@@ -196,6 +191,34 @@ impl RpcClient for HeliusAdapter {
     }
 }
 
+fn parse_pubkey_entry(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.get("pubkey").and_then(|v| v.as_str()).map(str::to_string))
+}
+
+fn extract_account_keys(result: &serde_json::Value) -> Vec<String> {
+    let mut account_keys: Vec<String> = result["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(parse_pubkey_entry)
+        .collect();
+
+    // For versioned v0 transactions, Solana RPC exposes ALT-resolved addresses under
+    // meta.loadedAddresses. Instruction account indices are resolved against the full
+    // account list: static keys first, then loaded writable, then loaded readonly.
+    if let Some(writable) = result["meta"]["loadedAddresses"]["writable"].as_array() {
+        account_keys.extend(writable.iter().filter_map(parse_pubkey_entry));
+    }
+    if let Some(readonly) = result["meta"]["loadedAddresses"]["readonly"].as_array() {
+        account_keys.extend(readonly.iter().filter_map(parse_pubkey_entry));
+    }
+
+    account_keys
+}
+
 fn parse_json_token_balances(value: &serde_json::Value) -> Vec<crate::ports::rpc::TokenBalance> {
     value
         .as_array()
@@ -214,6 +237,47 @@ fn parse_json_token_balances(value: &serde_json::Value) -> Vec<crate::ports::rpc
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_account_keys;
+    use serde_json::json;
+
+    #[test]
+    fn extract_account_keys_appends_loaded_addresses_for_v0() {
+        let result = json!({
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        "Static1111111111111111111111111111111111111",
+                        "Static2222222222222222222222222222222222222"
+                    ]
+                }
+            },
+            "meta": {
+                "loadedAddresses": {
+                    "writable": [
+                        "Writable33333333333333333333333333333333333"
+                    ],
+                    "readonly": [
+                        "Readonly4444444444444444444444444444444444"
+                    ]
+                }
+            }
+        });
+
+        let keys = extract_account_keys(&result);
+        assert_eq!(
+            keys,
+            vec![
+                "Static1111111111111111111111111111111111111".to_string(),
+                "Static2222222222222222222222222222222222222".to_string(),
+                "Writable33333333333333333333333333333333333".to_string(),
+                "Readonly4444444444444444444444444444444444".to_string(),
+            ]
+        );
+    }
 }
 
 impl StreamingRpcClient for HeliusAdapter {

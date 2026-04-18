@@ -1030,13 +1030,17 @@ where
     R: RpcClient,
     JI: JitoPort,
 {
-    // ── 1. getTransaction — single attempt, 500ms hard timeout ───────────────
+    let started_at = Instant::now();
+
+    // ── 1. getTransaction — bounded retry window ─────────────────────────────
+    let tx_fetch_started_at = Instant::now();
     let tx_info = tokio::time::timeout(
         tokio::time::Duration::from_millis(tx_fetch.timeout_ms),
         rpc.get_transaction_with_retries(&sig, tx_fetch.attempts, tx_fetch.retry_delay_ms),
     ).await
-    .map_err(|_| anyhow::anyhow!("getTransaction timeout"))?
-    .map_err(|e| anyhow::anyhow!("getTransaction failed: {}", e))?;
+    .map_err(|_| anyhow::anyhow!("getTransaction timeout after {}ms", tx_fetch_started_at.elapsed().as_millis()))?
+    .map_err(|e| anyhow::anyhow!("getTransaction failed after {}ms: {}", tx_fetch_started_at.elapsed().as_millis(), e))?;
+    let tx_fetch_ms = tx_fetch_started_at.elapsed().as_millis();
 
     // ── 2. Find the liquidate instruction ────────────────────────────────────
     let liquidate_ix_idx = find_kamino_liquidate_ix(&tx_info);
@@ -1069,10 +1073,17 @@ where
             tx_info.account_keys
                 .get(ix_accs[$i])
                 .map(|s| s.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing account at position {}", $i))?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "missing account at position {} (ix_accounts_len={} account_keys_len={} referenced_index={})",
+                    $i,
+                    ix_accs.len(),
+                    tx_info.account_keys.len(),
+                    ix_accs[$i]
+                ))?
         }
     }
 
+    let resolve_started_at = Instant::now();
     let obligation_str    = resolve!(1);
     let market_str        = resolve!(2);
     let market_auth_str   = resolve!(3);
@@ -1085,6 +1096,7 @@ where
     let wdr_col_sup_str   = resolve!(10);
     let wdr_liq_sup_str   = resolve!(11);
     let wdr_fee_str       = resolve!(12);
+    let resolve_ms = resolve_started_at.elapsed().as_millis();
 
     // ── 4. Dedup: skip if we fired on this obligation recently ───────────────
     {
@@ -1155,8 +1167,10 @@ where
     let tip_account   = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
 
     let liquidator = keypair.pubkey();
+    let reserve_meta_started_at = Instant::now();
     let repay_reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &repay_reserve_pk).await?;
     let withdraw_reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &wdr_reserve_pk).await?;
+    let reserve_meta_ms = reserve_meta_started_at.elapsed().as_millis();
 
     // ── 7. Build instructions ────────────────────────────────────────────────
     // Compute budget: 350k CU is sufficient for refresh x2 + refresh_obligation + liquidate.
@@ -1247,6 +1261,7 @@ where
     instructions.push(solana_sdk::system_instruction::transfer(&liquidator, &tip_account, tip_lamports));
 
     // ── 8. Build and sign tx with pre-cached blockhash ───────────────────────
+    let build_started_at = Instant::now();
     let blockhash = *cached_blockhash.read().await;
 
     let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
@@ -1254,6 +1269,16 @@ where
 
     let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
         .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+    let build_ms = build_started_at.elapsed().as_millis();
+    let total_before_send_ms = started_at.elapsed().as_millis();
+    let timing_detail = format_stage_timings(
+        tx_fetch_ms,
+        resolve_ms,
+        reserve_meta_ms,
+        build_ms,
+        None,
+        total_before_send_ms,
+    );
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
     trace_logger.log(HunterTraceEvent {
@@ -1265,7 +1290,7 @@ where
         repay_mint: Some(repay_mint_str.to_string()),
         repay_symbol: Some(repay_token.symbol.clone()),
         reason: None,
-        detail: Some(format!("tip={} cu_price={}", tip_lamports, compute_unit_price)),
+        detail: Some(format!("tip={} cu_price={} {}", tip_lamports, compute_unit_price, timing_detail)),
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
@@ -1288,7 +1313,7 @@ where
             repay_mint: Some(repay_mint_str.to_string()),
             repay_symbol: Some(repay_token.symbol.clone()),
             reason: Some("dry_run_enabled".to_string()),
-            detail: Some(format!("tx_size_bytes={} tip={} cu_price={}", tx_bytes, tip_lamports, compute_unit_price)),
+            detail: Some(format!("tx_size_bytes={} tip={} cu_price={} {}", tx_bytes, tip_lamports, compute_unit_price, timing_detail)),
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
@@ -1300,8 +1325,10 @@ where
         return Ok(());
     }
 
+    let send_started_at = Instant::now();
     match jito.send_bundle(vec![tx]).await {
         Ok(bundle_id) => {
+            let send_bundle_ms = send_started_at.elapsed().as_millis();
             trace_logger.log(HunterTraceEvent {
                 timestamp: crate::utils::utc_now(),
                 protocol: "kamino",
@@ -1311,7 +1338,14 @@ where
                 repay_mint: Some(repay_mint_str.to_string()),
                 repay_symbol: Some(repay_token.symbol.clone()),
                 reason: None,
-                detail: None,
+                detail: Some(format_stage_timings(
+                    tx_fetch_ms,
+                    resolve_ms,
+                    reserve_meta_ms,
+                    build_ms,
+                    Some(send_bundle_ms),
+                    started_at.elapsed().as_millis(),
+                )),
                 ws_received_at_ms: Some(ws_received_at_ms),
                 elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                 bundle_id: Some(bundle_id.clone()),
@@ -1322,6 +1356,7 @@ where
             );
         }
         Err(e) => {
+            let send_bundle_ms = send_started_at.elapsed().as_millis();
             trace_logger.log(HunterTraceEvent {
                 timestamp: crate::utils::utc_now(),
                 protocol: "kamino",
@@ -1331,7 +1366,18 @@ where
                 repay_mint: Some(repay_mint_str.to_string()),
                 repay_symbol: Some(repay_token.symbol.clone()),
                 reason: Some("bundle_send_failed".to_string()),
-                detail: Some(e.to_string()),
+                detail: Some(format!(
+                    "{} | {}",
+                    e,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        reserve_meta_ms,
+                        build_ms,
+                        Some(send_bundle_ms),
+                        started_at.elapsed().as_millis(),
+                    )
+                )),
                 ws_received_at_ms: Some(ws_received_at_ms),
                 elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                 bundle_id: None,
@@ -1372,15 +1418,20 @@ where
     R: RpcClient,
     JI: JitoPort,
 {
-    // ── 1. getTransaction — single attempt, 500ms hard timeout ───────────────
+    let started_at = Instant::now();
+
+    // ── 1. getTransaction — bounded retry window ─────────────────────────────
+    let tx_fetch_started_at = Instant::now();
     let tx_info = tokio::time::timeout(
         tokio::time::Duration::from_millis(tx_fetch.timeout_ms),
         rpc.get_transaction_with_retries(&sig, tx_fetch.attempts, tx_fetch.retry_delay_ms),
     ).await
-    .map_err(|_| anyhow::anyhow!("getTransaction timeout"))?
-    .map_err(|e| anyhow::anyhow!("getTransaction failed: {}", e))?;
+    .map_err(|_| anyhow::anyhow!("getTransaction timeout after {}ms", tx_fetch_started_at.elapsed().as_millis()))?
+    .map_err(|e| anyhow::anyhow!("getTransaction failed after {}ms: {}", tx_fetch_started_at.elapsed().as_millis(), e))?;
+    let tx_fetch_ms = tx_fetch_started_at.elapsed().as_millis();
 
     // ── 2. Find Solend liquidate instruction (most accounts) ─────────────────
+    let resolve_started_at = Instant::now();
     let liq_ix_idx = tx_info.instruction_programs.iter()
         .enumerate()
         .filter(|(_, &prog_idx)| {
@@ -1427,6 +1478,7 @@ where
         .and_then(|&i| tx_info.account_keys.get(i))
         .cloned()
         .unwrap_or_default();
+    let resolve_ms = resolve_started_at.elapsed().as_millis();
 
     if obligation_key_idx.is_empty() {
         anyhow::bail!("could not extract obligation pubkey from Solend tx");
@@ -1576,6 +1628,7 @@ where
     ));
 
     // ── 8. Build and sign tx with pre-cached blockhash ───────────────────────
+    let build_started_at = Instant::now();
     let blockhash = *cached_blockhash.read().await;
     let liquidator = keypair.pubkey();
 
@@ -1584,6 +1637,16 @@ where
 
     let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
         .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+    let build_ms = build_started_at.elapsed().as_millis();
+    let total_before_send_ms = started_at.elapsed().as_millis();
+    let timing_detail = format_stage_timings(
+        tx_fetch_ms,
+        resolve_ms,
+        0,
+        build_ms,
+        None,
+        total_before_send_ms,
+    );
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
     trace_logger.log(HunterTraceEvent {
@@ -1595,7 +1658,7 @@ where
         repay_mint: Some(repay_mint.mint.clone()),
         repay_symbol: Some(repay_mint.symbol.clone()),
         reason: None,
-        detail: Some(format!("tip={} cu_price={}", tip_lamports, compute_unit_price)),
+        detail: Some(format!("tip={} cu_price={} {}", tip_lamports, compute_unit_price, timing_detail)),
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
@@ -1620,7 +1683,7 @@ where
             repay_mint: Some(repay_mint.mint.clone()),
             repay_symbol: Some(repay_mint.symbol.clone()),
             reason: Some("dry_run_enabled".to_string()),
-            detail: Some(format!("tx_size_bytes={} tip={} cu_price={}", tx_bytes, tip_lamports, compute_unit_price)),
+            detail: Some(format!("tx_size_bytes={} tip={} cu_price={} {}", tx_bytes, tip_lamports, compute_unit_price, timing_detail)),
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
@@ -1634,8 +1697,10 @@ where
         return Ok(());
     }
 
+    let send_started_at = Instant::now();
     match jito.send_bundle(vec![tx]).await {
         Ok(bundle_id) => {
+            let send_bundle_ms = send_started_at.elapsed().as_millis();
             trace_logger.log(HunterTraceEvent {
                 timestamp: crate::utils::utc_now(),
                 protocol: "solend",
@@ -1645,7 +1710,14 @@ where
                 repay_mint: Some(repay_mint.mint.clone()),
                 repay_symbol: Some(repay_mint.symbol.clone()),
                 reason: None,
-                detail: None,
+                detail: Some(format_stage_timings(
+                    tx_fetch_ms,
+                    resolve_ms,
+                    0,
+                    build_ms,
+                    Some(send_bundle_ms),
+                    started_at.elapsed().as_millis(),
+                )),
                 ws_received_at_ms: Some(ws_received_at_ms),
                 elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                 bundle_id: Some(bundle_id.clone()),
@@ -1657,6 +1729,7 @@ where
             );
         }
         Err(e) => {
+            let send_bundle_ms = send_started_at.elapsed().as_millis();
             trace_logger.log(HunterTraceEvent {
                 timestamp: crate::utils::utc_now(),
                 protocol: "solend",
@@ -1666,7 +1739,18 @@ where
                 repay_mint: Some(repay_mint.mint.clone()),
                 repay_symbol: Some(repay_mint.symbol.clone()),
                 reason: Some("bundle_send_failed".to_string()),
-                detail: Some(e.to_string()),
+                detail: Some(format!(
+                    "{} | {}",
+                    e,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        0,
+                        build_ms,
+                        Some(send_bundle_ms),
+                        started_at.elapsed().as_millis(),
+                    )
+                )),
                 ws_received_at_ms: Some(ws_received_at_ms),
                 elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                 bundle_id: None,
@@ -1693,6 +1777,24 @@ fn now_ms() -> u64 {
 
 fn elapsed_ms_since(ws_received_at_ms: u64) -> u64 {
     now_ms().saturating_sub(ws_received_at_ms)
+}
+
+fn format_stage_timings(
+    tx_fetch_ms: u128,
+    resolve_ms: u128,
+    prep_ms: u128,
+    build_ms: u128,
+    send_bundle_ms: Option<u128>,
+    total_ms: u128,
+) -> String {
+    match send_bundle_ms {
+        Some(send_bundle_ms) => format!(
+            "timings_ms={{get_tx:{tx_fetch_ms},resolve:{resolve_ms},prep:{prep_ms},build:{build_ms},send_bundle:{send_bundle_ms},total:{total_ms}}}"
+        ),
+        None => format!(
+            "timings_ms={{get_tx:{tx_fetch_ms},resolve:{resolve_ms},prep:{prep_ms},build:{build_ms},total:{total_ms}}}"
+        ),
+    }
 }
 
 fn kamino_liquidate_discriminator() -> [u8; 8] {
