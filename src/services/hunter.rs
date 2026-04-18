@@ -4,6 +4,7 @@ use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::{RpcClient, RpcCommitment, StreamingRpcClient};
 use crate::ports::config::ConfigPort;
 use borsh::BorshDeserialize;
+use serde::Serialize;
 use solana_sdk::signature::Keypair;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
@@ -18,6 +19,8 @@ use std::sync::Arc;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::collections::HashMap;
+use std::io::Write;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const JITO_TIP_ACCOUNT: &str = "96g9sAg9u3P7Q9ebKsC6SA47cySvnV6S1S1K6ssB1vD";
 const KLEND_PROGRAM: &str    = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
@@ -31,11 +34,112 @@ const SOLEND_LIQUIDATE_FILTER: &str = "LiquidateWithoutReceivingCtokens";
 
 // Kamino
 const KAMINO_LIQUIDATE_FILTER: &str = "LiquidateObligationAndRedeemReserveCollateralV2";
+pub const DEFAULT_KAMINO_REPLAY_SIGNATURE: &str =
+    "3V11m9fyEiUqbrihZPF1QJdXW9g6tr4mHS9VtCS2BNSunUeQWvRTgXf48uoC7gXgij8bKp7hSERZ1CZvNhSYgCLA";
 
 /// Tip is refreshed every 60s.
 const TIP_REFRESH_SECS: u64 = 60;
 /// An obligation that was fired on within this window is skipped (prevents burst duplicates).
 const OBLIGATION_DEDUP_MS: u128 = 3_000;
+
+#[derive(Debug, Clone, Copy)]
+struct HunterTxFetchConfig {
+    attempts: usize,
+    retry_delay_ms: u64,
+    timeout_ms: u64,
+}
+
+impl HunterTxFetchConfig {
+    fn from_env(prefix: &str) -> Self {
+        let attempts = std::env::var(format!("{prefix}_GET_TX_ATTEMPTS"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_GET_TX_ATTEMPTS").ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        let retry_delay_ms = std::env::var(format!("{prefix}_GET_TX_RETRY_DELAY_MS"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_GET_TX_RETRY_DELAY_MS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(40);
+        let timeout_ms = std::env::var(format!("{prefix}_GET_TX_TIMEOUT_MS"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_GET_TX_TIMEOUT_MS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(800);
+
+        Self { attempts, retry_delay_ms, timeout_ms }
+    }
+}
+
+fn hunter_dry_run_enabled() -> bool {
+    std::env::var("HUNTER_DRY_RUN")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HunterTraceEvent {
+    timestamp: String,
+    protocol: &'static str,
+    stage: &'static str,
+    signature: String,
+    obligation: Option<String>,
+    repay_mint: Option<String>,
+    repay_symbol: Option<String>,
+    reason: Option<String>,
+    detail: Option<String>,
+    ws_received_at_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    bundle_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct HunterTraceLogger {
+    writer: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+}
+
+impl HunterTraceLogger {
+    fn from_env() -> Self {
+        let path = std::env::var("HUNTER_LOG_FILE")
+            .unwrap_or_else(|_| "hunter_trace.jsonl".to_string());
+
+        if path.eq_ignore_ascii_case("off") || path.eq_ignore_ascii_case("disabled") {
+            return Self { writer: None };
+        }
+
+        let writer = (|| -> std::io::Result<std::fs::File> {
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+        })()
+        .map(|file| Arc::new(std::sync::Mutex::new(file)))
+        .ok();
+
+        Self { writer }
+    }
+
+    fn log(&self, event: HunterTraceEvent) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(&event) else {
+            return;
+        };
+        if let Ok(mut file) = writer.lock() {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+}
 
 /// Token available in the hunter wallet (loaded from wallet.toml at startup).
 #[derive(Debug, Clone)]
@@ -100,22 +204,27 @@ pub fn load_wallet_tokens(path: &str) -> Vec<WalletToken> {
 }
 
 fn parse_toml_str(line: &str, key: &str) -> Option<String> {
-    let prefix = format!("{} =", key);
-    if !line.starts_with(&prefix) { return None; }
-    let rest = line[prefix.len()..].trim();
-    Some(rest.trim_matches('"').to_string())
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    Some(rhs.trim().trim_matches('"').to_string())
 }
 
 fn parse_toml_u8(line: &str, key: &str) -> Option<u8> {
-    let prefix = format!("{} =", key);
-    if !line.starts_with(&prefix) { return None; }
-    line[prefix.len()..].trim().parse().ok()
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    rhs.trim().parse().ok()
 }
 
 fn parse_toml_u64(line: &str, key: &str) -> Option<u64> {
-    let prefix = format!("{} =", key);
-    if !line.starts_with(&prefix) { return None; }
-    let clean: String = line[prefix.len()..].trim().chars().filter(|&c| c != '_').collect();
+    let (lhs, rhs) = line.split_once('=')?;
+    if lhs.trim() != key {
+        return None;
+    }
+    let clean: String = rhs.trim().chars().filter(|&c| c != '_').collect();
     let clean = clean.split('#').next().unwrap_or("").trim();
     clean.parse().ok()
 }
@@ -445,6 +554,7 @@ pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOr
     _config: C,
     keypair: Arc<Keypair>,
     max_repay_usd: f64,
+    trace_logger: HunterTraceLogger,
 }
 
 impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + Clone + 'static> HunterService<R, JI, JU, O, C> {
@@ -465,6 +575,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             _config: config,
             keypair,
             max_repay_usd,
+            trace_logger: HunterTraceLogger::from_env(),
         }
     }
 
@@ -487,6 +598,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
         let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let tx_fetch = HunterTxFetchConfig::from_env("KAMINO");
 
         eprintln!(
             "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | tokens: {}",
@@ -576,16 +688,112 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                 let max_repay   = self.max_repay_usd;
                 let wallet_idx  = wallet_index.clone();
                 let reserve_cache = reserve_cache.clone();
+                let trace_logger = self.trace_logger.clone();
+                let tx_fetch_cfg = tx_fetch;
+                let err_sig = sig.clone();
+                let err_trace_logger = trace_logger.clone();
+
+                trace_logger.log(HunterTraceEvent {
+                    timestamp: crate::utils::utc_now(),
+                    protocol: "kamino",
+                    stage: "ws_received",
+                    signature: sig.clone(),
+                    obligation: extract_obligation_pda_from_logs(&entry.logs),
+                    repay_mint: extract_log_field(&entry.logs, "repay_reserve:"),
+                    repay_symbol: None,
+                    reason: None,
+                    detail: None,
+                    ws_received_at_ms: Some(entry.received_at_ms),
+                    elapsed_ms: Some(0),
+                    bundle_id: None,
+                });
 
                 tokio::spawn(async move {
                     if let Err(e) = execute_kamino_opportunity(
-                        sig, rpc, jito, keypair, wallet_idx, reserve_cache, bh, tip, dedup, max_repay,
+                        sig,
+                        entry.received_at_ms,
+                        rpc,
+                        jito,
+                        keypair,
+                        wallet_idx,
+                        reserve_cache,
+                        bh,
+                        tip,
+                        dedup,
+                        max_repay,
+                        tx_fetch_cfg,
+                        trace_logger,
                     ).await {
+                        err_trace_logger.log(HunterTraceEvent {
+                            timestamp: crate::utils::utc_now(),
+                            protocol: "kamino",
+                            stage: "error",
+                            signature: err_sig.clone(),
+                            obligation: None,
+                            repay_mint: None,
+                            repay_symbol: None,
+                            reason: Some("opportunity_error".to_string()),
+                            detail: Some(e.to_string()),
+                            ws_received_at_ms: Some(entry.received_at_ms),
+                            elapsed_ms: Some(elapsed_ms_since(entry.received_at_ms)),
+                            bundle_id: None,
+                        });
                         eprintln!("[hunter-kamino] opportunity error: {}", e);
                     }
                 });
             }
         }
+    }
+
+    pub async fn replay_kamino(&self, wallet_tokens: Vec<WalletToken>, signature: String) -> anyhow::Result<()>
+    where
+        R: RpcClient + Clone + Send + Sync + 'static,
+        JI: Clone + Send + Sync + 'static,
+    {
+        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let cached_blockhash = Arc::new(tokio::sync::RwLock::new(
+            self.hunter_rpc.get_latest_blockhash().await.unwrap_or_default(),
+        ));
+        let cached_tip = Arc::new(std::sync::atomic::AtomicU64::new(
+            self.jito.get_tip_recommendation().await.unwrap_or(100_000),
+        ));
+        let tx_fetch = HunterTxFetchConfig::from_env("KAMINO");
+        let dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        eprintln!("[hunter-kamino] REPLAY | signature={}", signature);
+        self.trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "kamino",
+            stage: "replay_start",
+            signature: signature.clone(),
+            obligation: None,
+            repay_mint: None,
+            repay_symbol: None,
+            reason: None,
+            detail: Some("manual replay".to_string()),
+            ws_received_at_ms: Some(now_ms()),
+            elapsed_ms: Some(0),
+            bundle_id: None,
+        });
+
+        execute_kamino_opportunity(
+            signature,
+            now_ms(),
+            self.hunter_rpc.clone(),
+            self.jito.clone(),
+            self.keypair.clone(),
+            wallet_index,
+            reserve_cache,
+            cached_blockhash,
+            cached_tip,
+            dedup,
+            self.max_repay_usd,
+            tx_fetch,
+            self.trace_logger.clone(),
+        ).await
     }
 
     // ── Solend autonomous hunter ─────────────────────────────────────────────
@@ -606,6 +814,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         JI: Clone + Send + Sync + 'static,
     {
         let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let tx_fetch = HunterTxFetchConfig::from_env("SOLEND");
 
         eprintln!(
             "[hunter-solend] Starting autonomous hunter. Wallet: {} | tokens: {}",
@@ -690,16 +899,106 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                 let bh        = cached_blockhash.clone();
                 let tip       = cached_tip.clone();
                 let dedup     = recent_obligations.clone();
+                let trace_logger = self.trace_logger.clone();
+                let tx_fetch_cfg = tx_fetch;
+                let err_sig = sig.clone();
+                let err_trace_logger = trace_logger.clone();
+
+                trace_logger.log(HunterTraceEvent {
+                    timestamp: crate::utils::utc_now(),
+                    protocol: "solend",
+                    stage: "ws_received",
+                    signature: sig.clone(),
+                    obligation: None,
+                    repay_mint: None,
+                    repay_symbol: None,
+                    reason: None,
+                    detail: None,
+                    ws_received_at_ms: Some(entry.received_at_ms),
+                    elapsed_ms: Some(0),
+                    bundle_id: None,
+                });
 
                 tokio::spawn(async move {
                     if let Err(e) = execute_solend_opportunity(
-                        sig, rpc, jito, keypair, wallet_idx, bh, tip, dedup,
+                        sig,
+                        entry.received_at_ms,
+                        rpc,
+                        jito,
+                        keypair,
+                        wallet_idx,
+                        bh,
+                        tip,
+                        dedup,
+                        tx_fetch_cfg,
+                        trace_logger,
                     ).await {
+                        err_trace_logger.log(HunterTraceEvent {
+                            timestamp: crate::utils::utc_now(),
+                            protocol: "solend",
+                            stage: "error",
+                            signature: err_sig.clone(),
+                            obligation: None,
+                            repay_mint: None,
+                            repay_symbol: None,
+                            reason: Some("opportunity_error".to_string()),
+                            detail: Some(e.to_string()),
+                            ws_received_at_ms: Some(entry.received_at_ms),
+                            elapsed_ms: Some(elapsed_ms_since(entry.received_at_ms)),
+                            bundle_id: None,
+                        });
                         eprintln!("[hunter-solend] opportunity error: {}", e);
                     }
                 });
             }
         }
+    }
+
+    pub async fn replay_solend(&self, wallet_tokens: Vec<WalletToken>, signature: String) -> anyhow::Result<()>
+    where
+        R: RpcClient + Clone + Send + Sync + 'static,
+        JI: Clone + Send + Sync + 'static,
+    {
+        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let cached_blockhash = Arc::new(tokio::sync::RwLock::new(
+            self.hunter_rpc.get_latest_blockhash().await.unwrap_or_default(),
+        ));
+        let cached_tip = Arc::new(std::sync::atomic::AtomicU64::new(
+            self.jito.get_tip_recommendation().await.unwrap_or(100_000),
+        ));
+        let tx_fetch = HunterTxFetchConfig::from_env("SOLEND");
+        let dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        eprintln!("[hunter-solend] REPLAY | signature={}", signature);
+        self.trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "solend",
+            stage: "replay_start",
+            signature: signature.clone(),
+            obligation: None,
+            repay_mint: None,
+            repay_symbol: None,
+            reason: None,
+            detail: Some("manual replay".to_string()),
+            ws_received_at_ms: Some(now_ms()),
+            elapsed_ms: Some(0),
+            bundle_id: None,
+        });
+
+        execute_solend_opportunity(
+            signature,
+            now_ms(),
+            self.hunter_rpc.clone(),
+            self.jito.clone(),
+            self.keypair.clone(),
+            wallet_index,
+            cached_blockhash,
+            cached_tip,
+            dedup,
+            tx_fetch,
+            self.trace_logger.clone(),
+        ).await
     }
 }
 
@@ -714,6 +1013,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 // which means this works for ANY token pair without a hardcoded lookup table.
 async fn execute_kamino_opportunity<R, JI>(
     sig: String,
+    ws_received_at_ms: u64,
     rpc: R,
     jito: JI,
     keypair: Arc<Keypair>,
@@ -723,6 +1023,8 @@ async fn execute_kamino_opportunity<R, JI>(
     cached_tip: Arc<std::sync::atomic::AtomicU64>,
     dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     max_repay_usd: f64,
+    tx_fetch: HunterTxFetchConfig,
+    trace_logger: HunterTraceLogger,
 ) -> anyhow::Result<()>
 where
     R: RpcClient,
@@ -730,23 +1032,14 @@ where
 {
     // ── 1. getTransaction — single attempt, 500ms hard timeout ───────────────
     let tx_info = tokio::time::timeout(
-        tokio::time::Duration::from_millis(350),
-        rpc.get_transaction_with_retries(&sig, 1, 0),
+        tokio::time::Duration::from_millis(tx_fetch.timeout_ms),
+        rpc.get_transaction_with_retries(&sig, tx_fetch.attempts, tx_fetch.retry_delay_ms),
     ).await
     .map_err(|_| anyhow::anyhow!("getTransaction timeout"))?
     .map_err(|e| anyhow::anyhow!("getTransaction failed: {}", e))?;
 
     // ── 2. Find the liquidate instruction ────────────────────────────────────
-    // The liquidate instruction is the KLend instruction with the most accounts.
-    let liquidate_ix_idx = tx_info.instruction_programs.iter()
-        .enumerate()
-        .filter(|(_, &prog_idx)| {
-            tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(KLEND_PROGRAM)
-        })
-        .max_by_key(|(ix_idx, _)| {
-            tx_info.instruction_accounts.get(*ix_idx).map(|a| a.len()).unwrap_or(0)
-        })
-        .map(|(ix_idx, _)| ix_idx);
+    let liquidate_ix_idx = find_kamino_liquidate_ix(&tx_info);
 
     let ix_idx = liquidate_ix_idx
         .ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
@@ -798,6 +1091,20 @@ where
         let mut map = dedup.lock().unwrap();
         map.retain(|_, t| t.elapsed().as_millis() < OBLIGATION_DEDUP_MS);
         if map.contains_key(obligation_str) {
+            trace_logger.log(HunterTraceEvent {
+                timestamp: crate::utils::utc_now(),
+                protocol: "kamino",
+                stage: "skip",
+                signature: sig.clone(),
+                obligation: Some(obligation_str.to_string()),
+                repay_mint: Some(repay_mint_str.to_string()),
+                repay_symbol: None,
+                reason: Some("dedup".to_string()),
+                detail: None,
+                ws_received_at_ms: Some(ws_received_at_ms),
+                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                bundle_id: None,
+            });
             return Ok(());
         }
         map.insert(obligation_str.to_string(), std::time::Instant::now());
@@ -805,7 +1112,24 @@ where
 
     // ── 5. Check we hold the repay token ────────────────────────────────────
     let repay_token = wallet_index.get(repay_mint_str)
-        .ok_or_else(|| anyhow::anyhow!("no wallet token for repay mint {}", &repay_mint_str[..8]))?;
+        .ok_or_else(|| anyhow::anyhow!("no wallet token for repay mint {}", repay_mint_str))?;
+    if repay_token.max_repay_native == 0 {
+        trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "kamino",
+            stage: "skip",
+            signature: sig.clone(),
+            obligation: Some(obligation_str.to_string()),
+            repay_mint: Some(repay_mint_str.to_string()),
+            repay_symbol: Some(repay_token.symbol.clone()),
+            reason: Some("wallet_token_zero_cap".to_string()),
+            detail: None,
+            ws_received_at_ms: Some(ws_received_at_ms),
+            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+            bundle_id: None,
+        });
+        return Ok(());
+    }
 
     // Cap repay at max_repay_usd (approximate: we cap native amount, not USD)
     // The actual USD cap is enforced by wallet.toml max_repay_native.
@@ -932,17 +1256,88 @@ where
         .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
+    trace_logger.log(HunterTraceEvent {
+        timestamp: crate::utils::utc_now(),
+        protocol: "kamino",
+        stage: "firing",
+        signature: sig.clone(),
+        obligation: Some(obligation_str.to_string()),
+        repay_mint: Some(repay_mint_str.to_string()),
+        repay_symbol: Some(repay_token.symbol.clone()),
+        reason: None,
+        detail: Some(format!("tip={} cu_price={}", tip_lamports, compute_unit_price)),
+        ws_received_at_ms: Some(ws_received_at_ms),
+        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+        bundle_id: None,
+    });
     eprintln!(
         "[hunter-kamino] FIRING | obligation={} repay={} tip={} cu_price={}",
         &obligation_str[..8], repay_token.symbol, tip_lamports, compute_unit_price
     );
 
+    if hunter_dry_run_enabled() {
+        let tx_bytes = bincode::serialize(&tx)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "kamino",
+            stage: "dry_run",
+            signature: sig,
+            obligation: Some(obligation_str.to_string()),
+            repay_mint: Some(repay_mint_str.to_string()),
+            repay_symbol: Some(repay_token.symbol.clone()),
+            reason: Some("dry_run_enabled".to_string()),
+            detail: Some(format!("tx_size_bytes={} tip={} cu_price={}", tx_bytes, tip_lamports, compute_unit_price)),
+            ws_received_at_ms: Some(ws_received_at_ms),
+            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+            bundle_id: None,
+        });
+        eprintln!(
+            "[hunter-kamino] DRY RUN | obligation={} repay={} tx_size={}",
+            &obligation_str[..8], repay_token.symbol, tx_bytes
+        );
+        return Ok(());
+    }
+
     match jito.send_bundle(vec![tx]).await {
-        Ok(bundle_id) => eprintln!(
-            "[hunter-kamino] BUNDLE SENT | obligation={} bundle={}",
-            &obligation_str[..8], &bundle_id[..12.min(bundle_id.len())]
-        ),
-        Err(e) => eprintln!("[hunter-kamino] bundle send failed: {}", e),
+        Ok(bundle_id) => {
+            trace_logger.log(HunterTraceEvent {
+                timestamp: crate::utils::utc_now(),
+                protocol: "kamino",
+                stage: "bundle_sent",
+                signature: sig,
+                obligation: Some(obligation_str.to_string()),
+                repay_mint: Some(repay_mint_str.to_string()),
+                repay_symbol: Some(repay_token.symbol.clone()),
+                reason: None,
+                detail: None,
+                ws_received_at_ms: Some(ws_received_at_ms),
+                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                bundle_id: Some(bundle_id.clone()),
+            });
+            eprintln!(
+                "[hunter-kamino] BUNDLE SENT | obligation={} bundle={}",
+                &obligation_str[..8], &bundle_id[..12.min(bundle_id.len())]
+            );
+        }
+        Err(e) => {
+            trace_logger.log(HunterTraceEvent {
+                timestamp: crate::utils::utc_now(),
+                protocol: "kamino",
+                stage: "error",
+                signature: sig,
+                obligation: Some(obligation_str.to_string()),
+                repay_mint: Some(repay_mint_str.to_string()),
+                repay_symbol: Some(repay_token.symbol.clone()),
+                reason: Some("bundle_send_failed".to_string()),
+                detail: Some(e.to_string()),
+                ws_received_at_ms: Some(ws_received_at_ms),
+                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                bundle_id: None,
+            });
+            eprintln!("[hunter-kamino] bundle send failed: {}", e);
+        }
     }
 
     Ok(())
@@ -962,6 +1357,7 @@ where
 // If the obligation is already healthy, it fails cheaply.
 async fn execute_solend_opportunity<R, JI>(
     sig: String,
+    ws_received_at_ms: u64,
     rpc: R,
     jito: JI,
     keypair: Arc<Keypair>,
@@ -969,6 +1365,8 @@ async fn execute_solend_opportunity<R, JI>(
     cached_blockhash: Arc<tokio::sync::RwLock<solana_sdk::hash::Hash>>,
     cached_tip: Arc<std::sync::atomic::AtomicU64>,
     dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    tx_fetch: HunterTxFetchConfig,
+    trace_logger: HunterTraceLogger,
 ) -> anyhow::Result<()>
 where
     R: RpcClient,
@@ -976,8 +1374,8 @@ where
 {
     // ── 1. getTransaction — single attempt, 500ms hard timeout ───────────────
     let tx_info = tokio::time::timeout(
-        tokio::time::Duration::from_millis(350),
-        rpc.get_transaction_with_retries(&sig, 1, 0),
+        tokio::time::Duration::from_millis(tx_fetch.timeout_ms),
+        rpc.get_transaction_with_retries(&sig, tx_fetch.attempts, tx_fetch.retry_delay_ms),
     ).await
     .map_err(|_| anyhow::anyhow!("getTransaction timeout"))?
     .map_err(|e| anyhow::anyhow!("getTransaction failed: {}", e))?;
@@ -1038,9 +1436,40 @@ where
         let mut map = dedup.lock().unwrap();
         map.retain(|_, t| t.elapsed().as_millis() < OBLIGATION_DEDUP_MS);
         if map.contains_key(&obligation_key_idx) {
+            trace_logger.log(HunterTraceEvent {
+                timestamp: crate::utils::utc_now(),
+                protocol: "solend",
+                stage: "skip",
+                signature: sig.clone(),
+                obligation: Some(obligation_key_idx.clone()),
+                repay_mint: Some(repay_mint.mint.clone()),
+                repay_symbol: Some(repay_mint.symbol.clone()),
+                reason: Some("dedup".to_string()),
+                detail: None,
+                ws_received_at_ms: Some(ws_received_at_ms),
+                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                bundle_id: None,
+            });
             return Ok(());
         }
         map.insert(obligation_key_idx.clone(), std::time::Instant::now());
+    }
+    if repay_mint.max_repay_native == 0 {
+        trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "solend",
+            stage: "skip",
+            signature: sig.clone(),
+            obligation: Some(obligation_key_idx.clone()),
+            repay_mint: Some(repay_mint.mint.clone()),
+            repay_symbol: Some(repay_mint.symbol.clone()),
+            reason: Some("wallet_token_zero_cap".to_string()),
+            detail: None,
+            ws_received_at_ms: Some(ws_received_at_ms),
+            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+            bundle_id: None,
+        });
+        return Ok(());
     }
 
     // ── 7. Build instruction list ────────────────────────────────────────────
@@ -1157,6 +1586,20 @@ where
         .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
+    trace_logger.log(HunterTraceEvent {
+        timestamp: crate::utils::utc_now(),
+        protocol: "solend",
+        stage: "firing",
+        signature: sig.clone(),
+        obligation: Some(obligation_key_idx.clone()),
+        repay_mint: Some(repay_mint.mint.clone()),
+        repay_symbol: Some(repay_mint.symbol.clone()),
+        reason: None,
+        detail: Some(format!("tip={} cu_price={}", tip_lamports, compute_unit_price)),
+        ws_received_at_ms: Some(ws_received_at_ms),
+        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+        bundle_id: None,
+    });
     eprintln!(
         "[hunter-solend] FIRING | obligation={} repay={} tip={}",
         &obligation_key_idx[..8.min(obligation_key_idx.len())],
@@ -1164,13 +1607,72 @@ where
         tip_lamports,
     );
 
-    match jito.send_bundle(vec![tx]).await {
-        Ok(bundle_id) => eprintln!(
-            "[hunter-solend] BUNDLE SENT | obligation={} bundle={}",
+    if hunter_dry_run_enabled() {
+        let tx_bytes = bincode::serialize(&tx)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "solend",
+            stage: "dry_run",
+            signature: sig,
+            obligation: Some(obligation_key_idx.clone()),
+            repay_mint: Some(repay_mint.mint.clone()),
+            repay_symbol: Some(repay_mint.symbol.clone()),
+            reason: Some("dry_run_enabled".to_string()),
+            detail: Some(format!("tx_size_bytes={} tip={} cu_price={}", tx_bytes, tip_lamports, compute_unit_price)),
+            ws_received_at_ms: Some(ws_received_at_ms),
+            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+            bundle_id: None,
+        });
+        eprintln!(
+            "[hunter-solend] DRY RUN | obligation={} repay={} tx_size={}",
             &obligation_key_idx[..8.min(obligation_key_idx.len())],
-            &bundle_id[..12.min(bundle_id.len())]
-        ),
-        Err(e) => eprintln!("[hunter-solend] bundle send failed: {}", e),
+            repay_mint.symbol,
+            tx_bytes
+        );
+        return Ok(());
+    }
+
+    match jito.send_bundle(vec![tx]).await {
+        Ok(bundle_id) => {
+            trace_logger.log(HunterTraceEvent {
+                timestamp: crate::utils::utc_now(),
+                protocol: "solend",
+                stage: "bundle_sent",
+                signature: sig,
+                obligation: Some(obligation_key_idx.clone()),
+                repay_mint: Some(repay_mint.mint.clone()),
+                repay_symbol: Some(repay_mint.symbol.clone()),
+                reason: None,
+                detail: None,
+                ws_received_at_ms: Some(ws_received_at_ms),
+                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                bundle_id: Some(bundle_id.clone()),
+            });
+            eprintln!(
+                "[hunter-solend] BUNDLE SENT | obligation={} bundle={}",
+                &obligation_key_idx[..8.min(obligation_key_idx.len())],
+                &bundle_id[..12.min(bundle_id.len())]
+            );
+        }
+        Err(e) => {
+            trace_logger.log(HunterTraceEvent {
+                timestamp: crate::utils::utc_now(),
+                protocol: "solend",
+                stage: "error",
+                signature: sig,
+                obligation: Some(obligation_key_idx.clone()),
+                repay_mint: Some(repay_mint.mint.clone()),
+                repay_symbol: Some(repay_mint.symbol.clone()),
+                reason: Some("bundle_send_failed".to_string()),
+                detail: Some(e.to_string()),
+                ws_received_at_ms: Some(ws_received_at_ms),
+                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                bundle_id: None,
+            });
+            eprintln!("[hunter-solend] bundle send failed: {}", e);
+        }
     }
 
     Ok(())
@@ -1180,6 +1682,40 @@ where
 /// Used to identify program accounts (always readonly) vs data accounts.
 fn prog_idx_is_program(tx: &crate::ports::rpc::TransactionInfo, ai: usize) -> bool {
     tx.instruction_programs.contains(&ai)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn elapsed_ms_since(ws_received_at_ms: u64) -> u64 {
+    now_ms().saturating_sub(ws_received_at_ms)
+}
+
+fn kamino_liquidate_discriminator() -> [u8; 8] {
+    discriminator("liquidate_obligation_and_redeem_reserve_collateral_v2")
+}
+
+fn find_kamino_liquidate_ix(
+    tx_info: &crate::ports::rpc::TransactionInfo,
+) -> Option<usize> {
+    let expected_disc = kamino_liquidate_discriminator();
+    tx_info
+        .instruction_programs
+        .iter()
+        .enumerate()
+        .find(|(ix_idx, &prog_idx)| {
+            tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(KLEND_PROGRAM)
+                && tx_info
+                    .instruction_data
+                    .get(*ix_idx)
+                    .map(|data| data.len() >= 8 && data[..8] == expected_disc)
+                    .unwrap_or(false)
+        })
+        .map(|(ix_idx, _)| ix_idx)
 }
 
 // ── Solend log helpers ────────────────────────────────────────────────────────
@@ -1204,4 +1740,71 @@ fn extract_log_field(logs: &[String], key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::rpc::TransactionInfo;
+
+    #[test]
+    fn parse_toml_u64_supports_underscores_and_comments() {
+        assert_eq!(
+            parse_toml_u64("max_repay_native = 1_500_000_000  # 1.5 SOL", "max_repay_native"),
+            Some(1_500_000_000)
+        );
+    }
+
+    #[test]
+    fn finds_kamino_liquidate_instruction_by_discriminator() {
+        let mut liquidate_data = kamino_liquidate_discriminator().to_vec();
+        liquidate_data.extend_from_slice(&[0; 24]);
+
+        let tx = TransactionInfo {
+            account_keys: vec![KLEND_PROGRAM.to_string(), "Other111".to_string()],
+            instruction_accounts: vec![vec![0, 1, 2], vec![0, 1, 2, 3, 4, 5]],
+            instruction_programs: vec![0, 0],
+            instruction_data: vec![vec![1, 2, 3], liquidate_data],
+            block_time: None,
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+        };
+
+        assert_eq!(find_kamino_liquidate_ix(&tx), Some(1));
+    }
+
+    #[test]
+    fn hunter_trace_logger_writes_jsonl() {
+        let unique = format!("jawas_hunter_test_{}.jsonl", now_ms());
+        let path = std::env::temp_dir().join(unique);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = HunterTraceLogger {
+            writer: Some(Arc::new(std::sync::Mutex::new(file))),
+        };
+
+        logger.log(HunterTraceEvent {
+            timestamp: "2026-04-18T00:00:00Z".to_string(),
+            protocol: "kamino",
+            stage: "skip",
+            signature: "sig".to_string(),
+            obligation: Some("obl".to_string()),
+            repay_mint: Some("mint".to_string()),
+            repay_symbol: Some("USDC".to_string()),
+            reason: Some("dedup".to_string()),
+            detail: None,
+            ws_received_at_ms: Some(1),
+            elapsed_ms: Some(2),
+            bundle_id: None,
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"stage\":\"skip\""));
+        assert!(content.contains("\"reason\":\"dedup\""));
+
+        let _ = std::fs::remove_file(path);
+    }
 }

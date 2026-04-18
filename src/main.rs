@@ -19,7 +19,7 @@ use ports::rpc::RpcClient;
 use ports::logger::{LiquidationLogger, ObservationEvent};
 use services::heartbeat::HeartbeatService;
 use services::observer::{ObserverService, Protocol};
-use services::hunter::{HunterService, load_wallet_tokens, WalletToken};
+use services::hunter::{HunterService, load_wallet_tokens, WalletToken, DEFAULT_KAMINO_REPLAY_SIGNATURE};
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
 use std::sync::Arc;
@@ -61,6 +61,14 @@ async fn main() -> anyhow::Result<()> {
 
     let target_protocol = std::env::var("TARGET_PROTOCOL")
         .unwrap_or_else(|_| "KAMINO".to_string());
+    let replay_enabled = std::env::var("HUNTER_REPLAY")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    let replay_signature = std::env::var("HUNTER_REPLAY_SIGNATURE").ok();
 
     let protocol = match target_protocol.to_uppercase().as_str() {
         "SOLEND" | "SAVE" => Protocol::Solend,
@@ -148,6 +156,24 @@ async fn main() -> anyhow::Result<()> {
         let wallet_path = std::env::var("WALLET_TOML_PATH")
             .unwrap_or_else(|_| "wallet.toml".to_string());
         let wallet_tokens: Vec<WalletToken> = load_wallet_tokens(&wallet_path);
+
+        if replay_enabled || replay_signature.is_some() {
+            let signature = replay_signature.unwrap_or_else(|| match protocol {
+                Protocol::Kamino => DEFAULT_KAMINO_REPLAY_SIGNATURE.to_string(),
+                Protocol::Solend => {
+                    eprintln!("[hunter-replay] HUNTER_REPLAY_SIGNATURE is required for Solend replay.");
+                    std::process::exit(1);
+                }
+            });
+
+            match protocol {
+                Protocol::Kamino => hunter.replay_kamino(wallet_tokens, signature).await?,
+                Protocol::Solend => hunter.replay_solend(wallet_tokens, signature).await?,
+            }
+
+            println!("Jawas replay completed. Bye!");
+            return Ok(());
+        }
 
         match protocol {
             Protocol::Kamino => {

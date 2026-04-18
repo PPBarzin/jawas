@@ -85,30 +85,87 @@ Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable 
 > Les deux containers peuvent partager le **même endpoint QuikNode** (`HUNTER_RPC_URL` / `HUNTER_WS_URL` identiques). QuikNode supporte plusieurs connexions WS simultanées sur une même URL.
 
 ### Proposition d'Amélioration — Hunter Kamino
-Objectif : passer d'un hunter "réactif rapide" à un hunter "pré-armé" orienté vitesse pure.
+Verdict honnête :
+- Le bot est **opérationnel**, mais il n'est **pas encore dominant**.
+- Il peut gagner contre des opportunités peu disputées ou contre des bots faibles.
+- En duel contre des bots déjà pré-armés, il part encore trop souvent **en retard**.
+- Le vrai problème n'est plus "savoir envoyer une liquidation", c'est **savoir quoi tirer avant les autres** et **tirer sans relire le monde dans le hot path**.
 
-Principe :
+Principe non négociable :
 - Le wallet est géré manuellement. On ne chasse que les opportunités dont le `repay token` est déjà détenu.
 - Le hunter Kamino ne doit jamais dépendre de l'Observer.
 - Le hot path cible doit être : `QuickNode WS -> lookup mémoire -> build tx -> Jito`.
 
-Améliorations proposées :
-- Conserver une **whitelist manuelle** des tokens de chasse dans `wallet.toml`.
-- Précharger au démarrage les **ATA du wallet**, les **réserves Kamino utiles** et les **comptes oracle nécessaires aux refresh on-chain**.
-- Réduire au maximum les appels RPC dans le hot path : pas de calcul oracle off-chain, pas de lecture d'obligation à la demande, pas d'enrichissement de logs.
-- Maintenir un **cache mémoire des cibles prioritaires** (obligation, repay reserve, withdraw reserve, marché, comptes oracle).
-- Utiliser le flux hunter en **commitment `processed`** pour gagner les premières centaines de millisecondes.
-- Garder l'Observer en dehors du cycle de tir : il reste un composant de télémétrie uniquement.
+### Priorités — Impact / Difficulté
+Les items sont classés du meilleur ratio impact / coût au plus lourd.
 
-État visé :
-- Temps de réaction inférieur à 1 seconde de bout en bout.
-- Tir uniquement sur les paires explicitement préparées dans le wallet.
-- Pipeline Kamino focalisé sur la vitesse, pas sur la compatibilité universelle.
+#### P0 — À faire vite
+- **Supprimer tout appel RPC évitable du hot path.**
+  Impact : maximal. Difficulté : moyenne.
+  Tant qu'on fait encore des lectures bloquantes au moment du tir, on joue une course avec un boulet au pied.
+- **Précharger les ATA du wallet, réserves, oracles et mints au démarrage.**
+  Impact : très élevé. Difficulté : faible.
+  C'est le gain le plus propre et le plus immédiat.
+- **Ne tirer que sur les `repay mints` explicitement présents dans `wallet.toml`.**
+  Impact : élevé. Difficulté : faible.
+  Ça évite les branches inutiles et force une discipline de chasse.
+- **Mesurer la latence réelle de bout en bout.**
+  Impact : très élevé. Difficulté : faible.
+  Sans timestamps sur `WS reçu -> build -> signature -> Jito`, on optimise à l'aveugle.
+- **Rendre la stratégie de `priority fee` et de `Jito tip` dynamique.**
+  Impact : élevé. Difficulté : moyenne.
+  Un tip fixe, c'est suffisant pour perdre proprement.
 
-Plan d'attaque immédiat :
-- Renommer l'outil Kamino `inspect_obligation.rs` en `inspect_kamino_obligation.rs` pour lever toute ambiguïté.
-- Ajouter un outil miroir `inspect_solend_obligation.rs` pour diagnostiquer les positions Solend.
-- Aligner progressivement le hunter Solend sur la même discipline que le hunter Kamino : wallet-driven, hot path court, observer totalement hors cycle.
+État actuel :
+- `getTransaction` est maintenant configurable via retries courts (`*_GET_TX_ATTEMPTS`, `*_GET_TX_RETRY_DELAY_MS`, `*_GET_TX_TIMEOUT_MS`) au lieu d'un unique tir brutal.
+- Le hunter écrit désormais un log JSONL structuré (`HUNTER_LOG_FILE`) avec `ws_received`, `skip`, `error`, `firing`, `bundle_sent` et les latences associées.
+- La sélection de l'instruction Kamino ne repose plus uniquement sur "le plus grand nombre d'accounts" : le discriminator Anchor de liquidation est validé.
+- Un mode `HUNTER_DRY_RUN=true` permet de construire et signer la tx sans l'envoyer à Jito, pour tester le pipeline réel sans risque.
+
+#### P1 — Ce qui empêche de gagner souvent
+- **Supprimer la dépendance au `getTransaction` du concurrent.**
+  Impact : maximal. Difficulté : élevée.
+  Tant qu'on reconstruit à partir de la tx d'un autre, on chasse en réaction. Les meilleurs bots sont déjà partis.
+- **Maintenir un cache mémoire des cibles prioritaires.**
+  Impact : maximal. Difficulté : élevée.
+  Il faut connaître à l'avance : obligation, repay reserve, withdraw reserve, marché, comptes oracle.
+- **Fiabiliser le scanner hebdo comme socle wallet-driven.**
+  Impact : élevé. Difficulté : moyenne.
+  Le wallet doit être construit sur des repay mints plausibles, pas sur du bruit RPC.
+- **Durcir encore les filtres de cohérence Kamino/Solend.**
+  Impact : élevé. Difficulté : moyenne.
+  Si le scanner laisse passer des faux positifs, il pollue le wallet puis le hunter.
+
+#### P2 — Ce qui fait passer de "fonctionne" à "compétitif"
+- **Construire une vraie watchlist propriétaire des obligations proches du seuil.**
+  Impact : maximal. Difficulté : élevée.
+  C'est là que se crée l'avantage informationnel.
+- **Faire évoluer le hunter Kamino vers un mode réellement pré-armé.**
+  Impact : maximal. Difficulté : élevée.
+  Le but est de ne plus découvrir la cible pendant le tir.
+- **Ajuster l'infra pour minimiser la distance au leader et la variance réseau.**
+  Impact : élevé. Difficulté : élevée.
+  Si l'infra est lente, le code ne sauvera pas la course.
+
+#### P3 — Important mais secondaire
+- **Rendre le scanner hebdo plus lisible pour la préparation du wallet.**
+  Impact : moyen. Difficulté : faible.
+  Le rapport doit rester orienté `repay mint`, pas curiosité analytique.
+- **Élargir le catalogue token local.**
+  Impact : moyen. Difficulté : faible.
+  C'est du confort opérationnel, pas un edge.
+- **Nettoyer les outils d'inspection et les rapprocher du comportement on-chain réel.**
+  Impact : moyen. Difficulté : faible.
+  Utile pour diagnostiquer, pas pour gagner une course.
+- **AutoSwap après liquidation.**
+  Impact : moyen. Difficulté : moyenne.
+  Si un tir gagne, il faut pouvoir swapper automatiquement le collatéral reçu vers un actif cible défini par `.env` et autorisé dans `wallet.toml` (exemple : `USDC`). Ce n'est pas ce qui fait gagner le duel, mais c'est ce qui évite de finir avec un wallet poubelle.
+
+### Ce qu'il faut accepter
+- Un bot "réactif rapide" peut liquider.
+- Un bot "pré-armé" gagne les duels.
+- Aujourd'hui, le projet est entre les deux.
+- Si l'objectif est de gagner souvent, la cible n'est pas "faire plus de features". La cible est : **moins de lectures, moins de branches, moins de dépendances, plus de préparation mémoire**.
 
 ### Outils d'Inspection
 Commandes utiles pour diagnostiquer une obligation à la main :
@@ -131,6 +188,25 @@ Variables utiles :
 - `WEEKLY_REPORT_MIN_BORROW` : ancien nom encore accepté comme fallback, mais à remplacer.
 - `WEEKLY_REPORT_TOP_N` : nombre de positions proches retenues pour l'agrégation. Par défaut `50`.
 - `WEEKLY_REPORT_SHORTLIST_SIZE` : nombre de `repay tokens` à afficher dans `Shortlist`. Par défaut `10`. Le champ est formaté avec une pondération relative et le mint complet, par exemple `USDC [EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v] 42.0% (21)`.
+- `HUNTER_LOG_FILE` : chemin du log JSONL du hunter. Par défaut `hunter_trace.jsonl`. Mettre `off` pour désactiver.
+- `HUNTER_DRY_RUN` : si `true`, le hunter va jusqu'au build/sign de la tx puis s'arrête avant `sendBundle`. Le log contient alors un événement `dry_run`.
+- `HUNTER_REPLAY` : si `true`, Jawas exécute un replay one-shot du hunter au boot puis s'arrête.
+- `HUNTER_REPLAY_SIGNATURE` : signature à rejouer. Si absente en mode Kamino, Jawas utilise un fallback codé en dur (`3V11m9fyEiUqbrihZPF1QJdXW9g6tr4mHS9VtCS2BNSunUeQWvRTgXf48uoC7gXgij8bKp7hSERZ1CZvNhSYgCLA`).
+- `HUNTER_GET_TX_ATTEMPTS`, `HUNTER_GET_TX_RETRY_DELAY_MS`, `HUNTER_GET_TX_TIMEOUT_MS` : réglages globaux du fetch `getTransaction`.
+- `KAMINO_GET_TX_ATTEMPTS`, `KAMINO_GET_TX_RETRY_DELAY_MS`, `KAMINO_GET_TX_TIMEOUT_MS` : overrides spécifiques Kamino.
+- `SOLEND_GET_TX_ATTEMPTS`, `SOLEND_GET_TX_RETRY_DELAY_MS`, `SOLEND_GET_TX_TIMEOUT_MS` : overrides spécifiques Solend.
+- `BLOCKHASH_REFRESH_SECS` : rester pragmatique. Un refresh trop agressif peut exploser le quota QuickNode. Une valeur autour de `12` secondes est acceptable si le budget API est serré.
+
+Tests utiles :
+```bash
+cargo check
+cargo test hunter::tests -- --nocapture
+```
+
+Exemple de replay local Kamino :
+```bash
+HUNTER_REPLAY=true HUNTER_DRY_RUN=true SOLANA_KEYPAIR_PATH=secrets/keypair.json cargo run --bin jawas
+```
 
 ---
 
