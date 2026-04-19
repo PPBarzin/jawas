@@ -1236,8 +1236,28 @@ where
     }
 
     // ── 5. Check we hold the repay token ────────────────────────────────────
-    let repay_token = wallet_index.get(repay_mint_str)
-        .ok_or_else(|| anyhow::anyhow!("no wallet token for repay mint {}", repay_mint_str))?;
+    let Some(repay_token) = wallet_index.get(repay_mint_str) else {
+        trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "kamino",
+            stage: "skip",
+            signature: sig.clone(),
+            obligation: Some(obligation_str.to_string()),
+            repay_mint: Some(repay_mint_str.to_string()),
+            repay_symbol: None,
+            reason: Some("token_not_whitelisted".to_string()),
+            detail: Some("token not whitelisted".to_string()),
+            ws_received_at_ms: Some(ws_received_at_ms),
+            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+            bundle_id: None,
+        });
+        eprintln!(
+            "[hunter-kamino] skip: token not whitelisted | obligation={} repay_mint={}",
+            obligation_str.chars().take(8).collect::<String>(),
+            repay_mint_str
+        );
+        return Ok(());
+    };
     if repay_token.max_repay_native == 0 {
         trace_logger.log(HunterTraceEvent {
             timestamp: crate::utils::utc_now(),
@@ -1614,10 +1634,32 @@ where
     // ── 5. Find repay token: competitor ATA that decreased (owned by competitor)
     // We look for a wallet_token whose mint appears in the balances for an
     // account owned by the competitor. That's the token they repaid with.
-    let repay_mint = balance_map.values()
+    let repay_mint_str = balance_map.values()
         .find(|(_, owner)| owner == &competitor)
-        .and_then(|(mint, _)| wallet_index.get(mint))
-        .ok_or_else(|| anyhow::anyhow!("no matching wallet token for this liquidation"))?;
+        .map(|(mint, _)| mint.clone())
+        .ok_or_else(|| anyhow::anyhow!("could not identify repay mint for this liquidation"))?;
+
+    let Some(repay_mint) = wallet_index.get(&repay_mint_str) else {
+        trace_logger.log(HunterTraceEvent {
+            timestamp: crate::utils::utc_now(),
+            protocol: "solend",
+            stage: "skip",
+            signature: sig.clone(),
+            obligation: None,
+            repay_mint: Some(repay_mint_str.clone()),
+            repay_symbol: None,
+            reason: Some("token_not_whitelisted".to_string()),
+            detail: Some("token not whitelisted".to_string()),
+            ws_received_at_ms: Some(ws_received_at_ms),
+            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+            bundle_id: None,
+        });
+        eprintln!(
+            "[hunter-solend] skip: token not whitelisted | repay_mint={}",
+            repay_mint_str
+        );
+        return Ok(());
+    };
 
     // ── 6. Dedup: skip if we fired on this obligation recently ───────────────
     // Obligation is at accounts[5] for LiquidateWithoutReceivingCtokens

@@ -82,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── 2. Build adapters ────────────────────────────────────────────────────
-    let observer_rpc = HeliusAdapter::new(&observer_rpc_url, &observer_ws_url);
-    let hunter_rpc = HeliusAdapter::new(&hunter_rpc_url, &hunter_ws_url);
+    let observer_rpc = HeliusAdapter::with_tx_commitment(&observer_rpc_url, &observer_ws_url, "confirmed");
+    let hunter_rpc = HeliusAdapter::with_tx_commitment(&hunter_rpc_url, &hunter_ws_url, "processed");
     let airtable_table_watch = std::env::var("AIRTABLE_TABLE_WATCH")
         .unwrap_or_else(|_| "Jawas-Watch".to_string());
     let logger = AirtableAdapter::new(airtable_token, airtable_base_id, airtable_table_watch);

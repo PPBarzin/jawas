@@ -17,12 +17,17 @@ pub struct HeliusAdapter {
     ws_url: String,
     rpc_url: String,
     http_client: HttpClient,
+    tx_commitment: String,
 }
 
 impl HeliusAdapter {
     /// Constructs the adapter from a raw URL string.
     /// Trailing slashes are stripped to avoid double-slash issues with QuickNode URLs.
     pub fn new(rpc_url: &str, ws_url: &str) -> Self {
+        Self::with_tx_commitment(rpc_url, ws_url, "confirmed")
+    }
+
+    pub fn with_tx_commitment(rpc_url: &str, ws_url: &str, tx_commitment: &str) -> Self {
         let url = rpc_url.trim_end_matches('/').to_string();
         let ws = ws_url.trim_end_matches('/').to_string();
         Self {
@@ -30,7 +35,88 @@ impl HeliusAdapter {
             ws_url: ws,
             rpc_url: url,
             http_client: HttpClient::new(),
+            tx_commitment: tx_commitment.to_string(),
         }
+    }
+
+    async fn get_transaction_with_commitment(
+        &self,
+        signature: &str,
+        commitment: &str,
+        max_attempts: usize,
+        retry_delay_ms: u64,
+    ) -> Result<Option<TransactionInfo>> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0, "commitment": commitment}]
+        });
+
+        let max_attempts = max_attempts.max(1);
+
+        for attempt_idx in 0..max_attempts {
+            let resp = self.http_client
+                .post(&self.rpc_url)
+                .json(&payload)
+                .send()
+                .await
+                .context("getTransaction HTTP request failed")?;
+
+            let body: serde_json::Value = resp.json().await.context("getTransaction response parse failed")?;
+
+            let result = &body["result"];
+
+            if !result.is_null() {
+                let account_keys = extract_account_keys(result);
+
+                let raw_instructions = result["transaction"]["message"]["instructions"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .clone();
+
+                let mut instruction_accounts: Vec<Vec<usize>> = Vec::new();
+                let mut instruction_programs: Vec<usize> = Vec::new();
+                let mut instruction_data: Vec<Vec<u8>> = Vec::new();
+
+                for instr in &raw_instructions {
+                    let prog_idx = instr["programIdIndex"].as_u64().unwrap_or(0) as usize;
+                    let accounts: Vec<usize> = instr["accounts"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect();
+                    let data_bytes = instr["data"]
+                        .as_str()
+                        .and_then(|s| bs58::decode(s).into_vec().ok())
+                        .unwrap_or_default();
+                    instruction_programs.push(prog_idx);
+                    instruction_accounts.push(accounts);
+                    instruction_data.push(data_bytes);
+                }
+
+                let block_time = result["blockTime"].as_u64();
+                let pre_token_balances = parse_json_token_balances(&result["meta"]["preTokenBalances"]);
+                let post_token_balances = parse_json_token_balances(&result["meta"]["postTokenBalances"]);
+
+                return Ok(Some(TransactionInfo {
+                    account_keys,
+                    instruction_accounts,
+                    instruction_programs,
+                    instruction_data,
+                    block_time,
+                    pre_token_balances,
+                    post_token_balances,
+                }));
+            }
+
+            if attempt_idx + 1 < max_attempts {
+                tokio::time::sleep(tokio::time::Duration::from_millis(retry_delay_ms)).await;
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -53,81 +139,29 @@ impl RpcClient for HeliusAdapter {
         max_attempts: usize,
         retry_delay_ms: u64,
     ) -> Result<TransactionInfo> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}]
-        });
-
-        let mut attempts = 0;
-        let max_attempts = max_attempts.max(1);
-
-        loop {
-            let resp = self.http_client
-                .post(&self.rpc_url)
-                .json(&payload)
-                .send()
-                .await
-                .context("getTransaction HTTP request failed")?;
-
-            let body: serde_json::Value = resp.json().await.context("getTransaction response parse failed")?;
-
-            let result = &body["result"];
-            
-            if !result.is_null() {
-                let account_keys = extract_account_keys(result);
-
-                let raw_instructions = result["transaction"]["message"]["instructions"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .clone();
-
-                let mut instruction_accounts: Vec<Vec<usize>> = Vec::new();
-                let mut instruction_programs: Vec<usize> = Vec::new();
-
-                let mut instruction_data: Vec<Vec<u8>> = Vec::new();
-                for instr in &raw_instructions {
-                    let prog_idx = instr["programIdIndex"].as_u64().unwrap_or(0) as usize;
-                    let accounts: Vec<usize> = instr["accounts"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as usize))
-                        .collect();
-                    // Instruction data is base58-encoded in JSON format.
-                    let data_bytes = instr["data"]
-                        .as_str()
-                        .and_then(|s| bs58::decode(s).into_vec().ok())
-                        .unwrap_or_default();
-                    instruction_programs.push(prog_idx);
-                    instruction_accounts.push(accounts);
-                    instruction_data.push(data_bytes);
-                }
-
-                let block_time = result["blockTime"].as_u64();
-
-                let pre_token_balances = parse_json_token_balances(&result["meta"]["preTokenBalances"]);
-                let post_token_balances = parse_json_token_balances(&result["meta"]["postTokenBalances"]);
-
-                return Ok(TransactionInfo {
-                    account_keys,
-                    instruction_accounts,
-                    instruction_programs,
-                    instruction_data,
-                    block_time,
-                    pre_token_balances,
-                    post_token_balances,
-                });
-            }
-
-            attempts += 1;
-            if attempts >= max_attempts {
-                anyhow::bail!("getTransaction returned null for signature {} after {} attempts", signature, max_attempts);
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(retry_delay_ms)).await;
+        if let Some(info) = self
+            .get_transaction_with_commitment(signature, &self.tx_commitment, max_attempts, retry_delay_ms)
+            .await?
+        {
+            return Ok(info);
         }
+
+        if self.tx_commitment != "confirmed" {
+            let fallback_attempts = (max_attempts / 2).max(1);
+            if let Some(info) = self
+                .get_transaction_with_commitment(signature, "confirmed", fallback_attempts, retry_delay_ms)
+                .await?
+            {
+                return Ok(info);
+            }
+        }
+
+        anyhow::bail!(
+            "getTransaction returned null for signature {} after {} attempts (primary_commitment={} fallback=confirmed)",
+            signature,
+            max_attempts,
+            self.tx_commitment,
+        );
     }
 
     async fn get_account_info(&self, pubkey: &str) -> Result<Vec<u8>> {
