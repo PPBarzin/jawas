@@ -91,6 +91,25 @@ fn hunter_dry_run_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn kamino_logs_look_like_liquidation(logs: &[String]) -> bool {
+    logs.iter().any(|log| {
+        let lower = log.to_ascii_lowercase();
+        lower.contains("liquidate") || lower.contains("[truncated]")
+    })
+}
+
+fn summarize_candidate_logs(logs: &[String]) -> String {
+    logs.iter()
+        .filter(|log| {
+            let lower = log.to_ascii_lowercase();
+            lower.contains("liquidate") || lower.contains("flashborrow") || lower.contains("[truncated]")
+        })
+        .take(4)
+        .map(|log| log.replace('\n', " "))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HunterTraceEvent {
     timestamp: String,
@@ -713,8 +732,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     }
                 };
 
-                // Ignore transactions that don't contain a liquidation call.
-                if !entry.logs.iter().any(|l| l.contains(KAMINO_LIQUIDATE_FILTER)) {
+                // Ignore transactions that don't look like a liquidation candidate.
+                if !kamino_logs_look_like_liquidation(&entry.logs) {
                     continue;
                 }
 
@@ -745,7 +764,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     repay_mint: extract_log_field(&entry.logs, "repay_reserve:"),
                     repay_symbol: None,
                     reason: None,
-                    detail: None,
+                    detail: Some(summarize_candidate_logs(&entry.logs)),
                     ws_received_at_ms: Some(entry.received_at_ms),
                     elapsed_ms: Some(0),
                     bundle_id: None,
@@ -758,7 +777,7 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     None,
                     Some(hunter_wallet.clone()),
                     None,
-                    None,
+                    Some(summarize_candidate_logs(&entry.logs)),
                     Some(0),
                 ).await;
 
