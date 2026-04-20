@@ -5,7 +5,7 @@ services:
     environment:
       - TARGET_PROTOCOL=KAMINO
       - ENABLE_HUNTER=true
-      - ENABLE_OBSERVER=true
+      - ENABLE_OBSERVER=false
       - LOG_FILE=kamino_raw.jsonl
       - SOLANA_KEYPAIR_PATH=secrets/keypair.json
       - WALLET_TOML_PATH=wallet.toml
@@ -28,7 +28,7 @@ services:
     environment:
       - TARGET_PROTOCOL=SOLEND
       - ENABLE_HUNTER=false
-      - ENABLE_OBSERVER=true
+      - ENABLE_OBSERVER=false
       - LOG_FILE=solend_raw.jsonl
       - SOLANA_KEYPAIR_PATH=secrets/keypair.json
       - WALLET_TOML_PATH=wallet.toml

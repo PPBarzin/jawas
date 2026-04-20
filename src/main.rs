@@ -23,7 +23,7 @@ use services::hunter::{HunterService, load_wallet_tokens, WalletToken, DEFAULT_K
 use solana_sdk::signature::read_keypair_file;
 use solana_sdk::signer::Signer;
 use std::sync::Arc;
-use utils::utc_now;
+use utils::{log_stderr, log_stdout, utc_now};
 
 fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
@@ -35,11 +35,15 @@ fn env_flag(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_string(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    println!("Jawas Phase 2: Booting...");
+    log_stdout("Jawas Phase 2: Booting...");
 
     // ── 1. Load config from environment ─────────────────────────────────────
     let observer_rpc_url = std::env::var("OBSERVER_RPC_URL")
@@ -82,8 +86,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── 2. Build adapters ────────────────────────────────────────────────────
-    let observer_rpc = HeliusAdapter::with_tx_commitment(&observer_rpc_url, &observer_ws_url, "confirmed");
-    let hunter_rpc = HeliusAdapter::with_tx_commitment(&hunter_rpc_url, &hunter_ws_url, "processed");
+    let observer_tx_commitment = env_string("OBSERVER_TX_COMMITMENT", "confirmed");
+    let hunter_tx_commitment = env_string("HUNTER_TX_COMMITMENT", "confirmed");
+    let observer_rpc = HeliusAdapter::with_tx_commitment(&observer_rpc_url, &observer_ws_url, &observer_tx_commitment);
+    let hunter_rpc = HeliusAdapter::with_tx_commitment(&hunter_rpc_url, &hunter_ws_url, &hunter_tx_commitment);
     let airtable_table_watch = std::env::var("AIRTABLE_TABLE_WATCH")
         .unwrap_or_else(|_| "Jawas-Watch".to_string());
     let logger = AirtableAdapter::new(airtable_token, airtable_base_id, airtable_table_watch);
@@ -98,10 +104,10 @@ async fn main() -> anyhow::Result<()> {
     // ── 3. Load Keypair if Hunter mode is enabled ───────────────────────────
     let hunter_service = if enable_hunter {
         let path = keypair_path.ok_or_else(|| anyhow::anyhow!("ENABLE_HUNTER=true but SOLANA_KEYPAIR_PATH is not set"))?;
-        println!("  [Hunter] Loading keypair from {}...", path);
+        log_stdout(format!("  [Hunter] Loading keypair from {}...", path));
         let keypair = Arc::new(read_keypair_file(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read keypair: {}", e))?);
-        println!("  [Hunter] Wallet: {}", keypair.pubkey());
+        log_stdout(format!("  [Hunter] Wallet: {}", keypair.pubkey()));
         
         Some(HunterService::new(
             hunter_rpc.clone(),
@@ -113,22 +119,22 @@ async fn main() -> anyhow::Result<()> {
             max_repay_usd,
         ))
     } else {
-        println!("  [Hunter] Disabled via ENABLE_HUNTER=false.");
+        log_stdout("  [Hunter] Disabled via ENABLE_HUNTER=false.");
         None
     };
 
     // ── 4. Health check — Solana RPC ─────────────────────────────────────────
-    print!("  [RPC] Connecting to Solana (Observer)... ");
+    print!("[{}]   [RPC] Connecting to Solana (Observer)... ", utc_now());
     match observer_rpc.get_version().await {
         Ok(version) => println!("OK (solana-core {})", version),
         Err(e) => {
-            eprintln!("FAILED\n  → {}", e);
+            eprintln!("FAILED\n[{}]   → {}", utc_now(), e);
             std::process::exit(1);
         }
     }
 
     // ── 4. Health check — Airtable ───────────────────────────────────────────
-    print!("  [Airtable] Sending boot ping... ");
+    print!("[{}]   [Airtable] Sending boot ping... ", utc_now());
     let ping_event = ObservationEvent {
         timestamp: utc_now(),
         signature: format!("Jawas {} is alive", protocol.name()),
@@ -153,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     match logger.log_observation(&ping_event).await {
         Ok(_) => println!("OK"),
         Err(e) => {
-            eprintln!("FAILED\n  → {}", e);
+            eprintln!("FAILED\n[{}]   → {}", utc_now(), e);
             std::process::exit(1);
         }
     }
@@ -170,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
             let signature = replay_signature.unwrap_or_else(|| match protocol {
                 Protocol::Kamino => DEFAULT_KAMINO_REPLAY_SIGNATURE.to_string(),
                 Protocol::Solend => {
-                    eprintln!("[hunter-replay] HUNTER_REPLAY_SIGNATURE is required for Solend replay.");
+                    log_stderr("[hunter-replay] HUNTER_REPLAY_SIGNATURE is required for Solend replay.");
                     std::process::exit(1);
                 }
             });
@@ -180,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
                 Protocol::Solend => hunter.replay_solend(wallet_tokens, signature).await?,
             }
 
-            println!("Jawas replay completed. Bye!");
+            log_stdout("Jawas replay completed. Bye!");
             return Ok(());
         }
 
@@ -189,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     loop {
                         if let Err(e) = hunter.run_kamino(wallet_tokens.clone()).await {
-                            eprintln!("[hunter-kamino] exited: {}. Restarting in 2s...", e);
+                            log_stderr(format!("[hunter-kamino] exited: {}. Restarting in 2s...", e));
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
                     }
@@ -199,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     loop {
                         if let Err(e) = hunter.run_solend(wallet_tokens.clone()).await {
-                            eprintln!("[hunter-solend] exited: {}. Restarting in 2s...", e);
+                            log_stderr(format!("[hunter-solend] exited: {}. Restarting in 2s...", e));
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
                     }
@@ -215,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
         let rpc_for_observer = observer_rpc;
         tokio::spawn(async move {
             loop {
-                println!("[observer] Starting watch loop for {}...", protocol.name());
+                log_stdout(format!("[observer] Starting watch loop for {}...", protocol.name()));
                 let service = ObserverService::new(
                     rpc_for_observer.clone(),
                     logger_for_observer.clone(),
@@ -223,16 +229,16 @@ async fn main() -> anyhow::Result<()> {
                     protocol,
                 );
                 if let Err(e) = service.watch().await {
-                    eprintln!("[observer] loop exited with error: {}. Restarting in 5s...", e);
+                    log_stderr(format!("[observer] loop exited with error: {}. Restarting in 5s...", e));
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 } else {
-                    println!("[observer] loop closed normally. Restarting in 5s...");
+                    log_stdout("[observer] loop closed normally. Restarting in 5s...");
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
             }
         });
     } else {
-        println!("  [Observer] Disabled via ENABLE_OBSERVER=false.");
+        log_stdout("  [Observer] Disabled via ENABLE_OBSERVER=false.");
     }
 
     // ── 8. Spawn heartbeat ───────────────────────────────────────────────────
@@ -244,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 9. Wait for termination ──────────────────────────────────────────────
     tokio::signal::ctrl_c().await?;
-    println!("Jawas Phase 2: Shutdown requested. Bye!");
+    log_stdout("Jawas Phase 2: Shutdown requested. Bye!");
 
     Ok(())
 }

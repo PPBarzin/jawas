@@ -6,7 +6,10 @@ use solana_client::rpc_client::RpcClient as SolanaRpcClient;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::ports::rpc::{LogEntry, RpcClient, RpcCommitment, StreamingRpcClient, TransactionInfo};
+use crate::ports::rpc::{
+    LogEntry, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient, TransactionInfo,
+};
+use crate::utils::log_stderr;
 use bs58;
 
 use std::sync::Arc;
@@ -61,9 +64,12 @@ impl HeliusAdapter {
                 .json(&payload)
                 .send()
                 .await
-                .context("getTransaction HTTP request failed")?;
+                .with_context(|| format!("getTransaction HTTP request failed ({})", self.rpc_url))?;
 
-            let body: serde_json::Value = resp.json().await.context("getTransaction response parse failed")?;
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .with_context(|| format!("getTransaction response parse failed ({})", self.rpc_url))?;
 
             let result = &body["result"];
 
@@ -118,6 +124,16 @@ impl HeliusAdapter {
 
         Ok(None)
     }
+}
+
+fn endpoint_host_label(raw: &str) -> String {
+    raw.split("://")
+        .nth(1)
+        .unwrap_or(raw)
+        .split('/')
+        .next()
+        .unwrap_or(raw)
+        .to_string()
 }
 
 impl RpcClient for HeliusAdapter {
@@ -177,9 +193,12 @@ impl RpcClient for HeliusAdapter {
             .json(&payload)
             .send()
             .await
-            .context("getAccountInfo HTTP request failed")?;
+            .with_context(|| format!("getAccountInfo HTTP request failed ({})", self.rpc_url))?;
 
-        let body: serde_json::Value = resp.json().await.context("getAccountInfo response parse failed")?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("getAccountInfo response parse failed ({})", self.rpc_url))?;
 
         let data_arr = body["result"]["value"]["data"]
             .as_array()
@@ -197,6 +216,42 @@ impl RpcClient for HeliusAdapter {
         Ok(bytes)
     }
 
+    async fn get_signature_status(&self, signature: &str) -> Result<Option<SignatureStatusInfo>> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signature], { "searchTransactionHistory": false }]
+        });
+
+        let resp = self.http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("getSignatureStatuses HTTP request failed ({})", self.rpc_url))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("getSignatureStatuses response parse failed ({})", self.rpc_url))?;
+        let value = body["result"]["value"]
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        if value.is_null() {
+            return Ok(None);
+        }
+
+        Ok(Some(SignatureStatusInfo {
+            slot: value["slot"].as_u64(),
+            confirmation_status: value["confirmationStatus"].as_str().map(str::to_string),
+            has_error: !value["err"].is_null(),
+        }))
+    }
+
     async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash> {
         let payload = json!({
             "jsonrpc": "2.0",
@@ -210,9 +265,12 @@ impl RpcClient for HeliusAdapter {
             .json(&payload)
             .send()
             .await
-            .context("getLatestBlockhash HTTP request failed")?;
+            .with_context(|| format!("getLatestBlockhash HTTP request failed ({})", self.rpc_url))?;
 
-        let body: serde_json::Value = resp.json().await.context("getLatestBlockhash response parse failed")?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("getLatestBlockhash response parse failed ({})", self.rpc_url))?;
         let hash_str = body["result"]["value"]["blockhash"]
             .as_str()
             .context("blockhash missing in response")?;
@@ -323,6 +381,7 @@ impl StreamingRpcClient for HeliusAdapter {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         let program_id_owned = program_id.to_string();
         let ws_url = self.ws_url.clone();
+        let ws_label = endpoint_host_label(&ws_url);
         let commitment = match commitment {
             RpcCommitment::Processed => "processed",
             RpcCommitment::Confirmed => "confirmed",
@@ -332,10 +391,10 @@ impl StreamingRpcClient for HeliusAdapter {
             let mut backoff_secs: u64 = 1;
 
             loop {
-                eprintln!("[helius] connecting to WebSocket...");
+                log_stderr(format!("[rpc-ws {ws_label}] connecting..."));
                 match connect_async(&ws_url).await {
                     Ok((mut ws_stream, _)) => {
-                        eprintln!("[helius] WebSocket connected.");
+                        log_stderr(format!("[rpc-ws {ws_label}] connected."));
                         backoff_secs = 1; // reset backoff on successful connection
 
                         let subscribe_msg = json!({
@@ -352,8 +411,9 @@ impl StreamingRpcClient for HeliusAdapter {
                             .send(Message::Text(subscribe_msg.to_string()))
                             .await
                         {
-                            eprintln!("[helius] failed to send subscribe: {e}");
+                            log_stderr(format!("[rpc-ws {ws_label}] failed to send subscribe: {e}"));
                         } else {
+                            let mut subscribed = false;
                             while let Some(msg) = ws_stream.next().await {
                                 let received_at_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -364,6 +424,31 @@ impl StreamingRpcClient for HeliusAdapter {
                                         if let Ok(value) =
                                             serde_json::from_str::<serde_json::Value>(&text)
                                         {
+                                            if !subscribed && value.get("id").and_then(|v| v.as_i64()) == Some(1) {
+                                                if let Some(error) = value.get("error") {
+                                                    log_stderr(format!(
+                                                        "[rpc-ws {ws_label}] subscribe rejected: {}",
+                                                        error
+                                                    ));
+                                                    break;
+                                                }
+
+                                                if let Some(subscription_id) = value.get("result") {
+                                                    log_stderr(format!(
+                                                        "[rpc-ws {ws_label}] subscribed successfully: subscription_id={}",
+                                                        subscription_id
+                                                    ));
+                                                    subscribed = true;
+                                                    continue;
+                                                }
+
+                                                log_stderr(format!(
+                                                    "[rpc-ws {ws_label}] subscribe response missing result/error: {}",
+                                                    value
+                                                ));
+                                                break;
+                                            }
+
                                             if value
                                                 .get("method")
                                                 .and_then(|m| m.as_str())
@@ -396,7 +481,23 @@ impl StreamingRpcClient for HeliusAdapter {
                                                     // Downstream receiver dropped — stop.
                                                     return;
                                                 }
+                                            } else if !subscribed {
+                                                log_stderr(format!(
+                                                    "[rpc-ws {ws_label}] unexpected pre-subscription message: {}",
+                                                    value
+                                                ));
+                                            } else if let Some(method) =
+                                                value.get("method").and_then(|m| m.as_str())
+                                            {
+                                                log_stderr(format!(
+                                                    "[rpc-ws {ws_label}] ignoring WS message method={method}"
+                                                ));
                                             }
+                                        } else {
+                                            log_stderr(format!(
+                                                "[rpc-ws {ws_label}] failed to parse WS text message: {}",
+                                                text
+                                            ));
                                         }
                                     }
                                     Ok(Message::Ping(data)) => {
@@ -408,14 +509,14 @@ impl StreamingRpcClient for HeliusAdapter {
                             }
                         }
 
-                        eprintln!(
-                            "[helius] WebSocket stream ended. Reconnecting in {backoff_secs}s..."
-                        );
+                        log_stderr(format!(
+                            "[rpc-ws {ws_label}] stream ended. Reconnecting in {backoff_secs}s..."
+                        ));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[helius] WebSocket connection error: {e}. Retrying in {backoff_secs}s..."
-                        );
+                        log_stderr(format!(
+                            "[rpc-ws {ws_label}] connection error: {e}. Retrying in {backoff_secs}s..."
+                        ));
                     }
                 }
 

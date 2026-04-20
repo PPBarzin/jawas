@@ -11,6 +11,14 @@ pub fn utc_now() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 
+pub fn log_stdout(message: impl AsRef<str>) {
+    println!("[{}] {}", utc_now(), message.as_ref());
+}
+
+pub fn log_stderr(message: impl AsRef<str>) {
+    eprintln!("[{}] {}", utc_now(), message.as_ref());
+}
+
 fn unix_to_utc(mut s: u64) -> (u64, u64, u64, u64, u64, u64) {
     let sec = s % 60; s /= 60;
     let min = s % 60; s /= 60;

@@ -4,7 +4,7 @@ use crate::domain::token::{native_to_human, token_info, token_mint_by_symbol};
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::{RpcClient, StreamingRpcClient, TransactionInfo};
-use crate::utils::utc_now;
+use crate::utils::{log_stderr, log_stdout, utc_now};
 use std::collections::VecDeque;
 use std::io::Write;
 
@@ -122,7 +122,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 Ok(None) => break, // Stream closed
                 Err(_) => {
                     let msg = format!("RPC stream timeout: no messages received for {} seconds", RPC_TIMEOUT_SECONDS);
-                    eprintln!("[observer] {}", msg);
+                    log_stderr(format!("[observer] {}", msg));
                     
                     // Log timeout event to Airtable for infrastructure monitoring
                     let timeout_event = ObservationEvent {
@@ -154,10 +154,10 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             events_received += 1;
 
             if events_received % 1000 == 0 {
-                eprintln!(
+                log_stderr(format!(
                     "[observer] {} {} events received ({} liquidations logged)",
                     events_received, self.protocol.name(), liquidations_logged
-                );
+                ));
             }
 
             let is_liquidation = entry.logs.iter().any(|log| log.contains(LIQUIDATE_FILTER));
@@ -179,7 +179,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                     logs_json
                 );
                 if let Err(e) = log_file.write_all(line.as_bytes()) {
-                    eprintln!("[observer] failed to write to log file: {}", e);
+                    log_stderr(format!("[observer] failed to write to log file: {}", e));
                 }
                 let _ = log_file.flush();
             }
@@ -297,7 +297,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                         (owner, liq, delay, r_amt, w_amt)
                     }
                     Err(e) => {
-                        eprintln!("[observer] get_transaction failed for liquidation {}: {}", entry.signature, e);
+                        log_stderr(format!("[observer] get_transaction failed for liquidation {}: {}", entry.signature, e));
                         (parsed.liquidated_user, parsed.liquidator, 0u64, parsed.repay_amount, parsed.withdraw_amount)
                     }
                 };
@@ -319,7 +319,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             let withdrawn_usd = withdraw_amount * withdraw_price;
             let profit_usd = withdrawn_usd - repaid_usd;
 
-            println!(
+            log_stdout(format!(
                 "[observer] liquidation | sig={} market={} borrower={} liquidator={} \
                  repay={} {} (native={}, ${:.2}) withdraw={} {} (native={}, ${:.2}) profit=${:.2} delay={}ms",
                 entry.signature,
@@ -336,7 +336,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
                 withdrawn_usd,
                 profit_usd,
                 delay_ms,
-            );
+            ));
 
             let event = ObservationEvent {
                 timestamp: utc_now(),
@@ -360,7 +360,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle> Ob
             };
 
             if let Err(e) = self.logger.log_observation(&event).await {
-                eprintln!("[observer] failed to log {}: {}", entry.signature, e);
+                log_stderr(format!("[observer] failed to log {}: {}", entry.signature, e));
             } else {
                 liquidations_logged += 1;
             }
@@ -599,14 +599,14 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
 
     let repay_amount = native_to_human(repay_native, &repay_mint).unwrap_or_else(|| {
         if repay_native > 0 {
-            println!("[parser] repay_mint='{}' not in catalogue — decimals unknown", repay_mint);
+            log_stdout(format!("[parser] repay_mint='{}' not in catalogue — decimals unknown", repay_mint));
         }
         0.0
     });
 
     let withdraw_amount = native_to_human(withdraw_native, &withdraw_mint).unwrap_or_else(|| {
         if withdraw_native > 0 {
-            println!("[parser] withdraw_mint='{}' not in catalogue — decimals unknown", withdraw_mint);
+            log_stdout(format!("[parser] withdraw_mint='{}' not in catalogue — decimals unknown", withdraw_mint));
         }
         0.0
     });
@@ -653,7 +653,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
-    use crate::ports::rpc::{LogEntry, RpcCommitment, TransactionInfo};
+    use crate::ports::rpc::{LogEntry, RpcCommitment, SignatureStatusInfo, TransactionInfo};
 
     struct MockRpcClient {
         rx: Arc<Mutex<Option<mpsc::Receiver<LogEntry>>>>,
@@ -692,6 +692,9 @@ mod tests {
         }
         async fn get_account_info(&self, _pubkey: &str) -> anyhow::Result<Vec<u8>> {
             Ok(vec![])
+        }
+        async fn get_signature_status(&self, _signature: &str) -> anyhow::Result<Option<SignatureStatusInfo>> {
+            Ok(None)
         }
         async fn get_latest_blockhash(&self) -> anyhow::Result<solana_sdk::hash::Hash> {
             Ok(solana_sdk::hash::Hash::default())

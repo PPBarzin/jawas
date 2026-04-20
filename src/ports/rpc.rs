@@ -36,6 +36,13 @@ pub struct TokenBalance {
     pub ui_amount: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SignatureStatusInfo {
+    pub slot: Option<u64>,
+    pub confirmation_status: Option<String>,
+    pub has_error: bool,
+}
+
 use solana_sdk::hash::Hash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +65,11 @@ pub trait RpcClient: Send + Sync {
         max_attempts: usize,
         retry_delay_ms: u64,
     ) -> impl std::future::Future<Output = Result<TransactionInfo>> + Send;
+    /// Returns the recent status cache state for a signature when available.
+    fn get_signature_status(
+        &self,
+        signature: &str,
+    ) -> impl std::future::Future<Output = Result<Option<SignatureStatusInfo>>> + Send;
     /// Returns the latest blockhash from the network.
     fn get_latest_blockhash(&self) -> impl std::future::Future<Output = Result<Hash>> + Send;
     /// Returns the raw data bytes of an account (base64-decoded).
