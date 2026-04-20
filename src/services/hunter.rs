@@ -65,6 +65,7 @@ struct HunterRuntimeConfig {
     tx_fetch: HunterTxFetchConfig,
     obligation_dedup_ms: u128,
     non_whitelist_cooldown_ms: u128,
+    ws_idle_timeout_secs: u64,
     verbose: bool,
 }
 
@@ -116,6 +117,12 @@ impl HunterRuntimeConfig {
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(30_000);
 
+        let ws_idle_timeout_secs = std::env::var(format!("{prefix}_WS_IDLE_TIMEOUT_SECS"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_WS_IDLE_TIMEOUT_SECS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(180);
+
         let verbose = std::env::var(format!("{prefix}_VERBOSE"))
             .ok()
             .or_else(|| std::env::var("HUNTER_VERBOSE").ok())
@@ -130,6 +137,7 @@ impl HunterRuntimeConfig {
             tx_fetch: HunterTxFetchConfig::from_env(prefix),
             obligation_dedup_ms,
             non_whitelist_cooldown_ms,
+            ws_idle_timeout_secs,
             verbose,
         }
     }
@@ -805,10 +813,20 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             log_stderr("[hunter-kamino] WS subscription task started.");
 
             loop {
-                let entry = match rx.recv().await {
-                    Some(e) => e,
-                    None => {
+                let entry = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(runtime.ws_idle_timeout_secs),
+                    rx.recv(),
+                ).await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
                         log_stderr("[hunter-kamino] WS stream ended. Reconnecting...");
+                        break;
+                    }
+                    Err(_) => {
+                        log_stderr(format!(
+                            "[hunter-kamino] WS idle timeout: no messages received for {}s. Reconnecting...",
+                            runtime.ws_idle_timeout_secs
+                        ));
                         break;
                     }
                 };
@@ -1081,10 +1099,20 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             log_stderr("[hunter-solend] WS subscription task started.");
 
             loop {
-                let entry = match rx.recv().await {
-                    Some(e) => e,
-                    None => {
+                let entry = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(runtime.ws_idle_timeout_secs),
+                    rx.recv(),
+                ).await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
                         log_stderr("[hunter-solend] WS stream ended. Reconnecting...");
+                        break;
+                    }
+                    Err(_) => {
+                        log_stderr(format!(
+                            "[hunter-solend] WS idle timeout: no messages received for {}s. Reconnecting...",
+                            runtime.ws_idle_timeout_secs
+                        ));
                         break;
                     }
                 };
