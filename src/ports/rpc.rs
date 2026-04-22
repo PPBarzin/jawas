@@ -10,6 +10,7 @@ pub struct LogEntry {
 }
 
 /// Account keys and instruction layout extracted from a confirmed transaction.
+#[derive(Debug, Clone)]
 pub struct TransactionInfo {
     /// All account pubkeys in the transaction (base58), in order.
     pub account_keys: Vec<String>,
@@ -34,6 +35,12 @@ pub struct TokenBalance {
     pub mint: String,
     pub owner: String,
     pub ui_amount: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramAccount {
+    pub pubkey: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,16 +81,20 @@ pub trait RpcClient: Send + Sync {
     fn get_latest_blockhash(&self) -> impl std::future::Future<Output = Result<Hash>> + Send;
     /// Returns the raw data bytes of an account (base64-decoded).
     fn get_account_info(&self, pubkey: &str) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
+    /// Returns all accounts owned by a program with their raw bytes.
+    fn get_program_accounts(
+        &self,
+        program_id: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<ProgramAccount>>> + Send;
 }
 
 /// Port for real-time streaming of Solana logs.
-#[allow(async_fn_in_trait)]
 pub trait StreamingRpcClient: Send + Sync {
     /// Subscribe to logs for a specific program.
     /// Returns a receiver of per-transaction log bundles.
-    async fn subscribe_to_logs(
+    fn subscribe_to_logs(
         &self,
         program_id: &str,
         commitment: RpcCommitment,
-    ) -> Result<tokio::sync::mpsc::Receiver<LogEntry>>;
+    ) -> impl std::future::Future<Output = Result<tokio::sync::mpsc::Receiver<LogEntry>>> + Send;
 }

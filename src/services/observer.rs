@@ -693,6 +693,9 @@ mod tests {
         async fn get_account_info(&self, _pubkey: &str) -> anyhow::Result<Vec<u8>> {
             Ok(vec![])
         }
+        async fn get_program_accounts(&self, _program_id: &str) -> anyhow::Result<Vec<crate::ports::rpc::ProgramAccount>> {
+            Ok(vec![])
+        }
         async fn get_signature_status(&self, _signature: &str) -> anyhow::Result<Option<SignatureStatusInfo>> {
             Ok(None)
         }
@@ -702,13 +705,16 @@ mod tests {
     }
 
     impl StreamingRpcClient for MockRpcClient {
-        async fn subscribe_to_logs(
+        fn subscribe_to_logs(
             &self,
             _program_id: &str,
             _commitment: RpcCommitment,
-        ) -> anyhow::Result<mpsc::Receiver<LogEntry>> {
-            let mut rx_lock = self.rx.lock().unwrap();
-            rx_lock.take().ok_or_else(|| anyhow::anyhow!("Stream already consumed"))
+        ) -> impl std::future::Future<Output = anyhow::Result<mpsc::Receiver<LogEntry>>> + Send {
+            let rx = self.rx.clone();
+            async move {
+                let mut rx_lock = rx.lock().unwrap();
+                rx_lock.take().ok_or_else(|| anyhow::anyhow!("Stream already consumed"))
+            }
         }
     }
 

@@ -78,11 +78,17 @@ Toutes les 15 minutes, le bot envoie un événement **"LIFEBIT"** dans Airtable 
 - Si le dernier LIFEBIT date de plus de 20 minutes : **Alerte.** Le bot est peut-être figé ou le RPC est déconnecté.
 
 **Architecture des flux :**
-- **Observer** (Helius) : flux de logging uniquement. N'intervient jamais dans le cycle de liquidation.
-- **Hunter Kamino** (QuikNode) : flux autonome sur le programme Kamino. Détecte, construit et envoie via Jito en moins de 500ms.
-- **Hunter Solend** (QuikNode) : flux autonome sur le programme Solend. Même philosophie.
+- **Observer** : flux de logging uniquement. N'intervient jamais dans le cycle de liquidation.
+- **Hunter Kamino** : pipeline multi-signal. Peut écouter en parallèle :
+  - `QuickNode` via `HUNTER_RPC_URL` / `HUNTER_WS_URL`
+  - `Helius` via `OBSERVER_RPC_URL` / `OBSERVER_WS_URL` comme seconde source hunter
+  - `Pyth Hermes` comme source prédictive
+- **Hunter Solend** : flux autonome sur le programme Solend.
 
-> Les deux containers peuvent partager le **même endpoint QuikNode** (`HUNTER_RPC_URL` / `HUNTER_WS_URL` identiques). QuikNode supporte plusieurs connexions WS simultanées sur une même URL.
+Pour Kamino, la règle v1 est simple :
+- première source qui gagne le lock sur une obligation -> elle seule tire
+- les autres détections sont enregistrées, mais ignorées pendant la fenêtre du lock
+- il n'y a **pas** de fallback pendant cette fenêtre
 
 ### Proposition d'Amélioration — Hunter Kamino
 Verdict honnête :
@@ -124,6 +130,7 @@ Les items sont classés du meilleur ratio impact / coût au plus lourd.
 - Un mode `HUNTER_DRY_RUN=true` permet de construire et signer la tx sans l'envoyer à Jito, pour tester le pipeline réel sans risque.
 - L'adapter Airtable filtre maintenant les doublons par `Tx Signature` avant insertion. La dédup en mémoire de l'observer reste utile, mais l'unicité finale est garantie côté écriture.
 - Le hunter pousse aussi ses propres événements dans Airtable via `Status` : `HUNTER_WS_RECEIVED`, `HUNTER_FIRING`, `HUNTER_BUNDLE_SENT`, `HUNTER_BUNDLE_FAILED`.
+- Le hunter Kamino compare maintenant plusieurs sources de signal et écrit un résumé JSONL hors hot path (`HUNTER_SIGNAL_METRICS_FILE`) pour savoir quelle source a détecté quoi, et dans quel ordre.
 
 #### P1 — Ce qui empêche de gagner souvent
 - **Supprimer la dépendance au `getTransaction` du concurrent.**
@@ -192,9 +199,18 @@ Variables utiles :
 - `WEEKLY_REPORT_TOP_N` : nombre de positions proches retenues pour l'agrégation. Par défaut `50`.
 - `WEEKLY_REPORT_SHORTLIST_SIZE` : nombre de `repay tokens` à afficher dans `Shortlist`. Par défaut `10`. Le champ est formaté avec une pondération relative et le mint complet, par exemple `USDC [EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v] 42.0% (21)`.
 - `HUNTER_LOG_FILE` : chemin du log JSONL du hunter. Par défaut `hunter_trace.jsonl`. Mettre `off` pour désactiver.
+- `HUNTER_SIGNAL_METRICS_FILE` : résumé JSONL des locks Kamino multi-signal. Par défaut `hunter_signal_metrics.jsonl`. Mettre `off` pour désactiver.
+- `HUNTER_SIGNAL_LOCK_MS` : durée du lock "first wins" sur une obligation Kamino. Par défaut `1500`.
 - `HUNTER_DRY_RUN` : si `true`, le hunter va jusqu'au build/sign de la tx puis s'arrête avant `sendBundle`. Le log contient alors un événement `dry_run`.
 - `HUNTER_REPLAY` : si `true`, Jawas exécute un replay one-shot du hunter au boot puis s'arrête.
 - `HUNTER_REPLAY_SIGNATURE` : signature à rejouer. Si absente en mode Kamino, Jawas utilise un fallback codé en dur (`3V11m9fyEiUqbrihZPF1QJdXW9g6tr4mHS9VtCS2BNSunUeQWvRTgXf48uoC7gXgij8bKp7hSERZ1CZvNhSYgCLA`).
+- `ENABLE_HUNTER_SIGNAL_QUICKNODE` : active la source Kamino QuickNode. Par défaut `true`.
+- `ENABLE_HUNTER_SIGNAL_HELIUS` : active la source Kamino Helius en réutilisant `OBSERVER_RPC_URL` / `OBSERVER_WS_URL`. Par défaut `true`.
+- `ENABLE_HUNTER_SIGNAL_HERMES` : active la source Kamino Pyth Hermes. Par défaut `false`.
+- `HERMES_WS_URL` : endpoint Hermes. Par défaut `https://hermes.pyth.network`.
+- `HERMES_SHORTLIST_SIZE` : taille maximale de la shortlist Kamino surveillée par Hermes. Par défaut `200`.
+- `HERMES_REFRESH_SECS` : fréquence de refresh de l'état Kamino utilisé par Hermes. Par défaut `10`.
+- `HERMES_TRIGGER_BUFFER_BPS` : buffer prédictif Hermes avant émission du signal. Par défaut `25`.
 - `HUNTER_GET_TX_ATTEMPTS`, `HUNTER_GET_TX_RETRY_DELAY_MS`, `HUNTER_GET_TX_TIMEOUT_MS` : réglages globaux du fetch `getTransaction`.
 - `KAMINO_GET_TX_ATTEMPTS`, `KAMINO_GET_TX_RETRY_DELAY_MS`, `KAMINO_GET_TX_TIMEOUT_MS` : overrides spécifiques Kamino.
 - `SOLEND_GET_TX_ATTEMPTS`, `SOLEND_GET_TX_RETRY_DELAY_MS`, `SOLEND_GET_TX_TIMEOUT_MS` : overrides spécifiques Solend.
@@ -294,13 +310,11 @@ AIRTABLE_TOKEN=votre_token
 AIRTABLE_BASE_ID=appmvsotfJe4SO1Ll
 AIRTABLE_TABLE_WATCH=Jawas-Watch
 
-# Flux OBSERVATION (Recommandé : Helius)
-# Utilisé pour surveiller les transactions des concurrents (WebSocket intensif)
+# Flux OBSERVATION + signal Helius secondaire pour Kamino
 OBSERVER_RPC_URL=https://mainnet.helius-rpc.com/?api-key=votre_cle
 OBSERVER_WS_URL=wss://mainnet.helius-rpc.com/?api-key=votre_cle
 
-# Flux CHASSE / HUNTER (Recommandé : QuickNode)
-# Utilisé pour simuler et envoyer nos propres liquidations (Vitesse critique)
+# Flux CHASSE / HUNTER principal (QuickNode recommandé)
 HUNTER_RPC_URL=https://votre-endpoint-quicknode.com/
 HUNTER_WS_URL=wss://votre-endpoint-quicknode.com/
 JITO_URL=https://mainnet.block-engine.jito.wtf/api/v1/bundles
@@ -315,11 +329,30 @@ SOLANA_KEYPAIR_PATH=secrets/keypair.json
 # Activation fine des services
 ENABLE_HUNTER=true
 ENABLE_OBSERVER=true
+
+# Activation fine des sources Kamino
+ENABLE_HUNTER_SIGNAL_QUICKNODE=true
+ENABLE_HUNTER_SIGNAL_HELIUS=true
+ENABLE_HUNTER_SIGNAL_HERMES=false
+
+# Lock "première source gagnante"
+HUNTER_SIGNAL_LOCK_MS=1500
+
+# Logs et métriques JSONL
+HUNTER_LOG_FILE=hunter_trace.jsonl
+HUNTER_SIGNAL_METRICS_FILE=hunter_signal_metrics.jsonl
+
+# Source Hermes (prédictive)
+HERMES_WS_URL=https://hermes.pyth.network
+HERMES_SHORTLIST_SIZE=200
+HERMES_REFRESH_SECS=10
+HERMES_TRIGGER_BUFFER_BPS=25
 ```
 
 ### 2. Choix des fournisseurs RPC
-*   **Helius (Observer)** : Idéal pour le flux de "Watch" grâce à sa gestion très robuste des WebSockets et son plan gratuit généreux.
-*   **QuickNode (Hunter)** : Recommandé pour la Phase 2 (Hunt) pour sa faible latence lors de l'envoi des transactions et ses options de Priority Fees.
+*   **Helius** : utile comme flux de watch et comme seconde source hunter Kamino indépendante.
+*   **QuickNode** : reste la source hunter principale et le RPC de tir par défaut.
+*   **Pyth Hermes** : sert à construire un signal prédictif Kamino basé sur une shortlist, et reste désactivé par défaut tant que sa validation n'est pas jugée suffisante.
 
 ### Configuration Avancée (Multi-Tables)
 Par défaut, tous les containers envoient leurs données dans la même table Airtable (identifiée par le champ `Protocol`). Si vous souhaitez utiliser des tables séparées :

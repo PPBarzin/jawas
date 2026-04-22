@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         
         Some(HunterService::new(
             hunter_rpc.clone(),
+            Some(observer_rpc.clone()),
             jito,
             jupiter,
             oracle.clone(),

@@ -7,7 +7,8 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ports::rpc::{
-    LogEntry, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient, TransactionInfo,
+    LogEntry, ProgramAccount, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient,
+    TransactionInfo,
 };
 use crate::utils::log_stderr;
 use bs58;
@@ -216,6 +217,54 @@ impl RpcClient for HeliusAdapter {
         Ok(bytes)
     }
 
+    async fn get_program_accounts(&self, program_id: &str) -> Result<Vec<ProgramAccount>> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [program_id, {"encoding": "base64"}]
+        });
+
+        let resp = self.http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("getProgramAccounts HTTP request failed ({})", self.rpc_url))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("getProgramAccounts response parse failed ({})", self.rpc_url))?;
+
+        let accounts = body["result"]
+            .as_array()
+            .context("getProgramAccounts: missing result array")?;
+
+        let mut out = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let Some(pubkey) = account["pubkey"].as_str() else {
+                continue;
+            };
+            let data_arr = account["account"]["data"]
+                .as_array()
+                .context("getProgramAccounts: missing data array")?;
+            let b64 = data_arr.first()
+                .and_then(|v| v.as_str())
+                .context("getProgramAccounts: missing base64 data")?;
+            let bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                b64,
+            ).context("getProgramAccounts: base64 decode failed")?;
+            out.push(ProgramAccount {
+                pubkey: pubkey.to_string(),
+                data: bytes,
+            });
+        }
+
+        Ok(out)
+    }
+
     async fn get_signature_status(&self, signature: &str) -> Result<Option<SignatureStatusInfo>> {
         let payload = json!({
             "jsonrpc": "2.0",
@@ -373,14 +422,17 @@ mod tests {
 }
 
 impl StreamingRpcClient for HeliusAdapter {
-    async fn subscribe_to_logs(
+    fn subscribe_to_logs(
         &self,
         program_id: &str,
         commitment: RpcCommitment,
-    ) -> Result<tokio::sync::mpsc::Receiver<LogEntry>> {
+    ) -> impl std::future::Future<Output = Result<tokio::sync::mpsc::Receiver<LogEntry>>> + Send {
+        let this = self.clone();
+        let program_id = program_id.to_string();
+        async move {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         let program_id_owned = program_id.to_string();
-        let ws_url = self.ws_url.clone();
+        let ws_url = this.ws_url.clone();
         let ws_label = endpoint_host_label(&ws_url);
         let commitment = match commitment {
             RpcCommitment::Processed => "processed",
@@ -530,5 +582,6 @@ impl StreamingRpcClient for HeliusAdapter {
         });
 
         Ok(rx)
+        }
     }
 }
