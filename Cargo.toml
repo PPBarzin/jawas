@@ -7,22 +7,6 @@ edition = "2021"
 name = "jawas"
 path = "src/main.rs"
 
-[[bin]]
-name = "liquidate_one"
-path = "tools/liquidate_one.rs"
-
-[[bin]]
-name = "inspect_kamino_obligation"
-path = "tools/inspect_kamino_obligation.rs"
-
-[[bin]]
-name = "inspect_solend_obligation"
-path = "tools/inspect_solend_obligation.rs"
-
-[[bin]]
-name = "generate_weekly_token_report"
-path = "tools/generate_weekly_token_report.rs"
-
 [dependencies]
 tokio       = { version = "1", features = ["full"] }
 solana-client = "2"

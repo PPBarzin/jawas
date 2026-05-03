@@ -12,11 +12,11 @@ pub fn utc_now() -> String {
 }
 
 pub fn log_stdout(message: impl AsRef<str>) {
-    println!("[{}] {}", utc_now(), message.as_ref());
+    crate::logging::log_info("runtime", message.as_ref());
 }
 
 pub fn log_stderr(message: impl AsRef<str>) {
-    eprintln!("[{}] {}", utc_now(), message.as_ref());
+    crate::logging::log_error("runtime", message.as_ref());
 }
 
 fn unix_to_utc(mut s: u64) -> (u64, u64, u64, u64, u64, u64) {

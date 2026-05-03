@@ -2,6 +2,7 @@
 .env
 .envrc
 secrets/
+wallet.toml
 
 # Rust
 /target
@@ -17,5 +18,8 @@ Thumbs.db
 # Project Specific
 .gemini/
 .claude/
+.codex
 *.jsonl
 *.csv
+analysis/
+image_*.png

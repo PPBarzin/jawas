@@ -7,17 +7,16 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && echo 'fn main() {}' > src/main.rs \
-    && mkdir -p tools \
-    && echo 'fn main() {}' > tools/liquidate_one.rs \
-    && echo 'fn main() {}' > tools/inspect_kamino_obligation.rs \
-    && echo 'fn main() {}' > tools/inspect_solend_obligation.rs \
-    && echo 'fn main() {}' > tools/generate_weekly_token_report.rs
+    && mkdir -p src/bin \
+    && echo 'fn main() {}' > src/bin/liquidate_one.rs \
+    && echo 'fn main() {}' > src/bin/inspect_kamino_obligation.rs \
+    && echo 'fn main() {}' > src/bin/inspect_solend_obligation.rs \
+    && echo 'fn main() {}' > src/bin/generate_weekly_token_report.rs
 RUN cargo build --release
-RUN rm -rf src/ tools/
+RUN rm -rf src/
 
 # Build the real binary
 COPY src ./src
-COPY tools ./tools
 # Trigger rebuild of the main binary
 RUN touch src/main.rs
 RUN cargo build --release
