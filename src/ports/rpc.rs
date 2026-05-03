@@ -64,7 +64,10 @@ pub trait RpcClient: Send + Sync {
     /// Returns the node version string (used as a connectivity health-check).
     fn get_version(&self) -> impl std::future::Future<Output = Result<String>> + Send;
     /// Returns account keys and instruction accounts for a confirmed transaction.
-    fn get_transaction(&self, signature: &str) -> impl std::future::Future<Output = Result<TransactionInfo>> + Send;
+    fn get_transaction(
+        &self,
+        signature: &str,
+    ) -> impl std::future::Future<Output = Result<TransactionInfo>> + Send;
     /// Returns transaction data with caller-controlled retry behavior.
     fn get_transaction_with_retries(
         &self,
@@ -80,7 +83,10 @@ pub trait RpcClient: Send + Sync {
     /// Returns the latest blockhash from the network.
     fn get_latest_blockhash(&self) -> impl std::future::Future<Output = Result<Hash>> + Send;
     /// Returns the raw data bytes of an account (base64-decoded).
-    fn get_account_info(&self, pubkey: &str) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
+    fn get_account_info(
+        &self,
+        pubkey: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
     /// Returns all accounts owned by a program with their raw bytes.
     fn get_program_accounts(
         &self,

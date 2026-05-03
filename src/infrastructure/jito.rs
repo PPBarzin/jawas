@@ -1,9 +1,9 @@
 use crate::ports::jito::JitoPort;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
-use solana_sdk::transaction::VersionedTransaction;
 use serde_json::json;
+use solana_sdk::transaction::VersionedTransaction;
 
 #[derive(Clone)]
 pub struct JitoAdapter {
@@ -42,7 +42,9 @@ impl JitoPort for JitoAdapter {
             "params": [serialized_txs, { "encoding": "base64" }]
         });
 
-        let response = self.client.post(&self.url)
+        let response = self
+            .client
+            .post(&self.url)
             .json(&body)
             .send()
             .await?
@@ -50,7 +52,7 @@ impl JitoPort for JitoAdapter {
             .await?;
 
         if let Some(err) = response.get("error") {
-             return Err(anyhow::anyhow!("Jito error: {:?}", err));
+            return Err(anyhow::anyhow!("Jito error: {:?}", err));
         }
 
         response["result"]
@@ -67,7 +69,9 @@ impl JitoPort for JitoAdapter {
             "params": []
         });
 
-        let response = self.client.post(&self.url)
+        let response = self
+            .client
+            .post(&self.url)
             .json(&body)
             .send()
             .await?
@@ -75,7 +79,7 @@ impl JitoPort for JitoAdapter {
             .await?;
 
         if let Some(err) = response.get("error") {
-             return Err(anyhow::anyhow!("Jito error: {:?}", err));
+            return Err(anyhow::anyhow!("Jito error: {:?}", err));
         }
 
         // Response example: [{"landed_tips_25th_percentile": 0, "landed_tips_50th_percentile": 0, ...}]

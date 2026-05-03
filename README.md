@@ -20,12 +20,21 @@ Jawas currently exposes two runtime modes:
 - `observer`: subscribes to protocol logs, enriches liquidation events, and writes research data
 - `hunter`: listens for liquidation signals and attempts a reaction pipeline for Kamino or Solend
 
+The repository also includes analysis tooling to turn raw JSONL traces into dated research reports. This is used to quantify:
+
+- the hunter funnel from signal reception to bundle send
+- why many reactive Kamino signals are already too late
+- how Helius and QuickNode compare as signal sources
+- which repay mints fall outside the current wallet-driven scope
+
 The public value of the project is not "a profitable bot". The value is the instrumentation and the technical analysis of why a straightforward reactive bot is usually late.
 
 ## What Does Not Work Well Today
 
 - The hunter is still mostly reactive and therefore frequently second in competitive situations.
 - Some execution paths still depend on post-factum transaction reads, which is structurally slower than a pre-computed strategy.
+- `bundle_sent` is not equivalent to a confirmed liquidation win. It only means the Jito endpoint accepted the bundle submission.
+- Wallet coverage is intentionally narrow, so some observed opportunities are skipped by design.
 - Profitability is not demonstrated and should not be assumed.
 - RPC quality, propagation delay, and Jito fee strategy dominate outcomes more than code elegance alone.
 
@@ -74,6 +83,14 @@ Important variables:
 - `ENABLE_OBSERVER`, `ENABLE_HUNTER`
 - `SOLANA_KEYPAIR_PATH`
 - `WALLET_TOML_PATH`
+- `JUPITER_BASE_URL`
+- `JITO_SEND_MAX_ATTEMPTS`
+
+Recent runtime notes:
+
+- the price oracle is now `Jupiter`-first with a static fallback, to improve research accuracy without introducing heavy infrastructure
+- the Jito send path includes a bounded retry on clearly recoverable failures such as congestion or expired blockhash
+- hunter traces and signal metrics can be converted into a dated Markdown report for longitudinal comparison
 
 ## Install
 
@@ -120,6 +137,7 @@ cargo test hunter::tests -- --nocapture
 cargo run --bin inspect_kamino_obligation -- <OBLIGATION_PUBKEY>
 cargo run --bin inspect_solend_obligation -- <OBLIGATION_PUBKEY>
 cargo run --bin generate_weekly_token_report
+cargo run --bin generate_hunter_report
 cargo run --bin liquidate_one -- <OBLIGATION_PUBKEY> --dry-run
 ```
 
@@ -132,6 +150,15 @@ Research traces remain file-based:
 - `HUNTER_LOG_FILE`: per-event hunter JSONL trace
 - `HUNTER_SIGNAL_METRICS_FILE`: signal lock and source comparison metrics
 - `LOG_FILE`: raw observer capture
+
+Recommended research loop:
+
+```bash
+cargo run --bin jawas
+cargo run --bin generate_hunter_report
+```
+
+This produces a dated file under `docs/analysis/` that can be compared across runs.
 
 ## Safety and Disclaimers
 

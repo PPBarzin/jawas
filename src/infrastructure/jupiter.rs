@@ -1,12 +1,12 @@
 use crate::ports::jupiter::{JupiterPort, QuoteResponse};
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
 use reqwest::Client;
-use solana_sdk::instruction::{Instruction, AccountMeta};
-use solana_sdk::pubkey::Pubkey;
 use serde::{Deserialize, Serialize};
+use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
-use base64::{Engine as _, engine::general_purpose};
 
 pub struct JupiterAdapter {
     client: Client,
@@ -17,7 +17,9 @@ impl JupiterAdapter {
     pub fn new(base_url: Option<&str>) -> Self {
         Self {
             client: Client::new(),
-            base_url: base_url.unwrap_or("https://quote-api.jup.ag/v6").to_string(),
+            base_url: base_url
+                .unwrap_or("https://quote-api.jup.ag/v6")
+                .to_string(),
         }
     }
 }
@@ -65,15 +67,20 @@ impl TryFrom<JupiterInstruction> for Instruction {
     fn try_from(val: JupiterInstruction) -> Result<Self, Self::Error> {
         let program_id = Pubkey::from_str(&val.program_id)
             .map_err(|e| anyhow::anyhow!("Invalid program ID: {}", e))?;
-        let accounts = val.accounts.into_iter().map(|a| {
-            Ok(AccountMeta {
-                pubkey: Pubkey::from_str(&a.pubkey)
-                    .map_err(|e| anyhow::anyhow!("Invalid pubkey: {}", e))?,
-                is_signer: a.is_signer,
-                is_writable: a.is_writable,
+        let accounts = val
+            .accounts
+            .into_iter()
+            .map(|a| {
+                Ok(AccountMeta {
+                    pubkey: Pubkey::from_str(&a.pubkey)
+                        .map_err(|e| anyhow::anyhow!("Invalid pubkey: {}", e))?,
+                    is_signer: a.is_signer,
+                    is_writable: a.is_writable,
+                })
             })
-        }).collect::<Result<Vec<_>>>()?;
-        let data = general_purpose::STANDARD.decode(&val.data)
+            .collect::<Result<Vec<_>>>()?;
+        let data = general_purpose::STANDARD
+            .decode(&val.data)
             .map_err(|e| anyhow::anyhow!("Failed to decode base64 data: {}", e))?;
         Ok(Instruction {
             program_id,
@@ -93,7 +100,9 @@ impl JupiterPort for JupiterAdapter {
         slippage_bps: u16,
     ) -> Result<QuoteResponse> {
         let url = format!("{}/quote", self.base_url);
-        let response = self.client.get(&url)
+        let response = self
+            .client
+            .get(&url)
             .query(&[
                 ("inputMint", input_mint),
                 ("outputMint", output_mint),
@@ -123,7 +132,9 @@ impl JupiterPort for JupiterAdapter {
     ) -> Result<Vec<Instruction>> {
         // First get the quote because we need the full quote response to call swap-instructions
         let url_quote = format!("{}/quote", self.base_url);
-        let quote = self.client.get(&url_quote)
+        let quote = self
+            .client
+            .get(&url_quote)
             .query(&[
                 ("inputMint", input_mint),
                 ("outputMint", output_mint),
@@ -142,7 +153,9 @@ impl JupiterPort for JupiterAdapter {
             "wrapAndUnwrapSol": true,
         });
 
-        let response = self.client.post(&url_swap)
+        let response = self
+            .client
+            .post(&url_swap)
             .json(&body)
             .send()
             .await?

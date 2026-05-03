@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::domain::position::Position;
+use serde::{Deserialize, Serialize};
 
 /// A liquidation opportunity detected on-chain.
 /// Pure domain struct — zero external dependencies.

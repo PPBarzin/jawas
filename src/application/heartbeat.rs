@@ -1,6 +1,6 @@
-use std::time::Duration;
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::utils::{log_stderr, log_stdout, utc_now};
+use std::time::Duration;
 
 /// Phase 1: Periodic heartbeat to ensure the bot is alive.
 pub struct HeartbeatService<L: LiquidationLogger> {
@@ -15,7 +15,7 @@ impl<L: LiquidationLogger> HeartbeatService<L> {
     /// Periodically sends a "LIFEBIT" event to the logger.
     pub async fn run(&self, interval: Duration) {
         let mut ticker = tokio::time::interval(interval);
-        
+
         // Skip the first immediate tick
         ticker.tick().await;
 
@@ -59,7 +59,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{sleep, Duration};
 
     struct MockLogger {
         events: Arc<Mutex<Vec<ObservationEvent>>>,
@@ -68,7 +68,12 @@ mod tests {
     impl MockLogger {
         fn new() -> (Self, Arc<Mutex<Vec<ObservationEvent>>>) {
             let events = Arc::new(Mutex::new(Vec::new()));
-            (Self { events: events.clone() }, events)
+            (
+                Self {
+                    events: events.clone(),
+                },
+                events,
+            )
         }
     }
 
@@ -84,7 +89,7 @@ mod tests {
     async fn test_heartbeat_sends_event() {
         let (mock_logger, events_shared) = MockLogger::new();
         let service = HeartbeatService::new(mock_logger);
-        
+
         // Run heartbeat in background
         let handle = tokio::spawn(async move {
             service.run(Duration::from_millis(50)).await;
@@ -102,7 +107,11 @@ mod tests {
         handle.abort();
 
         let events = events_shared.lock().unwrap();
-        assert!(events.len() >= 2, "Expected at least 2 events, got {}", events.len());
+        assert!(
+            events.len() >= 2,
+            "Expected at least 2 events, got {}",
+            events.len()
+        );
         assert_eq!(events[0].signature, "LIFEBIT");
         assert_eq!(events[0].liquidated_user, "system-heartbeat");
     }

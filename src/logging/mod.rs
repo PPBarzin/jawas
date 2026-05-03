@@ -14,9 +14,21 @@ pub fn log_runtime(
     result: Option<&str>,
     detail: Option<&str>,
 ) {
-    emit("INFO", source, event, latency_ms, decision, result.and_then(non_empty));
+    emit(
+        "INFO",
+        source,
+        event,
+        latency_ms,
+        decision,
+        result.and_then(non_empty),
+    );
     if let Some(detail) = detail.and_then(non_empty) {
-        println!("[{}] level=INFO source={} detail=\"{}\"", crate::utils::utc_now(), source, escape(detail));
+        println!(
+            "[{}] level=INFO source={} detail=\"{}\"",
+            crate::utils::utc_now(),
+            source,
+            escape(detail)
+        );
     }
 }
 

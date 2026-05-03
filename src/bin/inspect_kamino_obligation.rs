@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use borsh::BorshDeserialize;
 use jawas::domain::kamino::{BigFractionBytes, LastUpdate, Obligation};
+use sha2::{Digest, Sha256};
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_client::rpc_client::RpcClient;
 use solana_rpc_client_types::config::{
@@ -14,7 +15,6 @@ use solana_sdk::{
     message::Message,
     transaction::Transaction,
 };
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
@@ -219,15 +219,37 @@ fn ix_refresh_reserve(
     ];
 
     let pyth = Pubkey::new_from_array(reserve.config.token_info.pyth_configuration.price);
-    let sb_price =
-        Pubkey::new_from_array(reserve.config.token_info.switchboard_configuration.price_aggregator);
-    let sb_twap =
-        Pubkey::new_from_array(reserve.config.token_info.switchboard_configuration.twap_aggregator);
+    let sb_price = Pubkey::new_from_array(
+        reserve
+            .config
+            .token_info
+            .switchboard_configuration
+            .price_aggregator,
+    );
+    let sb_twap = Pubkey::new_from_array(
+        reserve
+            .config
+            .token_info
+            .switchboard_configuration
+            .twap_aggregator,
+    );
     let scope = Pubkey::new_from_array(reserve.config.token_info.scope_configuration.price_feed);
 
     let has_any_optional = !is_default_pubkey(&reserve.config.token_info.pyth_configuration.price)
-        || !is_default_pubkey(&reserve.config.token_info.switchboard_configuration.price_aggregator)
-        || !is_default_pubkey(&reserve.config.token_info.switchboard_configuration.twap_aggregator)
+        || !is_default_pubkey(
+            &reserve
+                .config
+                .token_info
+                .switchboard_configuration
+                .price_aggregator,
+        )
+        || !is_default_pubkey(
+            &reserve
+                .config
+                .token_info
+                .switchboard_configuration
+                .twap_aggregator,
+        )
         || !is_default_pubkey(&reserve.config.token_info.scope_configuration.price_feed);
 
     if has_any_optional {
@@ -272,16 +294,40 @@ fn describe_oracles(reserve: &Reserve) -> String {
             Pubkey::new_from_array(reserve.config.token_info.pyth_configuration.price)
         ));
     }
-    if !is_default_pubkey(&reserve.config.token_info.switchboard_configuration.price_aggregator) {
+    if !is_default_pubkey(
+        &reserve
+            .config
+            .token_info
+            .switchboard_configuration
+            .price_aggregator,
+    ) {
         parts.push(format!(
             "sb_price={}",
-            Pubkey::new_from_array(reserve.config.token_info.switchboard_configuration.price_aggregator)
+            Pubkey::new_from_array(
+                reserve
+                    .config
+                    .token_info
+                    .switchboard_configuration
+                    .price_aggregator
+            )
         ));
     }
-    if !is_default_pubkey(&reserve.config.token_info.switchboard_configuration.twap_aggregator) {
+    if !is_default_pubkey(
+        &reserve
+            .config
+            .token_info
+            .switchboard_configuration
+            .twap_aggregator,
+    ) {
         parts.push(format!(
             "sb_twap={}",
-            Pubkey::new_from_array(reserve.config.token_info.switchboard_configuration.twap_aggregator)
+            Pubkey::new_from_array(
+                reserve
+                    .config
+                    .token_info
+                    .switchboard_configuration
+                    .twap_aggregator
+            )
         ));
     }
     if !is_default_pubkey(&reserve.config.token_info.scope_configuration.price_feed) {
@@ -299,14 +345,35 @@ fn describe_oracles(reserve: &Reserve) -> String {
 
 fn print_metrics(label: &str, obligation: &Obligation) {
     println!("\n--- {label} ---");
-    println!("Owner                : {}", Pubkey::new_from_array(obligation.owner));
-    println!("Collateral USD       : {}", fmt_usd(obligation.deposited_value_usd()));
-    println!("Debt USD             : {}", fmt_usd(obligation.debt_value_usd()));
-    println!("Net Value USD        : {}", fmt_usd(obligation.net_value_usd()));
-    println!("Current LTV %        : {}", fmt_pct(obligation.current_ltv()));
+    println!(
+        "Owner                : {}",
+        Pubkey::new_from_array(obligation.owner)
+    );
+    println!(
+        "Collateral USD       : {}",
+        fmt_usd(obligation.deposited_value_usd())
+    );
+    println!(
+        "Debt USD             : {}",
+        fmt_usd(obligation.debt_value_usd())
+    );
+    println!(
+        "Net Value USD        : {}",
+        fmt_usd(obligation.net_value_usd())
+    );
+    println!(
+        "Current LTV %        : {}",
+        fmt_pct(obligation.current_ltv())
+    );
     println!("Max LTV %            : {}", fmt_pct(obligation.max_ltv()));
-    println!("Unhealthy LTV %      : {}", fmt_pct(obligation.unhealthy_ltv()));
-    println!("Dist To Liq          : {}", fmt_pct(obligation.dist_to_liq()));
+    println!(
+        "Unhealthy LTV %      : {}",
+        fmt_pct(obligation.unhealthy_ltv())
+    );
+    println!(
+        "Dist To Liq          : {}",
+        fmt_pct(obligation.dist_to_liq())
+    );
     println!("Liquidatable         : {}", obligation.is_liquidatable());
 }
 
@@ -364,7 +431,12 @@ async fn main() -> Result<()> {
         );
         refresh_ixs.push(ix_refresh_reserve(&klend, &market, reserve_pk, &reserve));
     }
-    refresh_ixs.push(ix_refresh_obligation(&klend, &market, &pubkey, &reserve_pks));
+    refresh_ixs.push(ix_refresh_obligation(
+        &klend,
+        &market,
+        &pubkey,
+        &reserve_pks,
+    ));
 
     let message = Message::new(&refresh_ixs, None);
     let tx = Transaction::new_unsigned(message);

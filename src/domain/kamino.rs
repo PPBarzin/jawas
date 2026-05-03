@@ -144,7 +144,8 @@ impl Obligation {
 
     /// Check if the obligation is liquidatable
     pub fn is_liquidatable(&self) -> bool {
-        self.borrow_factor_adjusted_debt_value_sf >= self.unhealthy_borrow_value_sf && self.unhealthy_borrow_value_sf > 0
+        self.borrow_factor_adjusted_debt_value_sf >= self.unhealthy_borrow_value_sf
+            && self.unhealthy_borrow_value_sf > 0
     }
 
     pub fn max_ltv(&self) -> f64 {

@@ -111,14 +111,16 @@ impl<'a> Cursor<'a> {
 
     fn read_decimal(&mut self) -> Option<Decimal> {
         Some(Decimal {
-            lo:  self.read_u64()?,
+            lo: self.read_u64()?,
             mid: self.read_u64()?,
-            hi:  self.read_u64()?,
+            hi: self.read_u64()?,
         })
     }
 
     fn skip(&mut self, n: usize) -> Option<()> {
-        if self.pos + n > self.data.len() { return None; }
+        if self.pos + n > self.data.len() {
+            return None;
+        }
         self.pos += n;
         Some(())
     }
@@ -151,28 +153,36 @@ pub fn decode_solend_obligation(data: &[u8]) -> Option<SolendObligation> {
     c.skip(16)?;
 
     let lending_market = c.read_pubkey()?;
-    let owner          = c.read_pubkey()?;
+    let owner = c.read_pubkey()?;
 
     // deposits
     let n_deposits = c.read_u32()? as usize;
-    if n_deposits > MAX_OBLIGATION_RESERVES { return None; }
+    if n_deposits > MAX_OBLIGATION_RESERVES {
+        return None;
+    }
     let mut deposits = Vec::with_capacity(n_deposits);
     for _ in 0..n_deposits {
-        let deposit_reserve  = c.read_pubkey()?;
+        let deposit_reserve = c.read_pubkey()?;
         let deposited_amount = c.read_u64()?;
-        let market_value     = c.read_decimal()?;
-        deposits.push(ObligationCollateral { deposit_reserve, deposited_amount, market_value });
+        let market_value = c.read_decimal()?;
+        deposits.push(ObligationCollateral {
+            deposit_reserve,
+            deposited_amount,
+            market_value,
+        });
     }
 
     // borrows
     let n_borrows = c.read_u32()? as usize;
-    if n_borrows > MAX_OBLIGATION_RESERVES { return None; }
+    if n_borrows > MAX_OBLIGATION_RESERVES {
+        return None;
+    }
     let mut borrows = Vec::with_capacity(n_borrows);
     for _ in 0..n_borrows {
-        let borrow_reserve             = c.read_pubkey()?;
+        let borrow_reserve = c.read_pubkey()?;
         let cumulative_borrow_rate_wads = c.read_decimal()?;
-        let borrowed_amount_wads       = c.read_decimal()?;
-        let market_value               = c.read_decimal()?;
+        let borrowed_amount_wads = c.read_decimal()?;
+        let market_value = c.read_decimal()?;
         borrows.push(ObligationLiquidity {
             borrow_reserve,
             cumulative_borrow_rate_wads,
@@ -181,9 +191,9 @@ pub fn decode_solend_obligation(data: &[u8]) -> Option<SolendObligation> {
         });
     }
 
-    let deposited_value       = c.read_decimal()?;
-    let borrowed_value        = c.read_decimal()?;
-    let allowed_borrow_value  = c.read_decimal()?;
+    let deposited_value = c.read_decimal()?;
+    let borrowed_value = c.read_decimal()?;
+    let allowed_borrow_value = c.read_decimal()?;
     let unhealthy_borrow_value = c.read_decimal()?;
 
     Some(SolendObligation {

@@ -5,10 +5,7 @@ use crate::application::hunter::{
 use crate::application::observer::{ObserverService, Protocol};
 use crate::config::AppConfig;
 use crate::infrastructure::{
-    airtable::AirtableAdapter,
-    helius::HeliusAdapter,
-    jito::JitoAdapter,
-    jupiter::JupiterAdapter,
+    airtable::AirtableAdapter, helius::HeliusAdapter, jito::JitoAdapter, jupiter::JupiterAdapter,
     oracle::SimplePriceOracle,
 };
 use crate::logging::{log_error, log_info, log_runtime};
@@ -39,9 +36,9 @@ pub async fn run() -> anyhow::Result<()> {
         config.airtable.base_id.clone(),
         config.airtable.watch_table.clone(),
     );
-    let oracle = SimplePriceOracle::new();
+    let oracle = SimplePriceOracle::new(Some(&config.hunter.jupiter_base_url));
     let jito = JitoAdapter::new(&config.hunter.jito_url);
-    let jupiter = JupiterAdapter::new(None);
+    let jupiter = JupiterAdapter::new(Some(&config.hunter.jupiter_base_url));
 
     let protocol = config.runtime.protocol();
     let hunter_service = build_hunter_service(
@@ -60,8 +57,13 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(hunter) = hunter_service {
         let wallet_tokens = load_wallet_tokens(&config.hunter.wallet_toml_path);
         if config.hunter.replay_enabled || config.hunter.replay_signature.is_some() {
-            run_hunter_replay(&hunter, protocol, wallet_tokens, config.hunter.replay_signature.clone())
-                .await?;
+            run_hunter_replay(
+                &hunter,
+                protocol,
+                wallet_tokens,
+                config.hunter.replay_signature.clone(),
+            )
+            .await?;
             log_info("app", "replay completed");
             return Ok(());
         }
@@ -84,13 +86,8 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-type JawasHunter = HunterService<
-    HeliusAdapter,
-    JitoAdapter,
-    JupiterAdapter,
-    SimplePriceOracle,
-    AirtableAdapter,
->;
+type JawasHunter =
+    HunterService<HeliusAdapter, JitoAdapter, JupiterAdapter, SimplePriceOracle, AirtableAdapter>;
 
 fn build_hunter_service(
     config: &AppConfig,
@@ -100,19 +97,24 @@ fn build_hunter_service(
     oracle: SimplePriceOracle,
     jito: JitoAdapter,
     jupiter: JupiterAdapter,
-) -> anyhow::Result<Option<JawasHunter>>
-{
+) -> anyhow::Result<Option<JawasHunter>> {
     if !config.runtime.enable_hunter {
         return Ok(None);
     }
 
-    let keypair_path = config
-        .hunter
-        .keypair_path
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("ENABLE_HUNTER=true but SOLANA_KEYPAIR_PATH is not set"))?;
+    let keypair_path =
+        config.hunter.keypair_path.clone().ok_or_else(|| {
+            anyhow::anyhow!("ENABLE_HUNTER=true but SOLANA_KEYPAIR_PATH is not set")
+        })?;
 
-    log_runtime("hunter", "loading keypair", None, Some("startup"), None, Some(&keypair_path));
+    log_runtime(
+        "hunter",
+        "loading keypair",
+        None,
+        Some("startup"),
+        None,
+        Some(&keypair_path),
+    );
     let keypair = Arc::new(
         read_keypair_file(&keypair_path)
             .map_err(|e| anyhow::anyhow!("failed to read keypair: {}", e))?,
@@ -152,16 +154,16 @@ async fn verify_observer_rpc(observer_rpc: &HeliusAdapter) -> anyhow::Result<()>
             Ok(())
         }
         Err(error) => {
-            log_error("rpc", &format!("observer RPC healthcheck failed: {}", error));
+            log_error(
+                "rpc",
+                &format!("observer RPC healthcheck failed: {}", error),
+            );
             Err(error)
         }
     }
 }
 
-async fn send_boot_ping(
-    logger: &AirtableAdapter,
-    protocol: Protocol,
-) -> anyhow::Result<()> {
+async fn send_boot_ping(logger: &AirtableAdapter, protocol: Protocol) -> anyhow::Result<()> {
     let ping_event = ObservationEvent {
         timestamp: crate::utils::utc_now(),
         signature: format!("Jawas {} is alive", protocol.name()),
@@ -184,7 +186,14 @@ async fn send_boot_ping(
     };
 
     logger.log_observation(&ping_event).await.map(|_| {
-        log_runtime("airtable", "boot ping sent", None, Some("healthcheck"), Some("ok"), None);
+        log_runtime(
+            "airtable",
+            "boot ping sent",
+            None,
+            Some("healthcheck"),
+            Some("ok"),
+            None,
+        );
     })
 }
 
@@ -211,17 +220,16 @@ async fn run_hunter_replay(
     }
 }
 
-fn spawn_hunter(
-    protocol: Protocol,
-    hunter: JawasHunter,
-    wallet_tokens: Vec<WalletToken>,
-) {
+fn spawn_hunter(protocol: Protocol, hunter: JawasHunter, wallet_tokens: Vec<WalletToken>) {
     match protocol {
         Protocol::Kamino => {
             tokio::spawn(async move {
                 loop {
                     if let Err(error) = hunter.run_kamino(wallet_tokens.clone()).await {
-                        log_error("hunter-kamino", &format!("loop exited: {}. Restarting in 2s", error));
+                        log_error(
+                            "hunter-kamino",
+                            &format!("loop exited: {}. Restarting in 2s", error),
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     }
                 }
@@ -231,7 +239,10 @@ fn spawn_hunter(
             tokio::spawn(async move {
                 loop {
                     if let Err(error) = hunter.run_solend(wallet_tokens.clone()).await {
-                        log_error("hunter-solend", &format!("loop exited: {}. Restarting in 2s", error));
+                        log_error(
+                            "hunter-solend",
+                            &format!("loop exited: {}. Restarting in 2s", error),
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     }
                 }
@@ -256,9 +267,13 @@ fn spawn_observer(
                 Some("running"),
                 None,
             );
-            let service = ObserverService::new(rpc.clone(), logger.clone(), oracle.clone(), protocol);
+            let service =
+                ObserverService::new(rpc.clone(), logger.clone(), oracle.clone(), protocol);
             if let Err(error) = service.watch().await {
-                log_error("observer", &format!("loop exited: {}. Restarting in 5s", error));
+                log_error(
+                    "observer",
+                    &format!("loop exited: {}. Restarting in 5s", error),
+                );
             } else {
                 log_info("observer", "loop closed normally. Restarting in 5s");
             }
@@ -270,6 +285,8 @@ fn spawn_observer(
 fn spawn_heartbeat(logger: AirtableAdapter) {
     tokio::spawn(async move {
         let heartbeat = HeartbeatService::new(logger);
-        heartbeat.run(tokio::time::Duration::from_secs(15 * 60)).await;
+        heartbeat
+            .run(tokio::time::Duration::from_secs(15 * 60))
+            .await;
     });
 }

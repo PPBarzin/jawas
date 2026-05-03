@@ -30,7 +30,7 @@ mod tests {
     #[test]
     fn net_profit_deducts_fees() {
         let gross = gross_profit(1000.0, 0.05); // $50
-        let net = net_profit(gross, 5.0, 2.0);  // -$7 in fees
+        let net = net_profit(gross, 5.0, 2.0); // -$7 in fees
         assert!((net - 43.0).abs() < 1e-9);
     }
 

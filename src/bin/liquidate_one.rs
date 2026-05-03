@@ -1,4 +1,7 @@
 use anyhow::{Context, Result};
+use borsh::BorshDeserialize;
+use jawas::domain::kamino::Obligation;
+use sha2::{Digest, Sha256};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
@@ -9,16 +12,13 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::str::FromStr;
-use jawas::domain::kamino::Obligation;
-use borsh::BorshDeserialize;
-use sha2::{Digest, Sha256};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-const KLEND_PROGRAM: &str    = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const LENDING_MARKET: &str   = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
+const KLEND_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+const LENDING_MARKET: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
 const MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
-const TOKEN_PROGRAM: &str    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ATA_PROGRAM: &str      = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
 fn discriminator(name: &str) -> [u8; 8] {
     let preimage = format!("global:{}", name);
@@ -28,20 +28,21 @@ fn discriminator(name: &str) -> [u8; 8] {
 
 fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    let ata_program   = Pubkey::from_str(ATA_PROGRAM).unwrap();
+    let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
     Pubkey::find_program_address(
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program,
-    ).0
+    )
+    .0
 }
 
 #[derive(Debug, Clone)]
 struct ReserveInfo {
-    address:               Pubkey,
-    liquidity_mint:        Pubkey,
-    liquidity_supply:      Pubkey,
-    collateral_mint:       Pubkey,
-    collateral_supply:     Pubkey,
+    address: Pubkey,
+    liquidity_mint: Pubkey,
+    liquidity_supply: Pubkey,
+    collateral_mint: Pubkey,
+    collateral_supply: Pubkey,
     liquidity_fee_receiver: Pubkey,
 }
 
@@ -88,18 +89,28 @@ async fn main() -> Result<()> {
     // 1. Lire l'obligation
     let obs_data = rpc.get_account(&obligation_pk)?.data;
     let mut cursor = &obs_data[8..];
-    let obligation = Obligation::deserialize(&mut cursor).map_err(|e| anyhow::anyhow!("Borsh fail: {}", e))?;
+    let obligation =
+        Obligation::deserialize(&mut cursor).map_err(|e| anyhow::anyhow!("Borsh fail: {}", e))?;
 
     // 2. Trouver le premier dépôt et le premier emprunt
-    let deposit = obligation.deposits.iter().find(|d| d.deposited_amount > 0)
+    let deposit = obligation
+        .deposits
+        .iter()
+        .find(|d| d.deposited_amount > 0)
         .context("Aucun dépôt trouvé")?;
-    let borrow = obligation.borrows.iter().find(|b| b.borrowed_amount_sf > 0)
+    let borrow = obligation
+        .borrows
+        .iter()
+        .find(|b| b.borrowed_amount_sf > 0)
         .context("Aucun emprunt trouvé")?;
 
     let repay_reserve_pk = Pubkey::new_from_array(borrow.borrow_reserve);
     let withdraw_reserve_pk = Pubkey::new_from_array(deposit.deposit_reserve);
 
-    println!("Action: Rembourser réserve {} | Retirer réserve {}", repay_reserve_pk, withdraw_reserve_pk);
+    println!(
+        "Action: Rembourser réserve {} | Retirer réserve {}",
+        repay_reserve_pk, withdraw_reserve_pk
+    );
 
     // 3. Chercher les métadonnées des réserves
     let repay_info = fetch_reserve_metadata(&rpc, &repay_reserve_pk).await?;
@@ -118,17 +129,34 @@ async fn main() -> Result<()> {
     // Refresh Obligation + Reserves
     ixs.push(Instruction {
         program_id: klend_pk,
-        accounts: vec![AccountMeta::new(repay_reserve_pk, false), AccountMeta::new_readonly(market_pk, false), AccountMeta::new_readonly(klend_pk, false), AccountMeta::new_readonly(klend_pk, false), AccountMeta::new_readonly(klend_pk, false)],
+        accounts: vec![
+            AccountMeta::new(repay_reserve_pk, false),
+            AccountMeta::new_readonly(market_pk, false),
+            AccountMeta::new_readonly(klend_pk, false),
+            AccountMeta::new_readonly(klend_pk, false),
+            AccountMeta::new_readonly(klend_pk, false),
+        ],
         data: discriminator("refresh_reserve").to_vec(),
     });
     ixs.push(Instruction {
         program_id: klend_pk,
-        accounts: vec![AccountMeta::new(withdraw_reserve_pk, false), AccountMeta::new_readonly(market_pk, false), AccountMeta::new_readonly(klend_pk, false), AccountMeta::new_readonly(klend_pk, false), AccountMeta::new_readonly(klend_pk, false)],
+        accounts: vec![
+            AccountMeta::new(withdraw_reserve_pk, false),
+            AccountMeta::new_readonly(market_pk, false),
+            AccountMeta::new_readonly(klend_pk, false),
+            AccountMeta::new_readonly(klend_pk, false),
+            AccountMeta::new_readonly(klend_pk, false),
+        ],
         data: discriminator("refresh_reserve").to_vec(),
     });
     ixs.push(Instruction {
         program_id: klend_pk,
-        accounts: vec![AccountMeta::new_readonly(market_pk, false), AccountMeta::new(obligation_pk, false), AccountMeta::new_readonly(withdraw_reserve_pk, false), AccountMeta::new_readonly(repay_reserve_pk, false)],
+        accounts: vec![
+            AccountMeta::new_readonly(market_pk, false),
+            AccountMeta::new(obligation_pk, false),
+            AccountMeta::new_readonly(withdraw_reserve_pk, false),
+            AccountMeta::new_readonly(repay_reserve_pk, false),
+        ],
         data: discriminator("refresh_obligation").to_vec(),
     });
 
@@ -161,14 +189,28 @@ async fn main() -> Result<()> {
         AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM)?, false),
         AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM)?, false),
         AccountMeta::new_readonly(sysvar::instructions::id(), false),
-        AccountMeta::new(klend_pk, false), AccountMeta::new(klend_pk, false), AccountMeta::new(klend_pk, false), AccountMeta::new(klend_pk, false),
-        AccountMeta::new_readonly(Pubkey::from_str("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr")?, false),
+        AccountMeta::new(klend_pk, false),
+        AccountMeta::new(klend_pk, false),
+        AccountMeta::new(klend_pk, false),
+        AccountMeta::new(klend_pk, false),
+        AccountMeta::new_readonly(
+            Pubkey::from_str("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr")?,
+            false,
+        ),
     ];
 
-    ixs.push(Instruction { program_id: klend_pk, accounts, data });
+    ixs.push(Instruction {
+        program_id: klend_pk,
+        accounts,
+        data,
+    });
 
     // Jito Tip
-    ixs.push(solana_sdk::system_instruction::transfer(&liquidator, &Pubkey::from_str("96g9sAg9u3P7Q9ebKsC6SA47cySvnV6S1S1K6ssB1vD")?, 100_000));
+    ixs.push(solana_sdk::system_instruction::transfer(
+        &liquidator,
+        &Pubkey::from_str("96g9sAg9u3P7Q9ebKsC6SA47cySvnV6S1S1K6ssB1vD")?,
+        100_000,
+    ));
 
     let blockhash = rpc.get_latest_blockhash()?;
     let tx = Transaction::new_signed_with_payer(&ixs, Some(&liquidator), &[&keypair], blockhash);
@@ -178,7 +220,9 @@ async fn main() -> Result<()> {
     if let Some(err) = sim.value.err {
         println!("❌ ÉCHEC SIMULATION : {:?}", err);
         if let Some(logs) = sim.value.logs {
-            for log in logs { println!("  {}", log); }
+            for log in logs {
+                println!("  {}", log);
+            }
         }
     } else {
         println!("✅ SIMULATION RÉUSSIE !");

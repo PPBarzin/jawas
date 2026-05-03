@@ -1,40 +1,42 @@
+use crate::ports::config::ConfigPort;
 use crate::ports::jito::JitoPort;
 use crate::ports::jupiter::JupiterPort;
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
-use crate::ports::rpc::{ProgramAccount, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient};
-use crate::ports::config::ConfigPort;
-use dashmap::mapref::entry::Entry as DashEntry;
-use dashmap::DashMap;
+use crate::ports::rpc::{
+    ProgramAccount, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient,
+};
 use crate::utils::log_stderr;
 use borsh::BorshDeserialize;
+use dashmap::mapref::entry::Entry as DashEntry;
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde::Serialize;
-use solana_sdk::signature::Keypair;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signer::Signer;
-use solana_sdk::transaction::VersionedTransaction;
-use solana_sdk::message::VersionedMessage;
-use solana_sdk::message::v0::Message;
+use sha2::{Digest, Sha256};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::message::v0::Message;
+use solana_sdk::message::VersionedMessage;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
 use solana_sdk::sysvar;
-use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
-use std::sync::Arc;
-use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use solana_sdk::transaction::VersionedTransaction;
 use std::collections::HashMap;
 use std::io::Write;
+use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
-const KLEND_PROGRAM: &str    = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const TOKEN_PROGRAM: &str    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ATA_PROGRAM: &str      = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const FARMS_PROGRAM: &str    = "FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr";
+const KLEND_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const FARMS_PROGRAM: &str = "FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr";
 
 // Solend
-const SOLEND_PROGRAM: &str   = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 const SOLEND_LIQUIDATE_FILTER: &str = "LiquidateWithoutReceivingCtokens";
 
 // Kamino
@@ -92,7 +94,11 @@ impl HunterTxFetchConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(800);
 
-        Self { attempts, retry_delay_ms, timeout_ms }
+        Self {
+            attempts,
+            retry_delay_ms,
+            timeout_ms,
+        }
     }
 }
 
@@ -116,11 +122,12 @@ impl HunterRuntimeConfig {
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(DEFAULT_OBLIGATION_DEDUP_MS);
 
-        let non_whitelist_cooldown_ms = std::env::var(format!("{prefix}_NON_WHITELIST_COOLDOWN_MS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_NON_WHITELIST_COOLDOWN_MS").ok())
-            .and_then(|v| v.parse::<u128>().ok())
-            .unwrap_or(30_000);
+        let non_whitelist_cooldown_ms =
+            std::env::var(format!("{prefix}_NON_WHITELIST_COOLDOWN_MS"))
+                .ok()
+                .or_else(|| std::env::var("HUNTER_NON_WHITELIST_COOLDOWN_MS").ok())
+                .and_then(|v| v.parse::<u128>().ok())
+                .unwrap_or(30_000);
 
         let ws_idle_timeout_secs = std::env::var(format!("{prefix}_WS_IDLE_TIMEOUT_SECS"))
             .ok()
@@ -165,6 +172,14 @@ fn hunter_dry_run_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn jito_send_max_attempts() -> usize {
+    std::env::var("JITO_SEND_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 4))
+        .unwrap_or(2)
+}
+
 fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
@@ -191,6 +206,37 @@ fn format_signature_status(status: Option<&SignatureStatusInfo>) -> String {
     }
 }
 
+fn is_expired_blockhash_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("expired blockhash")
+}
+
+fn is_retryable_jito_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rate limited")
+        || lower.contains("network congested")
+        || lower.contains("too many requests")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("timeout")
+        || is_expired_blockhash_error(&lower)
+}
+
+fn retry_tip_lamports(base_tip_lamports: u64, attempt: usize) -> u64 {
+    if attempt <= 1 {
+        return base_tip_lamports;
+    }
+    let multiplier = 1.0 + 0.25 * (attempt.saturating_sub(1) as f64);
+    ((base_tip_lamports as f64) * multiplier).round() as u64
+}
+
+fn retry_backoff_ms(attempt: usize) -> u64 {
+    match attempt {
+        0 | 1 => 0,
+        2 => 40,
+        3 => 100,
+        _ => 200,
+    }
+}
+
 fn kamino_logs_look_like_liquidation(logs: &[String]) -> bool {
     logs.iter().any(|log| {
         let lower = log.to_ascii_lowercase();
@@ -209,7 +255,9 @@ fn summarize_candidate_logs(logs: &[String]) -> String {
     logs.iter()
         .filter(|log| {
             let lower = log.to_ascii_lowercase();
-            lower.contains("liquidate") || lower.contains("flashborrow") || lower.contains("[truncated]")
+            lower.contains("liquidate")
+                || lower.contains("flashborrow")
+                || lower.contains("[truncated]")
         })
         .take(4)
         .map(|log| log.replace('\n', " "))
@@ -240,8 +288,8 @@ struct HunterTraceLogger {
 
 impl HunterTraceLogger {
     fn from_env() -> Self {
-        let path = std::env::var("HUNTER_LOG_FILE")
-            .unwrap_or_else(|_| "hunter_trace.jsonl".to_string());
+        let path =
+            std::env::var("HUNTER_LOG_FILE").unwrap_or_else(|_| "hunter_trace.jsonl".to_string());
 
         if path.eq_ignore_ascii_case("off") || path.eq_ignore_ascii_case("disabled") {
             return Self { writer: None };
@@ -396,7 +444,11 @@ struct LockRecord {
 }
 
 impl LockRecord {
-    fn new_held(source: HunterSignalSource, acquired_at_ms: u64, repay_mint: Option<String>) -> Self {
+    fn new_held(
+        source: HunterSignalSource,
+        acquired_at_ms: u64,
+        repay_mint: Option<String>,
+    ) -> Self {
         Self {
             state: LockState::Held {
                 winner_source: source,
@@ -427,7 +479,12 @@ impl LockRecord {
         now_ms.saturating_sub(self.acquired_at_ms()) >= lock_ms
     }
 
-    fn record_detection(&mut self, source: HunterSignalSource, received_at_ms: u64, won_lock: bool) {
+    fn record_detection(
+        &mut self,
+        source: HunterSignalSource,
+        received_at_ms: u64,
+        won_lock: bool,
+    ) {
         let entry = self.detections.entry(source).or_insert(DetectionStats {
             first_ts_ms: received_at_ms,
             count: 0,
@@ -455,7 +512,12 @@ impl LockRecord {
         }
     }
 
-    fn transition_to_fired(&mut self, source: HunterSignalSource, now_ms: u64, outcome: FireOutcome) -> bool {
+    fn transition_to_fired(
+        &mut self,
+        source: HunterSignalSource,
+        now_ms: u64,
+        outcome: FireOutcome,
+    ) -> bool {
         match &self.state {
             LockState::Firing {
                 winner_source,
@@ -593,20 +655,38 @@ pub fn load_wallet_tokens(path: &str) -> Vec<WalletToken> {
         let line = line.trim();
         if line == "[[tokens]]" {
             if let Some((symbol, mint, decimals, max)) = current.take() {
-                tokens.push(WalletToken { symbol, mint, decimals, max_repay_native: max });
+                tokens.push(WalletToken {
+                    symbol,
+                    mint,
+                    decimals,
+                    max_repay_native: max,
+                });
             }
             current = Some((String::new(), String::new(), 6, 0));
             continue;
         }
         if let Some(ref mut t) = current {
-            if let Some(v) = parse_toml_str(line, "symbol")   { t.0 = v; }
-            if let Some(v) = parse_toml_str(line, "mint")     { t.1 = v; }
-            if let Some(v) = parse_toml_u8(line, "decimals")  { t.2 = v; }
-            if let Some(v) = parse_toml_u64(line, "max_repay_native") { t.3 = v; }
+            if let Some(v) = parse_toml_str(line, "symbol") {
+                t.0 = v;
+            }
+            if let Some(v) = parse_toml_str(line, "mint") {
+                t.1 = v;
+            }
+            if let Some(v) = parse_toml_u8(line, "decimals") {
+                t.2 = v;
+            }
+            if let Some(v) = parse_toml_u64(line, "max_repay_native") {
+                t.3 = v;
+            }
         }
     }
     if let Some((symbol, mint, decimals, max)) = current {
-        tokens.push(WalletToken { symbol, mint, decimals, max_repay_native: max });
+        tokens.push(WalletToken {
+            symbol,
+            mint,
+            decimals,
+            max_repay_native: max,
+        });
     }
 
     tokens
@@ -839,11 +919,12 @@ fn discriminator(name: &str) -> [u8; 8] {
 
 fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    let ata_program   = Pubkey::from_str(ATA_PROGRAM).unwrap();
+    let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
     Pubkey::find_program_address(
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program,
-    ).0
+    )
+    .0
 }
 
 fn jito_tip_accounts() -> Vec<Pubkey> {
@@ -919,20 +1000,24 @@ fn reserve_meta_from_account(data: &[u8]) -> anyhow::Result<KaminoReserveMeta> {
         lending_market: Pubkey::new_from_array(reserve.lending_market),
         pyth_oracle: optional_pubkey(reserve.config.token_info.pyth_configuration.price),
         switchboard_price_oracle: optional_pubkey(
-            reserve.config.token_info.switchboard_configuration.price_aggregator,
+            reserve
+                .config
+                .token_info
+                .switchboard_configuration
+                .price_aggregator,
         ),
         switchboard_twap_oracle: optional_pubkey(
-            reserve.config.token_info.switchboard_configuration.twap_aggregator,
+            reserve
+                .config
+                .token_info
+                .switchboard_configuration
+                .twap_aggregator,
         ),
         scope_prices: optional_pubkey(reserve.config.token_info.scope_configuration.price_feed),
     })
 }
 
-fn ix_refresh_reserve(
-    klend: &Pubkey,
-    reserve: &Pubkey,
-    meta: &KaminoReserveMeta,
-) -> Instruction {
+fn ix_refresh_reserve(klend: &Pubkey, reserve: &Pubkey, meta: &KaminoReserveMeta) -> Instruction {
     let disc = discriminator("refresh_reserve");
     let mut accounts = vec![
         AccountMeta::new(*reserve, false),
@@ -950,7 +1035,11 @@ fn ix_refresh_reserve(
     if let Some(pk) = meta.scope_prices {
         accounts.push(AccountMeta::new_readonly(pk, false));
     }
-    Instruction { program_id: *klend, accounts, data: disc.to_vec() }
+    Instruction {
+        program_id: *klend,
+        accounts,
+        data: disc.to_vec(),
+    }
 }
 
 fn ix_refresh_obligation(
@@ -967,7 +1056,11 @@ fn ix_refresh_obligation(
     for r in reserves {
         accounts.push(AccountMeta::new_readonly(**r, false));
     }
-    Instruction { program_id: *klend, accounts, data: disc.to_vec() }
+    Instruction {
+        program_id: *klend,
+        accounts,
+        data: disc.to_vec(),
+    }
 }
 
 async fn get_or_fetch_kamino_reserve_meta<R: RpcClient>(
@@ -986,7 +1079,13 @@ async fn get_or_fetch_kamino_reserve_meta<R: RpcClient>(
     Ok(meta)
 }
 
-pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + LiquidationLogger + Clone> {
+pub struct HunterService<
+    R: RpcClient,
+    JI: JitoPort,
+    JU: JupiterPort,
+    O: PriceOracle,
+    C: ConfigPort + LiquidationLogger + Clone,
+> {
     hunter_rpc: R,
     secondary_signal_rpc: Option<R>,
     jito: JI,
@@ -998,7 +1097,14 @@ pub struct HunterService<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOr
     trace_logger: HunterTraceLogger,
 }
 
-impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort + LiquidationLogger + Clone + 'static> HunterService<R, JI, JU, O, C> {
+impl<
+        R: RpcClient,
+        JI: JitoPort,
+        JU: JupiterPort,
+        O: PriceOracle,
+        C: ConfigPort + LiquidationLogger + Clone + 'static,
+    > HunterService<R, JI, JU, O, C>
+{
     pub fn new(
         hunter_rpc: R,
         secondary_signal_rpc: Option<R>,
@@ -1039,7 +1145,10 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         JI: Clone + Send + Sync + 'static,
     {
         let runtime = HunterRuntimeConfig::from_env("KAMINO");
-        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let wallet_index = Arc::new(build_wallet_token_index(
+            &self.keypair.pubkey(),
+            &wallet_tokens,
+        )?);
         let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -1053,7 +1162,10 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         ));
 
         // ── Hot cache: blockhash ─────────────────────────────────────────────
-        let initial_blockhash = self.hunter_rpc.get_latest_blockhash().await
+        let initial_blockhash = self
+            .hunter_rpc
+            .get_latest_blockhash()
+            .await
             .unwrap_or_default();
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(initial_blockhash));
         let blockhash_refresh_secs = std::env::var("BLOCKHASH_REFRESH_SECS")
@@ -1066,10 +1178,15 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             let bh = cached_blockhash.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs))
+                        .await;
                     match rpc.get_latest_blockhash().await {
-                        Ok(hash) => { *bh.write().await = hash; }
-                        Err(e) => log_stderr(format!("[hunter-kamino] blockhash refresh failed: {}", e)),
+                        Ok(hash) => {
+                            *bh.write().await = hash;
+                        }
+                        Err(e) => {
+                            log_stderr(format!("[hunter-kamino] blockhash refresh failed: {}", e))
+                        }
                     }
                 }
             });
@@ -1142,7 +1259,9 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     hunter_wallet.clone(),
                 );
             } else {
-                log_stderr("[hunter-kamino] Helius signal source enabled but no secondary RPC configured.");
+                log_stderr(
+                    "[hunter-kamino] Helius signal source enabled but no secondary RPC configured.",
+                );
             }
         }
 
@@ -1171,12 +1290,22 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             self.trace_logger.log(HunterTraceEvent {
                 timestamp: crate::utils::utc_now(),
                 protocol: "kamino",
-                stage: if won_lock { "signal_accepted" } else { "signal_rejected_duplicate" },
-                signature: signal.signature.clone().unwrap_or_else(|| format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)),
+                stage: if won_lock {
+                    "signal_accepted"
+                } else {
+                    "signal_rejected_duplicate"
+                },
+                signature: signal.signature.clone().unwrap_or_else(|| {
+                    format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
+                }),
                 obligation: Some(signal.obligation_pubkey.clone()),
                 repay_mint: signal.repay_mint.clone(),
                 repay_symbol: None,
-                reason: if won_lock { None } else { Some("lock_held".to_string()) },
+                reason: if won_lock {
+                    None
+                } else {
+                    Some("lock_held".to_string())
+                },
                 detail: Some(format!("source={}", signal.source.as_str())),
                 ws_received_at_ms: Some(signal.received_at_ms),
                 elapsed_ms: Some(0),
@@ -1200,10 +1329,15 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             let airtable_logger = self._config.clone();
             let hunter_wallet = hunter_wallet.clone();
             let signal_locks = signal_locks.clone();
-            let sig_for_error = signal.signature.clone().unwrap_or_else(|| format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey));
+            let sig_for_error = signal.signature.clone().unwrap_or_else(|| {
+                format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
+            });
             let rpc = match signal.source {
                 HunterSignalSource::QuickNode => self.hunter_rpc.clone(),
-                HunterSignalSource::Helius => self.secondary_signal_rpc.clone().unwrap_or_else(|| self.hunter_rpc.clone()),
+                HunterSignalSource::Helius => self
+                    .secondary_signal_rpc
+                    .clone()
+                    .unwrap_or_else(|| self.hunter_rpc.clone()),
                 HunterSignalSource::Hermes => self.hunter_rpc.clone(),
             };
 
@@ -1228,7 +1362,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     signal.tx_info,
                     Some(signal.obligation_pubkey.clone()),
                     signal.repay_mint.clone(),
-                ).await;
+                )
+                .await;
 
                 let outcome = match &result {
                     Ok(KaminoExecutionOutcome::BundleSent) => FireOutcome::BundleSent,
@@ -1237,7 +1372,13 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     Ok(KaminoExecutionOutcome::Skipped) => FireOutcome::Skipped,
                     Err(_) => FireOutcome::OpportunityError,
                 };
-                mark_lock_fired(&signal_locks, &fingerprint, signal.source, now_ms(), outcome);
+                mark_lock_fired(
+                    &signal_locks,
+                    &fingerprint,
+                    signal.source,
+                    now_ms(),
+                    outcome,
+                );
 
                 if let Err(e) = result {
                     trace_logger.log(HunterTraceEvent {
@@ -1264,8 +1405,13 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                         None,
                         Some(format!("source={} {}", signal.source.as_str(), e)),
                         Some(elapsed_ms_since(signal.received_at_ms)),
-                    ).await;
-                    log_stderr(format!("[hunter-kamino] opportunity error (source={}): {}", signal.source.as_str(), e));
+                    )
+                    .await;
+                    log_stderr(format!(
+                        "[hunter-kamino] opportunity error (source={}): {}",
+                        signal.source.as_str(),
+                        e
+                    ));
                 }
             });
         }
@@ -1273,16 +1419,26 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         Ok(())
     }
 
-    pub async fn replay_kamino(&self, wallet_tokens: Vec<WalletToken>, signature: String) -> anyhow::Result<()>
+    pub async fn replay_kamino(
+        &self,
+        wallet_tokens: Vec<WalletToken>,
+        signature: String,
+    ) -> anyhow::Result<()>
     where
         R: RpcClient + Clone + Send + Sync + 'static,
         JI: Clone + Send + Sync + 'static,
     {
-        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let wallet_index = Arc::new(build_wallet_token_index(
+            &self.keypair.pubkey(),
+            &wallet_tokens,
+        )?);
         let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(
-            self.hunter_rpc.get_latest_blockhash().await.unwrap_or_default(),
+            self.hunter_rpc
+                .get_latest_blockhash()
+                .await
+                .unwrap_or_default(),
         ));
         let cached_tip = Arc::new(std::sync::atomic::AtomicU64::new(
             self.jito.get_tip_recommendation().await.unwrap_or(100_000),
@@ -1349,7 +1505,10 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         JI: Clone + Send + Sync + 'static,
     {
         let runtime = HunterRuntimeConfig::from_env("SOLEND");
-        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let wallet_index = Arc::new(build_wallet_token_index(
+            &self.keypair.pubkey(),
+            &wallet_tokens,
+        )?);
 
         log_stderr(format!(
             "[hunter-solend] Starting autonomous hunter. Wallet: {} | signal_commitment={:?} | tx_fetch={:?} | tokens: {}",
@@ -1358,7 +1517,10 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         ));
 
         // ── Hot cache: blockhash ─────────────────────────────────────────────
-        let initial_blockhash = self.hunter_rpc.get_latest_blockhash().await
+        let initial_blockhash = self
+            .hunter_rpc
+            .get_latest_blockhash()
+            .await
             .unwrap_or_default();
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(initial_blockhash));
         let blockhash_refresh_secs = std::env::var("BLOCKHASH_REFRESH_SECS")
@@ -1371,10 +1533,15 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             let bh = cached_blockhash.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs))
+                        .await;
                     match rpc.get_latest_blockhash().await {
-                        Ok(hash) => { *bh.write().await = hash; }
-                        Err(e) => log_stderr(format!("[hunter-solend] blockhash refresh failed: {}", e)),
+                        Ok(hash) => {
+                            *bh.write().await = hash;
+                        }
+                        Err(e) => {
+                            log_stderr(format!("[hunter-solend] blockhash refresh failed: {}", e))
+                        }
                     }
                 }
             });
@@ -1402,10 +1569,17 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
 
         // ── Main WS loop ─────────────────────────────────────────────────────
         loop {
-            let mut rx = match self.hunter_rpc.subscribe_to_logs(SOLEND_PROGRAM, runtime.signal_commitment).await {
+            let mut rx = match self
+                .hunter_rpc
+                .subscribe_to_logs(SOLEND_PROGRAM, runtime.signal_commitment)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    log_stderr(format!("[hunter-solend] WS subscribe failed: {}. Retrying in 2s...", e));
+                    log_stderr(format!(
+                        "[hunter-solend] WS subscribe failed: {}. Retrying in 2s...",
+                        e
+                    ));
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     continue;
                 }
@@ -1417,7 +1591,9 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                 let entry = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(runtime.ws_idle_timeout_secs),
                     rx.recv(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(e)) => e,
                     Ok(None) => {
                         log_stderr("[hunter-solend] WS stream ended. Reconnecting...");
@@ -1432,18 +1608,22 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     }
                 };
 
-                if !entry.logs.iter().any(|l| l.contains(SOLEND_LIQUIDATE_FILTER)) {
+                if !entry
+                    .logs
+                    .iter()
+                    .any(|l| l.contains(SOLEND_LIQUIDATE_FILTER))
+                {
                     continue;
                 }
 
-                let sig       = entry.signature.clone();
-                let rpc       = self.hunter_rpc.clone();
-                let keypair   = self.keypair.clone();
-                let jito      = self.jito.clone();
+                let sig = entry.signature.clone();
+                let rpc = self.hunter_rpc.clone();
+                let keypair = self.keypair.clone();
+                let jito = self.jito.clone();
                 let wallet_idx = wallet_index.clone();
-                let bh        = cached_blockhash.clone();
-                let tip       = cached_tip.clone();
-                let dedup     = recent_obligations.clone();
+                let bh = cached_blockhash.clone();
+                let tip = cached_tip.clone();
+                let dedup = recent_obligations.clone();
                 let trace_logger = self.trace_logger.clone();
                 let tx_fetch_cfg = runtime.tx_fetch;
                 let airtable_logger = self._config.clone();
@@ -1451,7 +1631,11 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                 let err_sig = sig.clone();
                 let err_trace_logger = trace_logger.clone();
 
-                hunter_verbose_log(runtime.verbose, "solend", format!("candidate | sig={}", sig));
+                hunter_verbose_log(
+                    runtime.verbose,
+                    "solend",
+                    format!("candidate | sig={}", sig),
+                );
 
                 trace_logger.log(HunterTraceEvent {
                     timestamp: crate::utils::utc_now(),
@@ -1477,7 +1661,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                     None,
                     None,
                     Some(0),
-                ).await;
+                )
+                .await;
 
                 tokio::spawn(async move {
                     if let Err(e) = execute_solend_opportunity(
@@ -1493,7 +1678,9 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                         tx_fetch_cfg,
                         trace_logger,
                         airtable_logger.clone(),
-                    ).await {
+                    )
+                    .await
+                    {
                         err_trace_logger.log(HunterTraceEvent {
                             timestamp: crate::utils::utc_now(),
                             protocol: "solend",
@@ -1518,7 +1705,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
                             None,
                             Some(e.to_string()),
                             Some(elapsed_ms_since(entry.received_at_ms)),
-                        ).await;
+                        )
+                        .await;
                         log_stderr(format!("[hunter-solend] opportunity error: {}", e));
                     }
                 });
@@ -1526,14 +1714,24 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
         }
     }
 
-    pub async fn replay_solend(&self, wallet_tokens: Vec<WalletToken>, signature: String) -> anyhow::Result<()>
+    pub async fn replay_solend(
+        &self,
+        wallet_tokens: Vec<WalletToken>,
+        signature: String,
+    ) -> anyhow::Result<()>
     where
         R: RpcClient + Clone + Send + Sync + 'static,
         JI: Clone + Send + Sync + 'static,
     {
-        let wallet_index = Arc::new(build_wallet_token_index(&self.keypair.pubkey(), &wallet_tokens)?);
+        let wallet_index = Arc::new(build_wallet_token_index(
+            &self.keypair.pubkey(),
+            &wallet_tokens,
+        )?);
         let cached_blockhash = Arc::new(tokio::sync::RwLock::new(
-            self.hunter_rpc.get_latest_blockhash().await.unwrap_or_default(),
+            self.hunter_rpc
+                .get_latest_blockhash()
+                .await
+                .unwrap_or_default(),
         ));
         let cached_tip = Arc::new(std::sync::atomic::AtomicU64::new(
             self.jito.get_tip_recommendation().await.unwrap_or(100_000),
@@ -1571,7 +1769,8 @@ impl<R: RpcClient, JI: JitoPort, JU: JupiterPort, O: PriceOracle, C: ConfigPort 
             tx_fetch,
             self.trace_logger.clone(),
             self._config.clone(),
-        ).await
+        )
+        .await
     }
 }
 
@@ -1592,7 +1791,11 @@ fn try_accept_signal(
         }
         DashEntry::Occupied(mut o) => {
             if o.get().is_expired(now, lock_ms) {
-                let expired = o.insert(LockRecord::new_held(signal.source, now, signal.repay_mint.clone()));
+                let expired = o.insert(LockRecord::new_held(
+                    signal.source,
+                    now,
+                    signal.repay_mint.clone(),
+                ));
                 metrics.try_log_summary(expired.into_summary(fingerprint));
                 o.get_mut().record_detection(signal.source, now, true);
                 true
@@ -1670,22 +1873,28 @@ async fn resolve_kamino_signal_event<R: RpcClient>(
     runtime: HunterRuntimeConfig,
 ) -> anyhow::Result<HunterSignalEvent> {
     let tx_info = rpc
-        .get_transaction_with_retries(&signature, runtime.tx_fetch.attempts, runtime.tx_fetch.retry_delay_ms)
+        .get_transaction_with_retries(
+            &signature,
+            runtime.tx_fetch.attempts,
+            runtime.tx_fetch.retry_delay_ms,
+        )
         .await?;
     let liquidate_ix_idx = find_kamino_liquidate_ix(&tx_info)
         .ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
     let ix_accs = &tx_info.instruction_accounts[liquidate_ix_idx];
     if ix_accs.len() < 6 {
-        anyhow::bail!("liquidate instruction has too few accounts ({})", ix_accs.len());
+        anyhow::bail!(
+            "liquidate instruction has too few accounts ({})",
+            ix_accs.len()
+        );
     }
 
-    let obligation_pubkey = tx_info.account_keys
+    let obligation_pubkey = tx_info
+        .account_keys
         .get(ix_accs[1])
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("missing obligation account"))?;
-    let repay_mint = tx_info.account_keys
-        .get(ix_accs[5])
-        .cloned();
+    let repay_mint = tx_info.account_keys.get(ix_accs[5]).cloned();
 
     Ok(HunterSignalEvent {
         source,
@@ -1714,7 +1923,10 @@ fn spawn_kamino_log_signal_source<R, L>(
 {
     tokio::spawn(async move {
         loop {
-            let mut rx = match rpc.subscribe_to_logs(KLEND_PROGRAM, runtime.signal_commitment).await {
+            let mut rx = match rpc
+                .subscribe_to_logs(KLEND_PROGRAM, runtime.signal_commitment)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     log_stderr(format!(
@@ -1736,7 +1948,9 @@ fn spawn_kamino_log_signal_source<R, L>(
                 let entry = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(runtime.ws_idle_timeout_secs),
                     rx.recv(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(e)) => e,
                     Ok(None) => break,
                     Err(_) => break,
@@ -1751,7 +1965,12 @@ fn spawn_kamino_log_signal_source<R, L>(
                     hunter_verbose_log(
                         runtime.verbose,
                         "kamino",
-                        format!("skip healthy obligation | source={} sig={} logs={}", source.as_str(), entry.signature, detail),
+                        format!(
+                            "skip healthy obligation | source={} sig={} logs={}",
+                            source.as_str(),
+                            entry.signature,
+                            detail
+                        ),
                     );
                     trace_logger.log(HunterTraceEvent {
                         timestamp: crate::utils::utc_now(),
@@ -1773,7 +1992,12 @@ fn spawn_kamino_log_signal_source<R, L>(
                 hunter_verbose_log(
                     runtime.verbose,
                     "kamino",
-                    format!("candidate | source={} sig={} logs={}", source.as_str(), entry.signature, detail),
+                    format!(
+                        "candidate | source={} sig={} logs={}",
+                        source.as_str(),
+                        entry.signature,
+                        detail
+                    ),
                 );
 
                 trace_logger.log(HunterTraceEvent {
@@ -1800,7 +2024,8 @@ fn spawn_kamino_log_signal_source<R, L>(
                     None,
                     Some(format!("source={} {}", source.as_str(), detail)),
                     Some(0),
-                ).await;
+                )
+                .await;
 
                 match resolve_kamino_signal_event(
                     &rpc,
@@ -1923,7 +2148,8 @@ fn build_hermes_shortlist_from_decoded(
     obligations: Vec<(String, crate::domain::kamino::Obligation)>,
     reserve_infos: &HashMap<[u8; 32], HermesReserveInfo>,
 ) -> Vec<HermesShortlistEntry> {
-    let whitelist: HashMap<String, &WalletToken> = wallet_tokens.iter().map(|t| (t.mint.clone(), t)).collect();
+    let whitelist: HashMap<String, &WalletToken> =
+        wallet_tokens.iter().map(|t| (t.mint.clone(), t)).collect();
     let mut shortlist = Vec::new();
     for (account_pubkey, obligation) in obligations {
         if obligation.has_debt == 0 || obligation.borrowed_assets_market_value_sf == 0 {
@@ -1955,7 +2181,11 @@ fn build_hermes_shortlist_from_decoded(
         }
     }
 
-    shortlist.sort_by(|a, b| a.distance_to_liq.partial_cmp(&b.distance_to_liq).unwrap_or(std::cmp::Ordering::Equal));
+    shortlist.sort_by(|a, b| {
+        a.distance_to_liq
+            .partial_cmp(&b.distance_to_liq)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     shortlist
 }
 
@@ -1996,8 +2226,7 @@ fn build_hermes_signals_from_changed_feeds(
             repay_mint: Some(entry.repay_mint.clone()),
             detail: Some(format!(
                 "hermes_feed_update distance_to_liq={:.8} chunk_received_at_ms={}",
-                entry.distance_to_liq,
-                received_at_ms
+                entry.distance_to_liq, received_at_ms
             )),
             tx_info: None,
         })
@@ -2028,7 +2257,8 @@ fn spawn_hermes_signal_source<R>(
         let trigger_buffer_bps = std::env::var("HERMES_TRIGGER_BUFFER_BPS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(25) as f64 / 10_000.0;
+            .unwrap_or(25) as f64
+            / 10_000.0;
 
         let shortlist = Arc::new(tokio::sync::RwLock::new(Vec::<HermesShortlistEntry>::new()));
         {
@@ -2044,7 +2274,10 @@ fn spawn_hermes_signal_source<R>(
                             *shortlist.write().await = entries;
                         }
                         Err(e) => {
-                            log_stderr(format!("[hunter-kamino] hermes shortlist refresh failed: {}", e));
+                            log_stderr(format!(
+                                "[hunter-kamino] hermes shortlist refresh failed: {}",
+                                e
+                            ));
                         }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
@@ -2059,7 +2292,8 @@ fn spawn_hermes_signal_source<R>(
                 continue;
             }
 
-            let mut feed_ids = current.iter()
+            let mut feed_ids = current
+                .iter()
                 .flat_map(|entry| entry.tracked_feed_ids.iter().cloned())
                 .collect::<Vec<_>>();
             feed_ids.sort();
@@ -2067,7 +2301,8 @@ fn spawn_hermes_signal_source<R>(
 
             let mut url = format!("{}/v2/updates/price/stream", hermes_url);
             if !feed_ids.is_empty() {
-                let query = feed_ids.iter()
+                let query = feed_ids
+                    .iter()
                     .map(|id| format!("ids[]={}", id))
                     .collect::<Vec<_>>()
                     .join("&");
@@ -2105,7 +2340,10 @@ fn spawn_hermes_signal_source<R>(
                                             timestamp: crate::utils::utc_now(),
                                             protocol: "kamino",
                                             stage: "signal_received",
-                                            signature: format!("hermes:{}", signal.obligation_pubkey),
+                                            signature: format!(
+                                                "hermes:{}",
+                                                signal.obligation_pubkey
+                                            ),
                                             obligation: Some(signal.obligation_pubkey.clone()),
                                             repay_mint: signal.repay_mint.clone(),
                                             repay_symbol: None,
@@ -2175,8 +2413,14 @@ where
         Some(tx_info) => tx_info,
         None => match tokio::time::timeout(
             tokio::time::Duration::from_millis(runtime.tx_fetch.timeout_ms),
-            rpc.get_transaction_with_retries(&sig, runtime.tx_fetch.attempts, runtime.tx_fetch.retry_delay_ms),
-        ).await {
+            rpc.get_transaction_with_retries(
+                &sig,
+                runtime.tx_fetch.attempts,
+                runtime.tx_fetch.retry_delay_ms,
+            ),
+        )
+        .await
+        {
             Ok(Ok(tx_info)) => tx_info,
             Ok(Err(e)) => {
                 let status = rpc.get_signature_status(&sig).await.ok().flatten();
@@ -2202,12 +2446,15 @@ where
     // ── 2. Find the liquidate instruction ────────────────────────────────────
     let liquidate_ix_idx = find_kamino_liquidate_ix(&tx_info);
 
-    let ix_idx = liquidate_ix_idx
-        .ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
+    let ix_idx =
+        liquidate_ix_idx.ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
 
     let ix_accs = &tx_info.instruction_accounts[ix_idx];
     if ix_accs.len() < 13 {
-        anyhow::bail!("liquidate instruction has too few accounts ({})", ix_accs.len());
+        anyhow::bail!(
+            "liquidate instruction has too few accounts ({})",
+            ix_accs.len()
+        );
     }
 
     // ── 3. Resolve account pubkeys from the competitor's instruction ─────────
@@ -2246,21 +2493,21 @@ where
         None => resolve!(1).to_string(),
     };
     let obligation_str = obligation_owned.as_str();
-    let market_str        = resolve!(2);
-    let market_auth_str   = resolve!(3);
+    let market_str = resolve!(2);
+    let market_auth_str = resolve!(3);
     let repay_reserve_str = resolve!(4);
     let repay_mint_owned = match known_repay_mint {
         Some(value) => value,
         None => resolve!(5).to_string(),
     };
     let repay_mint_str = repay_mint_owned.as_str();
-    let repay_supply_str  = resolve!(6);
-    let wdr_reserve_str   = resolve!(7);
-    let wdr_liq_mint_str  = resolve!(8);
-    let wdr_col_mint_str  = resolve!(9);
-    let wdr_col_sup_str   = resolve!(10);
-    let wdr_liq_sup_str   = resolve!(11);
-    let wdr_fee_str       = resolve!(12);
+    let repay_supply_str = resolve!(6);
+    let wdr_reserve_str = resolve!(7);
+    let wdr_liq_mint_str = resolve!(8);
+    let wdr_col_mint_str = resolve!(9);
+    let wdr_col_sup_str = resolve!(10);
+    let wdr_liq_sup_str = resolve!(11);
+    let wdr_fee_str = resolve!(12);
     let resolve_ms = resolve_started_at.elapsed().as_millis();
 
     // ── 4. Check we hold the repay token ────────────────────────────────────
@@ -2332,28 +2579,30 @@ where
     let _ = max_repay_usd; // available for future price-based capping
 
     // ── 6. Parse pubkeys ─────────────────────────────────────────────────────
-    let obligation_pk    = Pubkey::from_str(obligation_str)?;
-    let market_pk        = Pubkey::from_str(market_str)?;
-    let market_auth_pk   = Pubkey::from_str(market_auth_str)?;
+    let obligation_pk = Pubkey::from_str(obligation_str)?;
+    let market_pk = Pubkey::from_str(market_str)?;
+    let market_auth_pk = Pubkey::from_str(market_auth_str)?;
     let repay_reserve_pk = Pubkey::from_str(repay_reserve_str)?;
-    let repay_mint_pk    = Pubkey::from_str(repay_mint_str)?;
-    let repay_supply_pk  = Pubkey::from_str(repay_supply_str)?;
-    let wdr_reserve_pk   = Pubkey::from_str(wdr_reserve_str)?;
-    let wdr_liq_mint_pk  = Pubkey::from_str(wdr_liq_mint_str)?;
-    let wdr_col_mint_pk  = Pubkey::from_str(wdr_col_mint_str)?;
-    let wdr_col_sup_pk   = Pubkey::from_str(wdr_col_sup_str)?;
-    let wdr_liq_sup_pk   = Pubkey::from_str(wdr_liq_sup_str)?;
-    let wdr_fee_pk       = Pubkey::from_str(wdr_fee_str)?;
+    let repay_mint_pk = Pubkey::from_str(repay_mint_str)?;
+    let repay_supply_pk = Pubkey::from_str(repay_supply_str)?;
+    let wdr_reserve_pk = Pubkey::from_str(wdr_reserve_str)?;
+    let wdr_liq_mint_pk = Pubkey::from_str(wdr_liq_mint_str)?;
+    let wdr_col_mint_pk = Pubkey::from_str(wdr_col_mint_str)?;
+    let wdr_col_sup_pk = Pubkey::from_str(wdr_col_sup_str)?;
+    let wdr_liq_sup_pk = Pubkey::from_str(wdr_liq_sup_str)?;
+    let wdr_fee_pk = Pubkey::from_str(wdr_fee_str)?;
 
-    let klend_pk      = Pubkey::from_str(KLEND_PROGRAM).unwrap();
+    let klend_pk = Pubkey::from_str(KLEND_PROGRAM).unwrap();
     let token_prog_pk = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    let farms_pk      = Pubkey::from_str(FARMS_PROGRAM).unwrap();
-    let tip_account   = select_jito_tip_account(&sig)?;
+    let farms_pk = Pubkey::from_str(FARMS_PROGRAM).unwrap();
+    let tip_account = select_jito_tip_account(&sig)?;
 
     let liquidator = keypair.pubkey();
     let reserve_meta_started_at = Instant::now();
-    let repay_reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &repay_reserve_pk).await?;
-    let withdraw_reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &wdr_reserve_pk).await?;
+    let repay_reserve_meta =
+        get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &repay_reserve_pk).await?;
+    let withdraw_reserve_meta =
+        get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &wdr_reserve_pk).await?;
     let reserve_meta_ms = reserve_meta_started_at.elapsed().as_millis();
 
     // ── 7. Build instructions ────────────────────────────────────────────────
@@ -2374,7 +2623,12 @@ where
         ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
         ix_refresh_reserve(&klend_pk, &repay_reserve_pk, &repay_reserve_meta),
         ix_refresh_reserve(&klend_pk, &wdr_reserve_pk, &withdraw_reserve_meta),
-        ix_refresh_obligation(&klend_pk, &market_pk, &obligation_pk, &[&repay_reserve_pk, &wdr_reserve_pk]),
+        ix_refresh_obligation(
+            &klend_pk,
+            &market_pk,
+            &obligation_pk,
+            &[&repay_reserve_pk, &wdr_reserve_pk],
+        ),
     ];
 
     // Liquidate instruction
@@ -2387,7 +2641,7 @@ where
         data.extend_from_slice(&0u64.to_le_bytes()); // minAcceptableReceivedLiquidityAmount
         data.extend_from_slice(&0u64.to_le_bytes()); // maxAllowedLtvOverridePercent
 
-        let user_src     = repay_token.source_ata;
+        let user_src = repay_token.source_ata;
         let user_dst_col = get_ata(&liquidator, &wdr_col_mint_pk);
         let user_dst_liq = get_ata(&liquidator, &wdr_liq_mint_pk);
 
@@ -2416,15 +2670,19 @@ where
         if ix_accs.len() >= 25 {
             for &account_idx in &ix_accs[20..24] {
                 let pk = Pubkey::from_str(
-                    tx_info.account_keys
+                    tx_info
+                        .account_keys
                         .get(account_idx)
                         .ok_or_else(|| anyhow::anyhow!("missing farm account"))?,
                 )?;
                 accounts.push(AccountMeta::new(pk, false));
             }
-            let farms_program_idx = *ix_accs.get(24).ok_or_else(|| anyhow::anyhow!("missing farms program"))?;
+            let farms_program_idx = *ix_accs
+                .get(24)
+                .ok_or_else(|| anyhow::anyhow!("missing farms program"))?;
             let farms_program_pk = Pubkey::from_str(
-                tx_info.account_keys
+                tx_info
+                    .account_keys
                     .get(farms_program_idx)
                     .ok_or_else(|| anyhow::anyhow!("missing farms program key"))?,
             )?;
@@ -2437,31 +2695,29 @@ where
             accounts.push(AccountMeta::new_readonly(farms_pk, false));
         }
 
-        instructions.push(Instruction { program_id: klend_pk, accounts, data });
+        instructions.push(Instruction {
+            program_id: klend_pk,
+            accounts,
+            data,
+        });
     }
 
     // Jito tip (pre-cached)
-    let tip_lamports = cached_tip.load(Ordering::Relaxed);
-    instructions.push(solana_sdk::system_instruction::transfer(&liquidator, &tip_account, tip_lamports));
-
-    // ── 8. Build and sign tx with pre-cached blockhash ───────────────────────
-    let build_started_at = Instant::now();
-    let blockhash = *cached_blockhash.read().await;
-
-    let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
-        .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-
-    let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-        .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
-    let build_ms = build_started_at.elapsed().as_millis();
-    let total_before_send_ms = started_at.elapsed().as_millis();
-    let timing_detail = format_stage_timings(
+    let base_tip_lamports = cached_tip.load(Ordering::Relaxed);
+    instructions.push(solana_sdk::system_instruction::transfer(
+        &liquidator,
+        &tip_account,
+        base_tip_lamports,
+    ));
+    let tip_instruction_idx = instructions.len() - 1;
+    let max_send_attempts = jito_send_max_attempts();
+    let initial_timing_detail = format_stage_timings(
         tx_fetch_ms,
         resolve_ms,
         reserve_meta_ms,
-        build_ms,
+        0,
         None,
-        total_before_send_ms,
+        started_at.elapsed().as_millis(),
     );
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
@@ -2474,7 +2730,15 @@ where
         repay_mint: Some(repay_mint_str.to_string()),
         repay_symbol: Some(repay_token.symbol.clone()),
         reason: None,
-        detail: Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
+        detail: Some(format!(
+            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} {}",
+            source.as_str(),
+            base_tip_lamports,
+            tip_account,
+            compute_unit_price,
+            max_send_attempts,
+            initial_timing_detail
+        )),
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
@@ -2487,15 +2751,36 @@ where
         Some(obligation_str.to_string()),
         Some(liquidator.to_string()),
         Some(repay_token),
-        Some(format!("source={} tip={} tip_account={} cu_price={} {}", source.as_str(), tip_lamports, tip_account, compute_unit_price, timing_detail)),
+        Some(format!(
+            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} {}",
+            source.as_str(),
+            base_tip_lamports,
+            tip_account,
+            compute_unit_price,
+            max_send_attempts,
+            initial_timing_detail
+        )),
         Some(elapsed_ms_since(ws_received_at_ms)),
-    ).await;
+    )
+    .await;
     log_stderr(format!(
-        "[hunter-kamino] FIRING | source={} obligation={} repay={} tip={} cu_price={}",
-        source.as_str(), &obligation_str[..8], repay_token.symbol, tip_lamports, compute_unit_price
+        "[hunter-kamino] FIRING | source={} obligation={} repay={} tip={} cu_price={} max_attempts={}",
+        source.as_str(),
+        &obligation_str[..8],
+        repay_token.symbol,
+        base_tip_lamports,
+        compute_unit_price,
+        max_send_attempts
     ));
 
     if hunter_dry_run_enabled() {
+        let dry_run_blockhash = *cached_blockhash.read().await;
+        let build_started_at = Instant::now();
+        let message = Message::try_compile(&liquidator, &instructions, &[], dry_run_blockhash)
+            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
+            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let build_ms = build_started_at.elapsed().as_millis();
         let tx_bytes = bincode::serialize(&tx)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
@@ -2508,104 +2793,205 @@ where
             repay_mint: Some(repay_mint_str.to_string()),
             repay_symbol: Some(repay_token.symbol.clone()),
             reason: Some("dry_run_enabled".to_string()),
-            detail: Some(format!("source={} tx_size_bytes={} tip={} cu_price={} {}", source.as_str(), tx_bytes, tip_lamports, compute_unit_price, timing_detail)),
+            detail: Some(format!(
+                "source={} tx_size_bytes={} tip={} cu_price={} attempt=1/{} {}",
+                source.as_str(),
+                tx_bytes,
+                base_tip_lamports,
+                compute_unit_price,
+                max_send_attempts,
+                format_stage_timings(
+                    tx_fetch_ms,
+                    resolve_ms,
+                    reserve_meta_ms,
+                    build_ms,
+                    None,
+                    started_at.elapsed().as_millis(),
+                )
+            )),
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
         });
         log_stderr(format!(
             "[hunter-kamino] DRY RUN | obligation={} repay={} tx_size={}",
-            &obligation_str[..8], repay_token.symbol, tx_bytes
+            &obligation_str[..8],
+            repay_token.symbol,
+            tx_bytes
         ));
         return Ok(KaminoExecutionOutcome::DryRun);
     }
 
-    let send_started_at = Instant::now();
-    match jito.send_bundle(vec![tx]).await {
-        Ok(bundle_id) => {
-            let send_bundle_ms = send_started_at.elapsed().as_millis();
-            let bundle_detail = format_stage_timings(
-                tx_fetch_ms,
-                resolve_ms,
-                reserve_meta_ms,
-                build_ms,
-                Some(send_bundle_ms),
-                started_at.elapsed().as_millis(),
-            );
-            trace_logger.log(HunterTraceEvent {
-                timestamp: crate::utils::utc_now(),
-                protocol: "kamino",
-                stage: "bundle_sent",
-                signature: sig.clone(),
-                obligation: Some(obligation_str.to_string()),
-                repay_mint: Some(repay_mint_str.to_string()),
-                repay_symbol: Some(repay_token.symbol.clone()),
-                reason: None,
-                detail: Some(format!("source={} {}", source.as_str(), bundle_detail.clone())),
-                ws_received_at_ms: Some(ws_received_at_ms),
-                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                bundle_id: Some(bundle_id.clone()),
-            });
-            let _ = log_hunter_observation(
-                &logger,
-                "Kamino",
-                "HUNTER_BUNDLE_SENT",
-                &sig,
-                Some(obligation_str.to_string()),
-                Some(liquidator.to_string()),
-                Some(repay_token),
-                Some(format!("source={} {}", source.as_str(), bundle_detail)),
-                Some(elapsed_ms_since(ws_received_at_ms)),
-            ).await;
-            log_stderr(format!(
-                "[hunter-kamino] BUNDLE SENT | source={} obligation={} bundle={}",
-                source.as_str(), &obligation_str[..8], &bundle_id[..12.min(bundle_id.len())]
-            ));
-            Ok(KaminoExecutionOutcome::BundleSent)
-        }
-        Err(e) => {
-            let send_bundle_ms = send_started_at.elapsed().as_millis();
-            let bundle_detail = format!(
-                "{} | {}",
-                e,
-                format_stage_timings(
-                    tx_fetch_ms,
-                    resolve_ms,
-                    reserve_meta_ms,
-                    build_ms,
-                    Some(send_bundle_ms),
-                    started_at.elapsed().as_millis(),
+    for attempt in 1..=max_send_attempts {
+        let tip_lamports = retry_tip_lamports(base_tip_lamports, attempt);
+        instructions[tip_instruction_idx] =
+            solana_sdk::system_instruction::transfer(&liquidator, &tip_account, tip_lamports);
+
+        let blockhash = if attempt == 1 {
+            *cached_blockhash.read().await
+        } else {
+            match rpc.get_latest_blockhash().await {
+                Ok(latest_blockhash) => {
+                    *cached_blockhash.write().await = latest_blockhash;
+                    latest_blockhash
+                }
+                Err(_) => *cached_blockhash.read().await,
+            }
+        };
+
+        let build_started_at = Instant::now();
+        let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
+            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
+            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let build_ms = build_started_at.elapsed().as_millis();
+
+        let send_started_at = Instant::now();
+        match jito.send_bundle(vec![tx]).await {
+            Ok(bundle_id) => {
+                let send_bundle_ms = send_started_at.elapsed().as_millis();
+                let bundle_detail = format!(
+                    "attempt={}/{} tip={} {}",
+                    attempt,
+                    max_send_attempts,
+                    tip_lamports,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        reserve_meta_ms,
+                        build_ms,
+                        Some(send_bundle_ms),
+                        started_at.elapsed().as_millis(),
+                    )
+                );
+                trace_logger.log(HunterTraceEvent {
+                    timestamp: crate::utils::utc_now(),
+                    protocol: "kamino",
+                    stage: "bundle_sent",
+                    signature: sig.clone(),
+                    obligation: Some(obligation_str.to_string()),
+                    repay_mint: Some(repay_mint_str.to_string()),
+                    repay_symbol: Some(repay_token.symbol.clone()),
+                    reason: None,
+                    detail: Some(format!(
+                        "source={} {}",
+                        source.as_str(),
+                        bundle_detail.clone()
+                    )),
+                    ws_received_at_ms: Some(ws_received_at_ms),
+                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                    bundle_id: Some(bundle_id.clone()),
+                });
+                let _ = log_hunter_observation(
+                    &logger,
+                    "Kamino",
+                    "HUNTER_BUNDLE_SENT",
+                    &sig,
+                    Some(obligation_str.to_string()),
+                    Some(liquidator.to_string()),
+                    Some(repay_token),
+                    Some(format!("source={} {}", source.as_str(), bundle_detail)),
+                    Some(elapsed_ms_since(ws_received_at_ms)),
                 )
-            );
-            trace_logger.log(HunterTraceEvent {
-                timestamp: crate::utils::utc_now(),
-                protocol: "kamino",
-                stage: "error",
-                signature: sig.clone(),
-                obligation: Some(obligation_str.to_string()),
-                repay_mint: Some(repay_mint_str.to_string()),
-                repay_symbol: Some(repay_token.symbol.clone()),
-                reason: Some("bundle_send_failed".to_string()),
-                detail: Some(format!("source={} {}", source.as_str(), bundle_detail.clone())),
-                ws_received_at_ms: Some(ws_received_at_ms),
-                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                bundle_id: None,
-            });
-            let _ = log_hunter_observation(
-                &logger,
-                "Kamino",
-                "HUNTER_BUNDLE_FAILED",
-                &sig,
-                Some(obligation_str.to_string()),
-                Some(liquidator.to_string()),
-                Some(repay_token),
-                Some(format!("source={} {}", source.as_str(), bundle_detail)),
-                Some(elapsed_ms_since(ws_received_at_ms)),
-            ).await;
-            log_stderr(format!("[hunter-kamino] bundle send failed (source={}): {}", source.as_str(), e));
-            Ok(KaminoExecutionOutcome::BundleFailed)
+                .await;
+                log_stderr(format!(
+                    "[hunter-kamino] BUNDLE SENT | source={} obligation={} bundle={} attempt={}/{}",
+                    source.as_str(),
+                    &obligation_str[..8],
+                    &bundle_id[..12.min(bundle_id.len())],
+                    attempt,
+                    max_send_attempts
+                ));
+                return Ok(KaminoExecutionOutcome::BundleSent);
+            }
+            Err(error) => {
+                let send_bundle_ms = send_started_at.elapsed().as_millis();
+                let error_message = error.to_string();
+                let bundle_detail = format!(
+                    "attempt={}/{} tip={} {} | {}",
+                    attempt,
+                    max_send_attempts,
+                    tip_lamports,
+                    error_message,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        reserve_meta_ms,
+                        build_ms,
+                        Some(send_bundle_ms),
+                        started_at.elapsed().as_millis(),
+                    )
+                );
+
+                if attempt < max_send_attempts && is_retryable_jito_error(&error_message) {
+                    trace_logger.log(HunterTraceEvent {
+                        timestamp: crate::utils::utc_now(),
+                        protocol: "kamino",
+                        stage: "bundle_retry",
+                        signature: sig.clone(),
+                        obligation: Some(obligation_str.to_string()),
+                        repay_mint: Some(repay_mint_str.to_string()),
+                        repay_symbol: Some(repay_token.symbol.clone()),
+                        reason: Some(if is_expired_blockhash_error(&error_message) {
+                            "expired_blockhash_retry".to_string()
+                        } else {
+                            "retryable_bundle_send_error".to_string()
+                        }),
+                        detail: Some(format!("source={} {}", source.as_str(), bundle_detail)),
+                        ws_received_at_ms: Some(ws_received_at_ms),
+                        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                        bundle_id: None,
+                    });
+                    let backoff_ms = retry_backoff_ms(attempt);
+                    if backoff_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    continue;
+                }
+
+                trace_logger.log(HunterTraceEvent {
+                    timestamp: crate::utils::utc_now(),
+                    protocol: "kamino",
+                    stage: "error",
+                    signature: sig.clone(),
+                    obligation: Some(obligation_str.to_string()),
+                    repay_mint: Some(repay_mint_str.to_string()),
+                    repay_symbol: Some(repay_token.symbol.clone()),
+                    reason: Some("bundle_send_failed".to_string()),
+                    detail: Some(format!(
+                        "source={} {}",
+                        source.as_str(),
+                        bundle_detail.clone()
+                    )),
+                    ws_received_at_ms: Some(ws_received_at_ms),
+                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                    bundle_id: None,
+                });
+                let _ = log_hunter_observation(
+                    &logger,
+                    "Kamino",
+                    "HUNTER_BUNDLE_FAILED",
+                    &sig,
+                    Some(obligation_str.to_string()),
+                    Some(liquidator.to_string()),
+                    Some(repay_token),
+                    Some(format!("source={} {}", source.as_str(), bundle_detail)),
+                    Some(elapsed_ms_since(ws_received_at_ms)),
+                )
+                .await;
+                log_stderr(format!(
+                    "[hunter-kamino] bundle send failed (source={}, attempt={}/{}): {}",
+                    source.as_str(),
+                    attempt,
+                    max_send_attempts,
+                    error_message
+                ));
+                return Ok(KaminoExecutionOutcome::BundleFailed);
+            }
         }
     }
+
+    Ok(KaminoExecutionOutcome::BundleFailed)
 }
 
 // ── Solend opportunity execution (free function for tokio::spawn) ────────────
@@ -2645,7 +3031,9 @@ where
     let tx_info = match tokio::time::timeout(
         tokio::time::Duration::from_millis(tx_fetch.timeout_ms),
         rpc.get_transaction_with_retries(&sig, tx_fetch.attempts, tx_fetch.retry_delay_ms),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(tx_info)) => tx_info,
         Ok(Err(e)) => {
             let status = rpc.get_signature_status(&sig).await.ok().flatten();
@@ -2669,13 +3057,19 @@ where
 
     // ── 2. Find Solend liquidate instruction (most accounts) ─────────────────
     let resolve_started_at = Instant::now();
-    let liq_ix_idx = tx_info.instruction_programs.iter()
+    let liq_ix_idx = tx_info
+        .instruction_programs
+        .iter()
         .enumerate()
         .filter(|(_, &prog_idx)| {
             tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(SOLEND_PROGRAM)
         })
         .max_by_key(|(ix_idx, _)| {
-            tx_info.instruction_accounts.get(*ix_idx).map(|a| a.len()).unwrap_or(0)
+            tx_info
+                .instruction_accounts
+                .get(*ix_idx)
+                .map(|a| a.len())
+                .unwrap_or(0)
         })
         .map(|(ix_idx, _)| ix_idx)
         .ok_or_else(|| anyhow::anyhow!("no Solend liquidate instruction found"))?;
@@ -2684,17 +3078,25 @@ where
     let liq_data = &tx_info.instruction_data[liq_ix_idx];
 
     if liq_accs.len() < 9 || liq_data.len() < 16 {
-        anyhow::bail!("Solend liquidate instruction malformed (accs={} data={})", liq_accs.len(), liq_data.len());
+        anyhow::bail!(
+            "Solend liquidate instruction malformed (accs={} data={})",
+            liq_accs.len(),
+            liq_data.len()
+        );
     }
 
     // ── 3. Competitor's wallet = account_keys[0] (fee payer / signer) ────────
-    let competitor = tx_info.account_keys.get(0)
+    let competitor = tx_info
+        .account_keys
+        .get(0)
         .ok_or_else(|| anyhow::anyhow!("empty account_keys"))?
         .clone();
 
     // ── 4. Build: account_index → (mint, owner) from token balances ──────────
     // This lets us identify competitor ATAs and derive our equivalent ATAs.
-    let balance_map: HashMap<usize, (String, String)> = tx_info.post_token_balances.iter()
+    let balance_map: HashMap<usize, (String, String)> = tx_info
+        .post_token_balances
+        .iter()
         .chain(tx_info.pre_token_balances.iter())
         .map(|b| (b.account_index, (b.mint.clone(), b.owner.clone())))
         .collect();
@@ -2702,7 +3104,8 @@ where
     // ── 5. Find repay token: competitor ATA that decreased (owned by competitor)
     // We look for a wallet_token whose mint appears in the balances for an
     // account owned by the competitor. That's the token they repaid with.
-    let repay_mint_str = balance_map.values()
+    let repay_mint_str = balance_map
+        .values()
         .find(|(_, owner)| owner == &competitor)
         .map(|(mint, _)| mint.clone())
         .ok_or_else(|| anyhow::anyhow!("could not identify repay mint for this liquidation"))?;
@@ -2733,7 +3136,8 @@ where
     // Obligation is at accounts[5] for LiquidateWithoutReceivingCtokens
     // (observer confirmed: accounts[5] = obligation, accounts[8] = liquidator).
     // We also fall back to checking a few positions to be safe.
-    let obligation_key_idx = liq_accs.get(5)
+    let obligation_key_idx = liq_accs
+        .get(5)
         .and_then(|&i| tx_info.account_keys.get(i))
         .cloned()
         .unwrap_or_default();
@@ -2802,7 +3206,9 @@ where
     // Copy all Solend non-liquidate instructions (RefreshReserve, RefreshObligation)
     // verbatim — they contain no user-specific accounts.
     let solend_pk = Pubkey::from_str(SOLEND_PROGRAM).unwrap();
-    for (idx, (&prog_idx, accs)) in tx_info.instruction_programs.iter()
+    for (idx, (&prog_idx, accs)) in tx_info
+        .instruction_programs
+        .iter()
         .zip(tx_info.instruction_accounts.iter())
         .enumerate()
     {
@@ -2810,101 +3216,123 @@ where
             Some(k) => k.as_str(),
             None => continue,
         };
-        if prog_key != SOLEND_PROGRAM { continue; }
-        if idx == liq_ix_idx { continue; } // skip liquidate — we rebuild it below
+        if prog_key != SOLEND_PROGRAM {
+            continue;
+        }
+        if idx == liq_ix_idx {
+            continue;
+        } // skip liquidate — we rebuild it below
 
         // Resolve account metas: assume all non-signer / non-writable for refresh
-        let acc_metas: Vec<AccountMeta> = accs.iter().filter_map(|&ai| {
-            tx_info.account_keys.get(ai).and_then(|k| Pubkey::from_str(k).ok()).map(|pk| {
-                AccountMeta::new_readonly(pk, false)
+        let acc_metas: Vec<AccountMeta> = accs
+            .iter()
+            .filter_map(|&ai| {
+                tx_info
+                    .account_keys
+                    .get(ai)
+                    .and_then(|k| Pubkey::from_str(k).ok())
+                    .map(|pk| AccountMeta::new_readonly(pk, false))
             })
-        }).collect();
+            .collect();
 
-        let data = tx_info.instruction_data.get(idx).cloned().unwrap_or_default();
-        instructions.push(Instruction { program_id: solend_pk, accounts: acc_metas, data });
+        let data = tx_info
+            .instruction_data
+            .get(idx)
+            .cloned()
+            .unwrap_or_default();
+        instructions.push(Instruction {
+            program_id: solend_pk,
+            accounts: acc_metas,
+            data,
+        });
     }
 
     // Rebuild the liquidate instruction, replacing competitor accounts with ours.
     {
         let liquidator = keypair.pubkey();
 
-        let acc_metas: Vec<AccountMeta> = liq_accs.iter().enumerate().map(|(pos, &ai)| {
-            let key_str = tx_info.account_keys.get(ai).map(|s| s.as_str()).unwrap_or("");
-            let pk = Pubkey::from_str(key_str).unwrap_or_default();
+        let acc_metas: Vec<AccountMeta> = liq_accs
+            .iter()
+            .enumerate()
+            .map(|(pos, &ai)| {
+                let key_str = tx_info
+                    .account_keys
+                    .get(ai)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let pk = Pubkey::from_str(key_str).unwrap_or_default();
 
-            // Determine if this is a competitor-owned ATA → replace with ours
-            if let Some((mint_str, owner)) = balance_map.get(&ai) {
-                if owner == &competitor {
-                    // It's the competitor's token account — use our ATA for the same mint
-                    if let Some(runtime) = wallet_index.get(mint_str) {
-                        return AccountMeta::new(runtime.source_ata, false);
-                    }
-                    if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
-                        return AccountMeta::new(get_ata(&liquidator, &mint_pk), false);
+                // Determine if this is a competitor-owned ATA → replace with ours
+                if let Some((mint_str, owner)) = balance_map.get(&ai) {
+                    if owner == &competitor {
+                        // It's the competitor's token account — use our ATA for the same mint
+                        if let Some(runtime) = wallet_index.get(mint_str) {
+                            return AccountMeta::new(runtime.source_ata, false);
+                        }
+                        if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
+                            return AccountMeta::new(get_ata(&liquidator, &mint_pk), false);
+                        }
                     }
                 }
-            }
 
-            // It's the competitor's wallet (signer) — use our keypair
-            if key_str == competitor {
-                return AccountMeta::new_readonly(liquidator, true);
-            }
+                // It's the competitor's wallet (signer) — use our keypair
+                if key_str == competitor {
+                    return AccountMeta::new_readonly(liquidator, true);
+                }
 
-            // All other accounts (reserves, obligation, market, programs) are kept as-is.
-            // Mark writable if it was writable in the original tx.
-            // Heuristic: assume writable unless it's a program, sysvar, or readonly constant.
-            let is_program_or_sysvar = pk == solana_sdk::system_program::id()
-                || pk == Pubkey::from_str(TOKEN_PROGRAM).unwrap_or_default()
-                || pk == sysvar::instructions::id()
-                || pk == solana_sdk::sysvar::clock::id()
-                || pk == solana_sdk::sysvar::rent::id()
-                || prog_idx_is_program(&tx_info, ai);
+                // All other accounts (reserves, obligation, market, programs) are kept as-is.
+                // Mark writable if it was writable in the original tx.
+                // Heuristic: assume writable unless it's a program, sysvar, or readonly constant.
+                let is_program_or_sysvar = pk == solana_sdk::system_program::id()
+                    || pk == Pubkey::from_str(TOKEN_PROGRAM).unwrap_or_default()
+                    || pk == sysvar::instructions::id()
+                    || pk == solana_sdk::sysvar::clock::id()
+                    || pk == solana_sdk::sysvar::rent::id()
+                    || prog_idx_is_program(&tx_info, ai);
 
-            // Readonly marker positions (lending market, lending market authority, token program)
-            // are typically the last 3-4 accounts in Solend's liquidate instruction.
-            let is_likely_readonly = is_program_or_sysvar || pos >= liq_accs.len().saturating_sub(4);
+                // Readonly marker positions (lending market, lending market authority, token program)
+                // are typically the last 3-4 accounts in Solend's liquidate instruction.
+                let is_likely_readonly =
+                    is_program_or_sysvar || pos >= liq_accs.len().saturating_sub(4);
 
-            if is_likely_readonly {
-                AccountMeta::new_readonly(pk, false)
-            } else {
-                AccountMeta::new(pk, false)
-            }
-        }).collect();
+                if is_likely_readonly {
+                    AccountMeta::new_readonly(pk, false)
+                } else {
+                    AccountMeta::new(pk, false)
+                }
+            })
+            .collect();
 
         // Copy instruction data, replacing liquidity_amount (bytes 8-15) with our cap.
         let mut data = liq_data.clone();
         let amount = repay_mint.max_repay_native;
         data[8..16].copy_from_slice(&amount.to_le_bytes());
 
-        instructions.push(Instruction { program_id: solend_pk, accounts: acc_metas, data });
+        instructions.push(Instruction {
+            program_id: solend_pk,
+            accounts: acc_metas,
+            data,
+        });
     }
 
     // Jito tip
-    let tip_lamports = cached_tip.load(Ordering::Relaxed);
+    let base_tip_lamports = cached_tip.load(Ordering::Relaxed);
     let tip_account = select_jito_tip_account(&sig)?;
     instructions.push(solana_sdk::system_instruction::transfer(
-        &keypair.pubkey(), &tip_account, tip_lamports,
+        &keypair.pubkey(),
+        &tip_account,
+        base_tip_lamports,
     ));
-
-    // ── 8. Build and sign tx with pre-cached blockhash ───────────────────────
-    let build_started_at = Instant::now();
-    let blockhash = *cached_blockhash.read().await;
     let liquidator = keypair.pubkey();
-
-    let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
-        .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-
-    let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-        .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
-    let build_ms = build_started_at.elapsed().as_millis();
-    let total_before_send_ms = started_at.elapsed().as_millis();
-    let timing_detail = format_stage_timings(
+    let tip_instruction_idx = instructions.len() - 1;
+    let max_send_attempts = jito_send_max_attempts();
+    let initial_timing_detail = format_stage_timings(
         tx_fetch_ms,
         resolve_ms,
         0,
-        build_ms,
+        0,
         None,
-        total_before_send_ms,
+        started_at.elapsed().as_millis(),
     );
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
@@ -2917,7 +3345,14 @@ where
         repay_mint: Some(repay_mint.mint.clone()),
         repay_symbol: Some(repay_mint.symbol.clone()),
         reason: None,
-        detail: Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
+        detail: Some(format!(
+            "tip={} tip_account={} cu_price={} max_send_attempts={} {}",
+            base_tip_lamports,
+            tip_account,
+            compute_unit_price,
+            max_send_attempts,
+            initial_timing_detail
+        )),
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
@@ -2930,17 +3365,33 @@ where
         Some(obligation_key_idx.clone()),
         Some(liquidator.to_string()),
         Some(repay_mint),
-        Some(format!("tip={} tip_account={} cu_price={} {}", tip_lamports, tip_account, compute_unit_price, timing_detail)),
+        Some(format!(
+            "tip={} tip_account={} cu_price={} max_send_attempts={} {}",
+            base_tip_lamports,
+            tip_account,
+            compute_unit_price,
+            max_send_attempts,
+            initial_timing_detail
+        )),
         Some(elapsed_ms_since(ws_received_at_ms)),
-    ).await;
+    )
+    .await;
     log_stderr(format!(
-        "[hunter-solend] FIRING | obligation={} repay={} tip={}",
+        "[hunter-solend] FIRING | obligation={} repay={} tip={} max_attempts={}",
         &obligation_key_idx[..8.min(obligation_key_idx.len())],
         repay_mint.symbol,
-        tip_lamports,
+        base_tip_lamports,
+        max_send_attempts,
     ));
 
     if hunter_dry_run_enabled() {
+        let dry_run_blockhash = *cached_blockhash.read().await;
+        let build_started_at = Instant::now();
+        let message = Message::try_compile(&liquidator, &instructions, &[], dry_run_blockhash)
+            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
+            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let build_ms = build_started_at.elapsed().as_millis();
         let tx_bytes = bincode::serialize(&tx)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
@@ -2953,7 +3404,21 @@ where
             repay_mint: Some(repay_mint.mint.clone()),
             repay_symbol: Some(repay_mint.symbol.clone()),
             reason: Some("dry_run_enabled".to_string()),
-            detail: Some(format!("tx_size_bytes={} tip={} cu_price={} {}", tx_bytes, tip_lamports, compute_unit_price, timing_detail)),
+            detail: Some(format!(
+                "tx_size_bytes={} tip={} cu_price={} attempt=1/{} {}",
+                tx_bytes,
+                base_tip_lamports,
+                compute_unit_price,
+                max_send_attempts,
+                format_stage_timings(
+                    tx_fetch_ms,
+                    resolve_ms,
+                    0,
+                    build_ms,
+                    None,
+                    started_at.elapsed().as_millis(),
+                )
+            )),
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
@@ -2967,89 +3432,160 @@ where
         return Ok(());
     }
 
-    let send_started_at = Instant::now();
-    match jito.send_bundle(vec![tx]).await {
-        Ok(bundle_id) => {
-            let send_bundle_ms = send_started_at.elapsed().as_millis();
-            let bundle_detail = format_stage_timings(
-                tx_fetch_ms,
-                resolve_ms,
-                0,
-                build_ms,
-                Some(send_bundle_ms),
-                started_at.elapsed().as_millis(),
-            );
-            trace_logger.log(HunterTraceEvent {
-                timestamp: crate::utils::utc_now(),
-                protocol: "solend",
-                stage: "bundle_sent",
-                signature: sig.clone(),
-                obligation: Some(obligation_key_idx.clone()),
-                repay_mint: Some(repay_mint.mint.clone()),
-                repay_symbol: Some(repay_mint.symbol.clone()),
-                reason: None,
-                detail: Some(bundle_detail.clone()),
-                ws_received_at_ms: Some(ws_received_at_ms),
-                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                bundle_id: Some(bundle_id.clone()),
-            });
-            let _ = log_hunter_observation(
-                &logger,
-                "Solend",
-                "HUNTER_BUNDLE_SENT",
-                &sig,
-                Some(obligation_key_idx.clone()),
-                Some(liquidator.to_string()),
-                Some(repay_mint),
-                Some(bundle_detail),
-                Some(elapsed_ms_since(ws_received_at_ms)),
-            ).await;
-            log_stderr(format!(
-                "[hunter-solend] BUNDLE SENT | obligation={} bundle={}",
-                &obligation_key_idx[..8.min(obligation_key_idx.len())],
-                &bundle_id[..12.min(bundle_id.len())]
-            ));
-        }
-        Err(e) => {
-            let send_bundle_ms = send_started_at.elapsed().as_millis();
-            let bundle_detail = format!(
-                "{} | {}",
-                e,
-                format_stage_timings(
-                    tx_fetch_ms,
-                    resolve_ms,
-                    0,
-                    build_ms,
-                    Some(send_bundle_ms),
-                    started_at.elapsed().as_millis(),
+    for attempt in 1..=max_send_attempts {
+        let tip_lamports = retry_tip_lamports(base_tip_lamports, attempt);
+        instructions[tip_instruction_idx] =
+            solana_sdk::system_instruction::transfer(&liquidator, &tip_account, tip_lamports);
+
+        let blockhash = if attempt == 1 {
+            *cached_blockhash.read().await
+        } else {
+            match rpc.get_latest_blockhash().await {
+                Ok(latest_blockhash) => {
+                    *cached_blockhash.write().await = latest_blockhash;
+                    latest_blockhash
+                }
+                Err(_) => *cached_blockhash.read().await,
+            }
+        };
+
+        let build_started_at = Instant::now();
+        let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
+            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
+            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let build_ms = build_started_at.elapsed().as_millis();
+
+        let send_started_at = Instant::now();
+        match jito.send_bundle(vec![tx]).await {
+            Ok(bundle_id) => {
+                let send_bundle_ms = send_started_at.elapsed().as_millis();
+                let bundle_detail = format!(
+                    "attempt={}/{} tip={} {}",
+                    attempt,
+                    max_send_attempts,
+                    tip_lamports,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        0,
+                        build_ms,
+                        Some(send_bundle_ms),
+                        started_at.elapsed().as_millis(),
+                    )
+                );
+                trace_logger.log(HunterTraceEvent {
+                    timestamp: crate::utils::utc_now(),
+                    protocol: "solend",
+                    stage: "bundle_sent",
+                    signature: sig.clone(),
+                    obligation: Some(obligation_key_idx.clone()),
+                    repay_mint: Some(repay_mint.mint.clone()),
+                    repay_symbol: Some(repay_mint.symbol.clone()),
+                    reason: None,
+                    detail: Some(bundle_detail.clone()),
+                    ws_received_at_ms: Some(ws_received_at_ms),
+                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                    bundle_id: Some(bundle_id.clone()),
+                });
+                let _ = log_hunter_observation(
+                    &logger,
+                    "Solend",
+                    "HUNTER_BUNDLE_SENT",
+                    &sig,
+                    Some(obligation_key_idx.clone()),
+                    Some(liquidator.to_string()),
+                    Some(repay_mint),
+                    Some(bundle_detail),
+                    Some(elapsed_ms_since(ws_received_at_ms)),
                 )
-            );
-            trace_logger.log(HunterTraceEvent {
-                timestamp: crate::utils::utc_now(),
-                protocol: "solend",
-                stage: "error",
-                signature: sig.clone(),
-                obligation: Some(obligation_key_idx.clone()),
-                repay_mint: Some(repay_mint.mint.clone()),
-                repay_symbol: Some(repay_mint.symbol.clone()),
-                reason: Some("bundle_send_failed".to_string()),
-                detail: Some(bundle_detail.clone()),
-                ws_received_at_ms: Some(ws_received_at_ms),
-                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                bundle_id: None,
-            });
-            let _ = log_hunter_observation(
-                &logger,
-                "Solend",
-                "HUNTER_BUNDLE_FAILED",
-                &sig,
-                Some(obligation_key_idx.clone()),
-                Some(liquidator.to_string()),
-                Some(repay_mint),
-                Some(bundle_detail),
-                Some(elapsed_ms_since(ws_received_at_ms)),
-            ).await;
-            log_stderr(format!("[hunter-solend] bundle send failed: {}", e));
+                .await;
+                log_stderr(format!(
+                    "[hunter-solend] BUNDLE SENT | obligation={} bundle={} attempt={}/{}",
+                    &obligation_key_idx[..8.min(obligation_key_idx.len())],
+                    &bundle_id[..12.min(bundle_id.len())],
+                    attempt,
+                    max_send_attempts
+                ));
+                return Ok(());
+            }
+            Err(error) => {
+                let send_bundle_ms = send_started_at.elapsed().as_millis();
+                let error_message = error.to_string();
+                let bundle_detail = format!(
+                    "attempt={}/{} tip={} {} | {}",
+                    attempt,
+                    max_send_attempts,
+                    tip_lamports,
+                    error_message,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        0,
+                        build_ms,
+                        Some(send_bundle_ms),
+                        started_at.elapsed().as_millis(),
+                    )
+                );
+
+                if attempt < max_send_attempts && is_retryable_jito_error(&error_message) {
+                    trace_logger.log(HunterTraceEvent {
+                        timestamp: crate::utils::utc_now(),
+                        protocol: "solend",
+                        stage: "bundle_retry",
+                        signature: sig.clone(),
+                        obligation: Some(obligation_key_idx.clone()),
+                        repay_mint: Some(repay_mint.mint.clone()),
+                        repay_symbol: Some(repay_mint.symbol.clone()),
+                        reason: Some(if is_expired_blockhash_error(&error_message) {
+                            "expired_blockhash_retry".to_string()
+                        } else {
+                            "retryable_bundle_send_error".to_string()
+                        }),
+                        detail: Some(bundle_detail),
+                        ws_received_at_ms: Some(ws_received_at_ms),
+                        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                        bundle_id: None,
+                    });
+                    let backoff_ms = retry_backoff_ms(attempt);
+                    if backoff_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    continue;
+                }
+
+                trace_logger.log(HunterTraceEvent {
+                    timestamp: crate::utils::utc_now(),
+                    protocol: "solend",
+                    stage: "error",
+                    signature: sig.clone(),
+                    obligation: Some(obligation_key_idx.clone()),
+                    repay_mint: Some(repay_mint.mint.clone()),
+                    repay_symbol: Some(repay_mint.symbol.clone()),
+                    reason: Some("bundle_send_failed".to_string()),
+                    detail: Some(bundle_detail.clone()),
+                    ws_received_at_ms: Some(ws_received_at_ms),
+                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
+                    bundle_id: None,
+                });
+                let _ = log_hunter_observation(
+                    &logger,
+                    "Solend",
+                    "HUNTER_BUNDLE_FAILED",
+                    &sig,
+                    Some(obligation_key_idx.clone()),
+                    Some(liquidator.to_string()),
+                    Some(repay_mint),
+                    Some(bundle_detail),
+                    Some(elapsed_ms_since(ws_received_at_ms)),
+                )
+                .await;
+                log_stderr(format!(
+                    "[hunter-solend] bundle send failed (attempt={}/{}): {}",
+                    attempt, max_send_attempts, error_message
+                ));
+                return Ok(());
+            }
         }
     }
 
@@ -3109,9 +3645,13 @@ async fn log_hunter_observation<L: LiquidationLogger>(
         market: detail.unwrap_or_else(|| "N/A".to_string()),
         liquidated_user: obligation.unwrap_or_else(|| "N/A".to_string()),
         liquidator: liquidator.unwrap_or_else(|| "N/A".to_string()),
-        repay_mint: repay_token.map(|t| t.mint.clone()).unwrap_or_else(|| "N/A".to_string()),
+        repay_mint: repay_token
+            .map(|t| t.mint.clone())
+            .unwrap_or_else(|| "N/A".to_string()),
         withdraw_mint: "N/A".to_string(),
-        repay_symbol: repay_token.map(|t| t.symbol.clone()).unwrap_or_else(|| "N/A".to_string()),
+        repay_symbol: repay_token
+            .map(|t| t.symbol.clone())
+            .unwrap_or_else(|| "N/A".to_string()),
         withdraw_symbol: "N/A".to_string(),
         repay_amount: 0.0,
         withdraw_amount: 0.0,
@@ -3126,27 +3666,47 @@ async fn log_hunter_observation<L: LiquidationLogger>(
     logger.log_observation(&event).await
 }
 
-fn kamino_liquidate_discriminator() -> [u8; 8] {
-    discriminator("liquidate_obligation_and_redeem_reserve_collateral_v2")
+fn kamino_liquidate_discriminators() -> [[u8; 8]; 2] {
+    [
+        discriminator("liquidate_obligation_and_redeem_reserve_collateral_v2"),
+        discriminator("liquidate_obligation_and_redeem_reserve_collateral"),
+    ]
 }
 
-fn find_kamino_liquidate_ix(
-    tx_info: &crate::ports::rpc::TransactionInfo,
-) -> Option<usize> {
-    let expected_disc = kamino_liquidate_discriminator();
-    tx_info
-        .instruction_programs
-        .iter()
-        .enumerate()
-        .find(|(ix_idx, &prog_idx)| {
-            tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(KLEND_PROGRAM)
-                && tx_info
-                    .instruction_data
-                    .get(*ix_idx)
-                    .map(|data| data.len() >= 8 && data[..8] == expected_disc)
-                    .unwrap_or(false)
-        })
-        .map(|(ix_idx, _)| ix_idx)
+fn find_kamino_liquidate_ix(tx_info: &crate::ports::rpc::TransactionInfo) -> Option<usize> {
+    let expected_discriminators = kamino_liquidate_discriminators();
+    let mut fallback_idx = None;
+
+    for (ix_idx, &prog_idx) in tx_info.instruction_programs.iter().enumerate() {
+        if tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) != Some(KLEND_PROGRAM) {
+            continue;
+        }
+
+        if tx_info
+            .instruction_data
+            .get(ix_idx)
+            .map(|data| {
+                data.len() >= 8
+                    && expected_discriminators
+                        .iter()
+                        .any(|expected| data[..8] == *expected)
+            })
+            .unwrap_or(false)
+        {
+            return Some(ix_idx);
+        }
+
+        let account_len = tx_info
+            .instruction_accounts
+            .get(ix_idx)
+            .map(|accounts| accounts.len())
+            .unwrap_or(0);
+        if account_len >= 13 {
+            fallback_idx = Some(ix_idx);
+        }
+    }
+
+    fallback_idx
 }
 
 // ── Solend log helpers ────────────────────────────────────────────────────────
@@ -3156,7 +3716,9 @@ fn extract_obligation_pda_from_logs(logs: &[String]) -> Option<String> {
         let content = line.strip_prefix("Program log: ").unwrap_or(line);
         if let Some(rest) = content.strip_prefix("obligation_info:") {
             let pda = rest.trim().split_whitespace().next()?.to_string();
-            if !pda.is_empty() { return Some(pda); }
+            if !pda.is_empty() {
+                return Some(pda);
+            }
         }
     }
     None
@@ -3167,7 +3729,9 @@ fn extract_log_field(logs: &[String], key: &str) -> Option<String> {
         let content = line.strip_prefix("Program log: ").unwrap_or(line);
         if let Some(rest) = content.strip_prefix(key) {
             let val = rest.trim().split_whitespace().next()?.to_string();
-            if !val.is_empty() { return Some(val); }
+            if !val.is_empty() {
+                return Some(val);
+            }
         }
     }
     None
@@ -3183,14 +3747,17 @@ mod tests {
     #[test]
     fn parse_toml_u64_supports_underscores_and_comments() {
         assert_eq!(
-            parse_toml_u64("max_repay_native = 1_500_000_000  # 1.5 SOL", "max_repay_native"),
+            parse_toml_u64(
+                "max_repay_native = 1_500_000_000  # 1.5 SOL",
+                "max_repay_native"
+            ),
             Some(1_500_000_000)
         );
     }
 
     #[test]
     fn finds_kamino_liquidate_instruction_by_discriminator() {
-        let mut liquidate_data = kamino_liquidate_discriminator().to_vec();
+        let mut liquidate_data = kamino_liquidate_discriminators()[0].to_vec();
         liquidate_data.extend_from_slice(&[0; 24]);
 
         let tx = TransactionInfo {
@@ -3204,6 +3771,32 @@ mod tests {
         };
 
         assert_eq!(find_kamino_liquidate_ix(&tx), Some(1));
+    }
+
+    #[test]
+    fn falls_back_to_large_klend_instruction_when_discriminator_is_missing() {
+        let tx = TransactionInfo {
+            account_keys: vec![KLEND_PROGRAM.to_string(), "Other111".to_string()],
+            instruction_accounts: vec![vec![0, 1, 2], (0..13).collect()],
+            instruction_programs: vec![0, 0],
+            instruction_data: vec![vec![1, 2, 3], vec![9, 9, 9]],
+            block_time: None,
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+        };
+
+        assert_eq!(find_kamino_liquidate_ix(&tx), Some(1));
+    }
+
+    #[test]
+    fn retryable_jito_errors_cover_rate_limit_and_expired_blockhash() {
+        assert!(is_retryable_jito_error(
+            "Jito error: Network congested. Endpoint is globally rate limited."
+        ));
+        assert!(is_retryable_jito_error(
+            "bundle contains an expired blockhash"
+        ));
+        assert!(!is_retryable_jito_error("custom program error: 0x1"));
     }
 
     #[test]
@@ -3246,7 +3839,9 @@ mod tests {
         (SignalMetricsLogger { summary_tx: tx }, rx)
     }
 
-    fn test_metrics_logger_with_capacity(capacity: usize) -> (SignalMetricsLogger, mpsc::Receiver<SignalLockSummary>) {
+    fn test_metrics_logger_with_capacity(
+        capacity: usize,
+    ) -> (SignalMetricsLogger, mpsc::Receiver<SignalLockSummary>) {
         let (tx, rx) = mpsc::channel(capacity);
         (SignalMetricsLogger { summary_tx: tx }, rx)
     }
@@ -3322,7 +3917,10 @@ mod tests {
             }
             other => panic!("unexpected state: {other:?}"),
         }
-        let stats = record.detections.get(&HunterSignalSource::QuickNode).unwrap();
+        let stats = record
+            .detections
+            .get(&HunterSignalSource::QuickNode)
+            .unwrap();
         assert_eq!(stats.first_ts_ms, 100);
         assert_eq!(stats.count, 1);
         assert!(stats.won_lock);
@@ -3352,7 +3950,10 @@ mod tests {
 
         assert!(!won);
         let record = locks.get(&fingerprint).unwrap();
-        let quicknode = record.detections.get(&HunterSignalSource::QuickNode).unwrap();
+        let quicknode = record
+            .detections
+            .get(&HunterSignalSource::QuickNode)
+            .unwrap();
         let helius = record.detections.get(&HunterSignalSource::Helius).unwrap();
         assert_eq!(quicknode.count, 1);
         assert_eq!(helius.count, 1);
@@ -3374,7 +3975,10 @@ mod tests {
         ));
 
         mark_lock_firing(&locks, &fingerprint, HunterSignalSource::Helius, 101);
-        assert!(matches!(locks.get(&fingerprint).unwrap().state, LockState::Held { .. }));
+        assert!(matches!(
+            locks.get(&fingerprint).unwrap().state,
+            LockState::Held { .. }
+        ));
 
         mark_lock_firing(&locks, &fingerprint, HunterSignalSource::QuickNode, 102);
         let record = locks.get(&fingerprint).unwrap();
@@ -3414,7 +4018,10 @@ mod tests {
             103,
             FireOutcome::BundleSent,
         );
-        assert!(matches!(locks.get(&fingerprint).unwrap().state, LockState::Firing { .. }));
+        assert!(matches!(
+            locks.get(&fingerprint).unwrap().state,
+            LockState::Firing { .. }
+        ));
 
         mark_lock_fired(
             &locks,
@@ -3465,7 +4072,9 @@ mod tests {
         );
 
         assert!(won);
-        let summary = rx.try_recv().expect("expired lock summary should be emitted");
+        let summary = rx
+            .try_recv()
+            .expect("expired lock summary should be emitted");
         assert_eq!(summary.winner_source, "quicknode");
         assert_eq!(summary.fire_outcome, "held_expired");
         assert_eq!(
@@ -3615,25 +4224,11 @@ mod tests {
         let obligations = vec![
             (
                 "allowed".to_string(),
-                test_obligation_with_borrow(
-                    whitelisted_mint.to_bytes(),
-                    1,
-                    10,
-                    20,
-                    15,
-                    100,
-                ),
+                test_obligation_with_borrow(whitelisted_mint.to_bytes(), 1, 10, 20, 15, 100),
             ),
             (
                 "blocked".to_string(),
-                test_obligation_with_borrow(
-                    non_whitelisted_mint.to_bytes(),
-                    1,
-                    10,
-                    20,
-                    15,
-                    100,
-                ),
+                test_obligation_with_borrow(non_whitelisted_mint.to_bytes(), 1, 10, 20, 15, 100),
             ),
         ];
 
@@ -3747,13 +4342,19 @@ mod tests {
             let started = Instant::now();
             let won = try_accept_signal(&locks, metrics, fingerprint.clone(), &signal, 1_500);
             assert!(won);
-            mark_lock_firing(&locks, &fingerprint, HunterSignalSource::QuickNode, iteration + 1);
+            mark_lock_firing(
+                &locks,
+                &fingerprint,
+                HunterSignalSource::QuickNode,
+                iteration + 1,
+            );
             started.elapsed().as_nanos()
         }
 
         let iterations = 10_000u64;
 
-        let (empty_metrics, mut empty_rx) = test_metrics_logger_with_capacity(iterations as usize + 8);
+        let (empty_metrics, mut empty_rx) =
+            test_metrics_logger_with_capacity(iterations as usize + 8);
         let mut empty = Vec::with_capacity(iterations as usize);
         for i in 0..iterations {
             empty.push(sample_duration_ns(&empty_metrics, i * 10));

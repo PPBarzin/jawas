@@ -440,18 +440,20 @@ fn scan_solend_positions(
             continue;
         }
 
-        let Some(top_deposit) = obligation
-            .deposits
-            .iter()
-            .max_by(|a, b| a.market_value.to_f64().partial_cmp(&b.market_value.to_f64()).unwrap_or(Ordering::Equal))
-        else {
+        let Some(top_deposit) = obligation.deposits.iter().max_by(|a, b| {
+            a.market_value
+                .to_f64()
+                .partial_cmp(&b.market_value.to_f64())
+                .unwrap_or(Ordering::Equal)
+        }) else {
             continue;
         };
-        let Some(top_borrow) = obligation
-            .borrows
-            .iter()
-            .max_by(|a, b| a.market_value.to_f64().partial_cmp(&b.market_value.to_f64()).unwrap_or(Ordering::Equal))
-        else {
+        let Some(top_borrow) = obligation.borrows.iter().max_by(|a, b| {
+            a.market_value
+                .to_f64()
+                .partial_cmp(&b.market_value.to_f64())
+                .unwrap_or(Ordering::Equal)
+        }) else {
             continue;
         };
 
@@ -520,7 +522,8 @@ fn top_key(map: &HashMap<String, usize>) -> String {
 fn top_pairs_string(pair_counts: &HashMap<String, usize>, limit: usize) -> String {
     let mut pairs: Vec<_> = pair_counts.iter().collect();
     pairs.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
-    pairs.into_iter()
+    pairs
+        .into_iter()
         .take(limit)
         .map(|(pair, count)| format!("{pair} x{count}"))
         .collect::<Vec<_>>()
@@ -533,10 +536,7 @@ fn repay_shortlist_string(
     limit: usize,
 ) -> String {
     let mut tokens: Vec<_> = repay_counts.iter().collect();
-    tokens.sort_by(|a, b| {
-        b.1.0.cmp(&a.1.0)
-            .then_with(|| a.0.cmp(b.0))
-    });
+    tokens.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
 
     tokens
         .into_iter()
@@ -559,10 +559,7 @@ fn repay_mint_shortlist_string(
     limit: usize,
 ) -> String {
     let mut tokens: Vec<_> = repay_counts.iter().collect();
-    tokens.sort_by(|a, b| {
-        b.1.0.cmp(&a.1.0)
-            .then_with(|| a.0.cmp(b.0))
-    });
+    tokens.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
 
     tokens
         .into_iter()
@@ -667,7 +664,8 @@ async fn main() -> Result<()> {
                 "Frequence_paire": "Aucune obligation proche trouvée",
                 "Shortlist": "",
             }),
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -680,7 +678,9 @@ async fn main() -> Result<()> {
             .entry(pos.repay_mint.clone())
             .or_insert((0, pos.repay_symbol.clone()));
         entry.0 += 1;
-        *collateral_counts.entry(pos.collateral_symbol.clone()).or_insert(0) += 1;
+        *collateral_counts
+            .entry(pos.collateral_symbol.clone())
+            .or_insert(0) += 1;
         *pair_counts.entry(pos.pair.clone()).or_insert(0) += 1;
     }
 
@@ -725,7 +725,8 @@ async fn main() -> Result<()> {
             "Frequence_paire": pair_frequency,
             "Shortlist": shortlist,
         }),
-    ).await?;
+    )
+    .await?;
 
     println!("✅ Rapport hebdo on-chain inséré dans Airtable.");
     Ok(())

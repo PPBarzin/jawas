@@ -108,8 +108,8 @@ mod tests {
     #[test]
     fn usdc_normalization() {
         // 5_000_000 native USDC (6 decimals) → 5.0
-        let val = native_to_human(5_000_000, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-            .unwrap();
+        let val =
+            native_to_human(5_000_000, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
         assert!((val - 5.0).abs() < 1e-9, "got {}", val);
     }
 

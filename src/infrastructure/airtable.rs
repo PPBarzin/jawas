@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
-use async_trait::async_trait;
 
-use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::config::ConfigPort;
+use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 
 #[derive(Clone)]
 pub struct AirtableAdapter {
@@ -53,7 +53,12 @@ impl AirtableAdapter {
             }
         });
 
-        Self { tx, api_token: api_token_arc, base_id: base_id_arc, client }
+        Self {
+            tx,
+            api_token: api_token_arc,
+            base_id: base_id_arc,
+            client,
+        }
     }
 
     /// Fetches the list of active token symbols from the jawas-whitelist table.
@@ -63,7 +68,8 @@ impl AirtableAdapter {
             self.base_id
         );
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_token))
             .query(&[("filterByFormula", "{Active}=1")])
@@ -134,7 +140,14 @@ async fn flush_batch(
     let existing_keys = if tx_signature_status_pairs.is_empty() {
         HashSet::new()
     } else {
-        fetch_existing_event_keys(client, api_token, base_id, table_watch, &tx_signature_status_pairs).await?
+        fetch_existing_event_keys(
+            client,
+            api_token,
+            base_id,
+            table_watch,
+            &tx_signature_status_pairs,
+        )
+        .await?
     };
 
     let url = format!("https://api.airtable.com/v0/{}/{}", base_id, table_watch);
@@ -199,16 +212,16 @@ async fn flush_batch(
 
 fn is_tx_signature_like(signature: &str) -> bool {
     let len_ok = (64..=88).contains(&signature.len());
-    let base58_ok = signature
-        .bytes()
-        .all(|b| matches!(b,
+    let base58_ok = signature.bytes().all(|b| {
+        matches!(b,
             b'1'..=b'9' |
             b'A'..=b'H' |
             b'J'..=b'N' |
             b'P'..=b'Z' |
             b'a'..=b'k' |
             b'm'..=b'z'
-        ));
+        )
+    });
 
     len_ok && base58_ok
 }

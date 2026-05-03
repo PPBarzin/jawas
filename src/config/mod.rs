@@ -22,6 +22,7 @@ pub struct HunterConfig {
     pub tx_commitment: String,
     pub keypair_path: Option<String>,
     pub jito_url: String,
+    pub jupiter_base_url: String,
     pub max_repay_usd: f64,
     pub wallet_toml_path: String,
     pub replay_enabled: bool,
@@ -68,6 +69,7 @@ impl AppConfig {
                     "JITO_URL",
                     "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
                 ),
+                jupiter_base_url: env_string("JUPITER_BASE_URL", "https://quote-api.jup.ag/v6"),
                 max_repay_usd: env_string("MAX_REPAY_USD", "300.0")
                     .parse::<f64>()
                     .unwrap_or(300.0),
@@ -92,7 +94,12 @@ impl AppConfig {
 pub fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 

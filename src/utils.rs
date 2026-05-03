@@ -20,21 +20,41 @@ pub fn log_stderr(message: impl AsRef<str>) {
 }
 
 fn unix_to_utc(mut s: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let sec = s % 60; s /= 60;
-    let min = s % 60; s /= 60;
-    let hour = s % 24; s /= 24;
+    let sec = s % 60;
+    s /= 60;
+    let min = s % 60;
+    s /= 60;
+    let hour = s % 24;
+    s /= 24;
     let mut days = s;
     let mut year = 1970u64;
     loop {
         let days_in_year = if is_leap(year) { 366 } else { 365 };
-        if days < days_in_year { break; }
+        if days < days_in_year {
+            break;
+        }
         days -= days_in_year;
         year += 1;
     }
-    let months = [31u64, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31u64,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0u64;
     for &m in &months {
-        if days < m { break; }
+        if days < m {
+            break;
+        }
         days -= m;
         month += 1;
     }

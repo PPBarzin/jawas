@@ -60,17 +60,19 @@ impl HeliusAdapter {
         let max_attempts = max_attempts.max(1);
 
         for attempt_idx in 0..max_attempts {
-            let resp = self.http_client
+            let resp = self
+                .http_client
                 .post(&self.rpc_url)
                 .json(&payload)
                 .send()
                 .await
-                .with_context(|| format!("getTransaction HTTP request failed ({})", self.rpc_url))?;
+                .with_context(|| {
+                    format!("getTransaction HTTP request failed ({})", self.rpc_url)
+                })?;
 
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .with_context(|| format!("getTransaction response parse failed ({})", self.rpc_url))?;
+            let body: serde_json::Value = resp.json().await.with_context(|| {
+                format!("getTransaction response parse failed ({})", self.rpc_url)
+            })?;
 
             let result = &body["result"];
 
@@ -104,8 +106,10 @@ impl HeliusAdapter {
                 }
 
                 let block_time = result["blockTime"].as_u64();
-                let pre_token_balances = parse_json_token_balances(&result["meta"]["preTokenBalances"]);
-                let post_token_balances = parse_json_token_balances(&result["meta"]["postTokenBalances"]);
+                let pre_token_balances =
+                    parse_json_token_balances(&result["meta"]["preTokenBalances"]);
+                let post_token_balances =
+                    parse_json_token_balances(&result["meta"]["postTokenBalances"]);
 
                 return Ok(Some(TransactionInfo {
                     account_keys,
@@ -157,7 +161,12 @@ impl RpcClient for HeliusAdapter {
         retry_delay_ms: u64,
     ) -> Result<TransactionInfo> {
         if let Some(info) = self
-            .get_transaction_with_commitment(signature, &self.tx_commitment, max_attempts, retry_delay_ms)
+            .get_transaction_with_commitment(
+                signature,
+                &self.tx_commitment,
+                max_attempts,
+                retry_delay_ms,
+            )
             .await?
         {
             return Ok(info);
@@ -166,7 +175,12 @@ impl RpcClient for HeliusAdapter {
         if self.tx_commitment != "confirmed" {
             let fallback_attempts = (max_attempts / 2).max(1);
             if let Some(info) = self
-                .get_transaction_with_commitment(signature, "confirmed", fallback_attempts, retry_delay_ms)
+                .get_transaction_with_commitment(
+                    signature,
+                    "confirmed",
+                    fallback_attempts,
+                    retry_delay_ms,
+                )
                 .await?
             {
                 return Ok(info);
@@ -189,7 +203,8 @@ impl RpcClient for HeliusAdapter {
             "params": [pubkey, {"encoding": "base64"}]
         });
 
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&self.rpc_url)
             .json(&payload)
             .send()
@@ -205,14 +220,13 @@ impl RpcClient for HeliusAdapter {
             .as_array()
             .context("getAccountInfo: missing data array")?;
 
-        let b64 = data_arr.first()
+        let b64 = data_arr
+            .first()
             .and_then(|v| v.as_str())
             .context("getAccountInfo: missing base64 data")?;
 
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            b64,
-        ).context("getAccountInfo: base64 decode failed")?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .context("getAccountInfo: base64 decode failed")?;
 
         Ok(bytes)
     }
@@ -225,17 +239,22 @@ impl RpcClient for HeliusAdapter {
             "params": [program_id, {"encoding": "base64"}]
         });
 
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&self.rpc_url)
             .json(&payload)
             .send()
             .await
-            .with_context(|| format!("getProgramAccounts HTTP request failed ({})", self.rpc_url))?;
+            .with_context(|| {
+                format!("getProgramAccounts HTTP request failed ({})", self.rpc_url)
+            })?;
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| format!("getProgramAccounts response parse failed ({})", self.rpc_url))?;
+        let body: serde_json::Value = resp.json().await.with_context(|| {
+            format!(
+                "getProgramAccounts response parse failed ({})",
+                self.rpc_url
+            )
+        })?;
 
         let accounts = body["result"]
             .as_array()
@@ -249,13 +268,12 @@ impl RpcClient for HeliusAdapter {
             let data_arr = account["account"]["data"]
                 .as_array()
                 .context("getProgramAccounts: missing data array")?;
-            let b64 = data_arr.first()
+            let b64 = data_arr
+                .first()
                 .and_then(|v| v.as_str())
                 .context("getProgramAccounts: missing base64 data")?;
-            let bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                b64,
-            ).context("getProgramAccounts: base64 decode failed")?;
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                .context("getProgramAccounts: base64 decode failed")?;
             out.push(ProgramAccount {
                 pubkey: pubkey.to_string(),
                 data: bytes,
@@ -273,17 +291,25 @@ impl RpcClient for HeliusAdapter {
             "params": [[signature], { "searchTransactionHistory": false }]
         });
 
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&self.rpc_url)
             .json(&payload)
             .send()
             .await
-            .with_context(|| format!("getSignatureStatuses HTTP request failed ({})", self.rpc_url))?;
+            .with_context(|| {
+                format!(
+                    "getSignatureStatuses HTTP request failed ({})",
+                    self.rpc_url
+                )
+            })?;
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| format!("getSignatureStatuses response parse failed ({})", self.rpc_url))?;
+        let body: serde_json::Value = resp.json().await.with_context(|| {
+            format!(
+                "getSignatureStatuses response parse failed ({})",
+                self.rpc_url
+            )
+        })?;
         let value = body["result"]["value"]
             .as_array()
             .and_then(|items| items.first())
@@ -309,17 +335,22 @@ impl RpcClient for HeliusAdapter {
             "params": []
         });
 
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&self.rpc_url)
             .json(&payload)
             .send()
             .await
-            .with_context(|| format!("getLatestBlockhash HTTP request failed ({})", self.rpc_url))?;
+            .with_context(|| {
+                format!("getLatestBlockhash HTTP request failed ({})", self.rpc_url)
+            })?;
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| format!("getLatestBlockhash response parse failed ({})", self.rpc_url))?;
+        let body: serde_json::Value = resp.json().await.with_context(|| {
+            format!(
+                "getLatestBlockhash response parse failed ({})",
+                self.rpc_url
+            )
+        })?;
         let hash_str = body["result"]["value"]["blockhash"]
             .as_str()
             .context("blockhash missing in response")?;
@@ -333,10 +364,12 @@ impl RpcClient for HeliusAdapter {
 }
 
 fn parse_pubkey_entry(value: &serde_json::Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| value.get("pubkey").and_then(|v| v.as_str()).map(str::to_string))
+    value.as_str().map(str::to_string).or_else(|| {
+        value
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
 }
 
 fn extract_account_keys(result: &serde_json::Value) -> Vec<String> {
@@ -426,162 +459,169 @@ impl StreamingRpcClient for HeliusAdapter {
         &self,
         program_id: &str,
         commitment: RpcCommitment,
-    ) -> impl std::future::Future<Output = Result<tokio::sync::mpsc::Receiver<LogEntry>>> + Send {
+    ) -> impl std::future::Future<Output = Result<tokio::sync::mpsc::Receiver<LogEntry>>> + Send
+    {
         let this = self.clone();
         let program_id = program_id.to_string();
         async move {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-        let program_id_owned = program_id.to_string();
-        let ws_url = this.ws_url.clone();
-        let ws_label = endpoint_host_label(&ws_url);
-        let commitment = match commitment {
-            RpcCommitment::Processed => "processed",
-            RpcCommitment::Confirmed => "confirmed",
-        };
+            let (tx, rx) = tokio::sync::mpsc::channel(100);
+            let program_id_owned = program_id.to_string();
+            let ws_url = this.ws_url.clone();
+            let ws_label = endpoint_host_label(&ws_url);
+            let commitment = match commitment {
+                RpcCommitment::Processed => "processed",
+                RpcCommitment::Confirmed => "confirmed",
+            };
 
-        tokio::spawn(async move {
-            let mut backoff_secs: u64 = 1;
+            tokio::spawn(async move {
+                let mut backoff_secs: u64 = 1;
 
-            loop {
-                log_stderr(format!("[rpc-ws {ws_label}] connecting..."));
-                match connect_async(&ws_url).await {
-                    Ok((mut ws_stream, _)) => {
-                        log_stderr(format!("[rpc-ws {ws_label}] connected."));
-                        backoff_secs = 1; // reset backoff on successful connection
+                loop {
+                    log_stderr(format!("[rpc-ws {ws_label}] connecting..."));
+                    match connect_async(&ws_url).await {
+                        Ok((mut ws_stream, _)) => {
+                            log_stderr(format!("[rpc-ws {ws_label}] connected."));
+                            backoff_secs = 1; // reset backoff on successful connection
 
-                        let subscribe_msg = json!({
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "method": "logsSubscribe",
-                            "params": [
-                                { "mentions": [program_id_owned] },
-                                { "commitment": commitment }
-                            ]
-                        });
+                            let subscribe_msg = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "logsSubscribe",
+                                "params": [
+                                    { "mentions": [program_id_owned] },
+                                    { "commitment": commitment }
+                                ]
+                            });
 
-                        if let Err(e) = ws_stream
-                            .send(Message::Text(subscribe_msg.to_string()))
-                            .await
-                        {
-                            log_stderr(format!("[rpc-ws {ws_label}] failed to send subscribe: {e}"));
-                        } else {
-                            let mut subscribed = false;
-                            while let Some(msg) = ws_stream.next().await {
-                                let received_at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                                match msg {
-                                    Ok(Message::Text(text)) => {
-                                        if let Ok(value) =
-                                            serde_json::from_str::<serde_json::Value>(&text)
-                                        {
-                                            if !subscribed && value.get("id").and_then(|v| v.as_i64()) == Some(1) {
-                                                if let Some(error) = value.get("error") {
-                                                    log_stderr(format!(
+                            if let Err(e) = ws_stream
+                                .send(Message::Text(subscribe_msg.to_string()))
+                                .await
+                            {
+                                log_stderr(format!(
+                                    "[rpc-ws {ws_label}] failed to send subscribe: {e}"
+                                ));
+                            } else {
+                                let mut subscribed = false;
+                                while let Some(msg) = ws_stream.next().await {
+                                    let received_at_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+                                    match msg {
+                                        Ok(Message::Text(text)) => {
+                                            if let Ok(value) =
+                                                serde_json::from_str::<serde_json::Value>(&text)
+                                            {
+                                                if !subscribed
+                                                    && value.get("id").and_then(|v| v.as_i64())
+                                                        == Some(1)
+                                                {
+                                                    if let Some(error) = value.get("error") {
+                                                        log_stderr(format!(
                                                         "[rpc-ws {ws_label}] subscribe rejected: {}",
                                                         error
                                                     ));
-                                                    break;
-                                                }
+                                                        break;
+                                                    }
 
-                                                if let Some(subscription_id) = value.get("result") {
-                                                    log_stderr(format!(
+                                                    if let Some(subscription_id) =
+                                                        value.get("result")
+                                                    {
+                                                        log_stderr(format!(
                                                         "[rpc-ws {ws_label}] subscribed successfully: subscription_id={}",
                                                         subscription_id
                                                     ));
-                                                    subscribed = true;
-                                                    continue;
-                                                }
+                                                        subscribed = true;
+                                                        continue;
+                                                    }
 
-                                                log_stderr(format!(
+                                                    log_stderr(format!(
                                                     "[rpc-ws {ws_label}] subscribe response missing result/error: {}",
                                                     value
                                                 ));
-                                                break;
-                                            }
-
-                                            if value
-                                                .get("method")
-                                                .and_then(|m| m.as_str())
-                                                == Some("logsNotification")
-                                            {
-                                                let v = &value["params"]["result"]["value"];
-                                                let signature = v["signature"]
-                                                    .as_str()
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                let is_error = !v["err"].is_null();
-                                                let logs = v["logs"]
-                                                    .as_array()
-                                                    .map(|arr| {
-                                                        arr.iter()
-                                                            .filter_map(|l| {
-                                                                l.as_str().map(str::to_string)
-                                                            })
-                                                            .collect()
-                                                    })
-                                                    .unwrap_or_default();
-
-                                                let entry = LogEntry {
-                                                    signature,
-                                                    logs,
-                                                    is_error,
-                                                    received_at_ms,
-                                                };
-                                                if tx.send(entry).await.is_err() {
-                                                    // Downstream receiver dropped — stop.
-                                                    return;
+                                                    break;
                                                 }
-                                            } else if !subscribed {
-                                                log_stderr(format!(
+
+                                                if value.get("method").and_then(|m| m.as_str())
+                                                    == Some("logsNotification")
+                                                {
+                                                    let v = &value["params"]["result"]["value"];
+                                                    let signature = v["signature"]
+                                                        .as_str()
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    let is_error = !v["err"].is_null();
+                                                    let logs = v["logs"]
+                                                        .as_array()
+                                                        .map(|arr| {
+                                                            arr.iter()
+                                                                .filter_map(|l| {
+                                                                    l.as_str().map(str::to_string)
+                                                                })
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default();
+
+                                                    let entry = LogEntry {
+                                                        signature,
+                                                        logs,
+                                                        is_error,
+                                                        received_at_ms,
+                                                    };
+                                                    if tx.send(entry).await.is_err() {
+                                                        // Downstream receiver dropped — stop.
+                                                        return;
+                                                    }
+                                                } else if !subscribed {
+                                                    log_stderr(format!(
                                                     "[rpc-ws {ws_label}] unexpected pre-subscription message: {}",
                                                     value
                                                 ));
-                                            } else if let Some(method) =
-                                                value.get("method").and_then(|m| m.as_str())
-                                            {
-                                                log_stderr(format!(
+                                                } else if let Some(method) =
+                                                    value.get("method").and_then(|m| m.as_str())
+                                                {
+                                                    log_stderr(format!(
                                                     "[rpc-ws {ws_label}] ignoring WS message method={method}"
                                                 ));
-                                            }
-                                        } else {
-                                            log_stderr(format!(
+                                                }
+                                            } else {
+                                                log_stderr(format!(
                                                 "[rpc-ws {ws_label}] failed to parse WS text message: {}",
                                                 text
                                             ));
+                                            }
                                         }
+                                        Ok(Message::Ping(data)) => {
+                                            let _ = ws_stream.send(Message::Pong(data)).await;
+                                        }
+                                        Ok(Message::Close(_)) | Err(_) => break,
+                                        _ => {}
                                     }
-                                    Ok(Message::Ping(data)) => {
-                                        let _ = ws_stream.send(Message::Pong(data)).await;
-                                    }
-                                    Ok(Message::Close(_)) | Err(_) => break,
-                                    _ => {}
                                 }
                             }
-                        }
 
-                        log_stderr(format!(
+                            log_stderr(format!(
                             "[rpc-ws {ws_label}] stream ended. Reconnecting in {backoff_secs}s..."
                         ));
-                    }
-                    Err(e) => {
-                        log_stderr(format!(
+                        }
+                        Err(e) => {
+                            log_stderr(format!(
                             "[rpc-ws {ws_label}] connection error: {e}. Retrying in {backoff_secs}s..."
                         ));
+                        }
                     }
+
+                    if tx.is_closed() {
+                        return;
+                    }
+
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(30);
                 }
+            });
 
-                if tx.is_closed() {
-                    return;
-                }
-
-                sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(30);
-            }
-        });
-
-        Ok(rx)
+            Ok(rx)
         }
     }
 }
