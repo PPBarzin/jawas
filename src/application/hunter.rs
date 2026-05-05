@@ -328,17 +328,17 @@ impl HunterTraceLogger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HunterSignalSource {
-    QuickNode,
-    Helius,
-    Hermes,
+    PrimaryRpc,
+    SecondaryRpc,
+    PriceFeed,
 }
 
 impl HunterSignalSource {
     fn as_str(self) -> &'static str {
         match self {
-            HunterSignalSource::QuickNode => "quicknode",
-            HunterSignalSource::Helius => "helius",
-            HunterSignalSource::Hermes => "hermes",
+            HunterSignalSource::PrimaryRpc => "primary_rpc",
+            HunterSignalSource::SecondaryRpc => "secondary_rpc",
+            HunterSignalSource::PriceFeed => "price_feed",
         }
     }
 }
@@ -346,7 +346,7 @@ impl HunterSignalSource {
 #[derive(Debug, Clone, Copy)]
 enum HunterSignalKind {
     KaminoLogLiquidation,
-    HermesPredictedLiquidable,
+    PriceFeedPredictedLiquidable,
 }
 
 #[derive(Debug, Clone)]
@@ -1087,7 +1087,7 @@ pub struct HunterService<
     C: ConfigPort + LiquidationLogger + Clone,
 > {
     hunter_rpc: R,
-    secondary_signal_rpc: Option<R>,
+    signal_secondary_rpc: Option<R>,
     jito: JI,
     _jupiter: JU,
     _oracle: O,
@@ -1107,7 +1107,7 @@ impl<
 {
     pub fn new(
         hunter_rpc: R,
-        secondary_signal_rpc: Option<R>,
+        signal_secondary_rpc: Option<R>,
         jito: JI,
         jupiter: JU,
         oracle: O,
@@ -1117,7 +1117,7 @@ impl<
     ) -> Self {
         Self {
             hunter_rpc,
-            secondary_signal_rpc,
+            signal_secondary_rpc,
             jito,
             _jupiter: jupiter,
             _oracle: oracle,
@@ -1131,7 +1131,7 @@ impl<
     // ── Kamino autonomous hunter ─────────────────────────────────────────────
     //
     // Flow:
-    //   QuikNode WS notification (LiquidateObligationAndRedeemReserveCollateralV2)
+    //   primary RPC WS notification (LiquidateObligationAndRedeemReserveCollateralV2)
     //   → getTransaction (single attempt, 500ms timeout)
     //   → extract obligation PDA + reserve addresses from competitor's tx accounts
     //   → build optimistic tx (RefreshReserve x2 + RefreshObligation + Liquidate)
@@ -1230,14 +1230,14 @@ impl<
             });
         }
 
-        let source_config = read_kamino_signal_source_config(self.secondary_signal_rpc.is_some());
-        let quicknode_enabled = source_config.quicknode_enabled;
-        let helius_enabled = source_config.helius_enabled;
-        let hermes_enabled = source_config.hermes_enabled;
+        let source_config = read_kamino_signal_source_config(self.signal_secondary_rpc.is_some());
+        let primary_rpc_enabled = source_config.primary_rpc_enabled;
+        let secondary_rpc_enabled = source_config.secondary_rpc_enabled;
+        let price_feed_enabled = source_config.price_feed_enabled;
 
-        if quicknode_enabled {
+        if primary_rpc_enabled {
             spawn_kamino_log_signal_source(
-                HunterSignalSource::QuickNode,
+                HunterSignalSource::PrimaryRpc,
                 self.hunter_rpc.clone(),
                 runtime,
                 signal_tx.clone(),
@@ -1247,10 +1247,10 @@ impl<
             );
         }
 
-        if helius_enabled {
-            if let Some(secondary_rpc) = self.secondary_signal_rpc.clone() {
+        if secondary_rpc_enabled {
+            if let Some(secondary_rpc) = self.signal_secondary_rpc.clone() {
                 spawn_kamino_log_signal_source(
-                    HunterSignalSource::Helius,
+                    HunterSignalSource::SecondaryRpc,
                     secondary_rpc,
                     runtime,
                     signal_tx.clone(),
@@ -1260,13 +1260,13 @@ impl<
                 );
             } else {
                 log_stderr(
-                    "[hunter-kamino] Helius signal source enabled but no secondary RPC configured.",
+                    "[hunter-kamino] secondary RPC signal source enabled but no HUNTER_SIGNAL_SECONDARY_* endpoint configured.",
                 );
             }
         }
 
-        if hermes_enabled {
-            spawn_hermes_signal_source(
+        if price_feed_enabled {
+            spawn_price_feed_signal_source(
                 self.hunter_rpc.clone(),
                 wallet_tokens.clone(),
                 signal_tx.clone(),
@@ -1333,12 +1333,12 @@ impl<
                 format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
             });
             let rpc = match signal.source {
-                HunterSignalSource::QuickNode => self.hunter_rpc.clone(),
-                HunterSignalSource::Helius => self
-                    .secondary_signal_rpc
+                HunterSignalSource::PrimaryRpc => self.hunter_rpc.clone(),
+                HunterSignalSource::SecondaryRpc => self
+                    .signal_secondary_rpc
                     .clone()
                     .unwrap_or_else(|| self.hunter_rpc.clone()),
-                HunterSignalSource::Hermes => self.hunter_rpc.clone(),
+                HunterSignalSource::PriceFeed => self.hunter_rpc.clone(),
             };
 
             tokio::spawn(async move {
@@ -1478,7 +1478,7 @@ impl<
             runtime,
             self.trace_logger.clone(),
             self._config.clone(),
-            HunterSignalSource::QuickNode,
+            HunterSignalSource::PrimaryRpc,
             None,
             None,
             None,
@@ -2074,21 +2074,49 @@ struct HermesShortlistEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KaminoSignalSourceConfig {
-    quicknode_enabled: bool,
-    helius_enabled: bool,
-    hermes_enabled: bool,
+    primary_rpc_enabled: bool,
+    secondary_rpc_enabled: bool,
+    price_feed_enabled: bool,
 }
 
-fn read_kamino_signal_source_config(has_secondary_signal_rpc: bool) -> KaminoSignalSourceConfig {
-    let quicknode_enabled = env_flag("ENABLE_HUNTER_SIGNAL_QUICKNODE", true);
-    let helius_requested = env_flag("ENABLE_HUNTER_SIGNAL_HELIUS", true);
-    let hermes_enabled = env_flag("ENABLE_HUNTER_SIGNAL_HERMES", false);
+fn read_kamino_signal_source_config(has_signal_secondary_rpc: bool) -> KaminoSignalSourceConfig {
+    let primary_rpc_enabled = env_flag_aliases(
+        &[
+            "ENABLE_HUNTER_SIGNAL_PRIMARY",
+            "ENABLE_HUNTER_SIGNAL_QUICKNODE",
+        ],
+        true,
+    );
+    let secondary_rpc_requested = env_flag_aliases(
+        &[
+            "ENABLE_HUNTER_SIGNAL_SECONDARY",
+            "ENABLE_HUNTER_SIGNAL_HELIUS",
+        ],
+        true,
+    );
+    let price_feed_enabled = env_flag_aliases(
+        &[
+            "ENABLE_HUNTER_SIGNAL_PRICE_FEED",
+            "ENABLE_HUNTER_SIGNAL_HERMES",
+        ],
+        false,
+    );
 
     KaminoSignalSourceConfig {
-        quicknode_enabled,
-        helius_enabled: helius_requested && has_secondary_signal_rpc,
-        hermes_enabled,
+        primary_rpc_enabled,
+        secondary_rpc_enabled: secondary_rpc_requested && has_signal_secondary_rpc,
+        price_feed_enabled,
     }
+}
+
+fn env_flag_aliases(names: &[&str], default: bool) -> bool {
+    for name in names {
+        if std::env::var(name).is_ok() {
+            return env_flag(name, default);
+        }
+    }
+
+    default
 }
 
 #[derive(Debug, Clone)]
@@ -2217,9 +2245,9 @@ fn build_hermes_signals_from_changed_feeds(
                 && entry.distance_to_liq <= trigger_buffer_bps
         })
         .map(|entry| HunterSignalEvent {
-            source: HunterSignalSource::Hermes,
+            source: HunterSignalSource::PriceFeed,
             protocol: "kamino",
-            signal_kind: HunterSignalKind::HermesPredictedLiquidable,
+            signal_kind: HunterSignalKind::PriceFeedPredictedLiquidable,
             received_at_ms,
             signature: None,
             obligation_pubkey: entry.obligation_pubkey.clone(),
@@ -2233,7 +2261,7 @@ fn build_hermes_signals_from_changed_feeds(
         .collect()
 }
 
-fn spawn_hermes_signal_source<R>(
+fn spawn_price_feed_signal_source<R>(
     rpc: R,
     wallet_tokens: Vec<WalletToken>,
     signal_tx: mpsc::Sender<HunterSignalEvent>,
@@ -2242,7 +2270,8 @@ fn spawn_hermes_signal_source<R>(
     R: RpcClient + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
-        let hermes_url = std::env::var("HERMES_WS_URL")
+        let hermes_url = std::env::var("SIGNAL_FEED_WS_URL")
+            .or_else(|_| std::env::var("HERMES_WS_URL"))
             .unwrap_or_else(|_| "https://hermes.pyth.network".to_string())
             .trim_end_matches('/')
             .to_string();
@@ -3742,7 +3771,16 @@ mod tests {
     use super::*;
     use crate::ports::rpc::TransactionInfo;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Mutex, OnceLock};
     use tokio::sync::{mpsc, Barrier};
+
+    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env mutex poisoned")
+    }
 
     #[test]
     fn parse_toml_u64_supports_underscores_and_comments() {
@@ -3901,7 +3939,7 @@ mod tests {
         let locks = DashMap::new();
         let (metrics, _rx) = test_metrics_logger();
         let fingerprint = test_fingerprint();
-        let signal = test_signal(HunterSignalSource::QuickNode, 100);
+        let signal = test_signal(HunterSignalSource::PrimaryRpc, 100);
 
         let won = try_accept_signal(&locks, &metrics, fingerprint.clone(), &signal, 1_500);
 
@@ -3912,14 +3950,14 @@ mod tests {
                 winner_source,
                 acquired_at_ms,
             } => {
-                assert_eq!(*winner_source, HunterSignalSource::QuickNode);
+                assert_eq!(*winner_source, HunterSignalSource::PrimaryRpc);
                 assert_eq!(*acquired_at_ms, 100);
             }
             other => panic!("unexpected state: {other:?}"),
         }
         let stats = record
             .detections
-            .get(&HunterSignalSource::QuickNode)
+            .get(&HunterSignalSource::PrimaryRpc)
             .unwrap();
         assert_eq!(stats.first_ts_ms, 100);
         assert_eq!(stats.count, 1);
@@ -3936,7 +3974,7 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::QuickNode, 100),
+            &test_signal(HunterSignalSource::PrimaryRpc, 100),
             1_500,
         ));
 
@@ -3944,7 +3982,7 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::Helius, 101),
+            &test_signal(HunterSignalSource::SecondaryRpc, 101),
             1_500,
         );
 
@@ -3952,12 +3990,15 @@ mod tests {
         let record = locks.get(&fingerprint).unwrap();
         let quicknode = record
             .detections
-            .get(&HunterSignalSource::QuickNode)
+            .get(&HunterSignalSource::PrimaryRpc)
             .unwrap();
-        let helius = record.detections.get(&HunterSignalSource::Helius).unwrap();
+        let secondary = record
+            .detections
+            .get(&HunterSignalSource::SecondaryRpc)
+            .unwrap();
         assert_eq!(quicknode.count, 1);
-        assert_eq!(helius.count, 1);
-        assert!(!helius.won_lock);
+        assert_eq!(secondary.count, 1);
+        assert!(!secondary.won_lock);
     }
 
     #[test]
@@ -3970,17 +4011,17 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::QuickNode, 100),
+            &test_signal(HunterSignalSource::PrimaryRpc, 100),
             1_500,
         ));
 
-        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::Helius, 101);
+        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::SecondaryRpc, 101);
         assert!(matches!(
             locks.get(&fingerprint).unwrap().state,
             LockState::Held { .. }
         ));
 
-        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::QuickNode, 102);
+        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::PrimaryRpc, 102);
         let record = locks.get(&fingerprint).unwrap();
         match &record.state {
             LockState::Firing {
@@ -3988,7 +4029,7 @@ mod tests {
                 acquired_at_ms,
                 firing_started_at_ms,
             } => {
-                assert_eq!(*winner_source, HunterSignalSource::QuickNode);
+                assert_eq!(*winner_source, HunterSignalSource::PrimaryRpc);
                 assert_eq!(*acquired_at_ms, 100);
                 assert_eq!(*firing_started_at_ms, 102);
             }
@@ -4006,15 +4047,15 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::QuickNode, 100),
+            &test_signal(HunterSignalSource::PrimaryRpc, 100),
             1_500,
         ));
-        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::QuickNode, 102);
+        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::PrimaryRpc, 102);
 
         mark_lock_fired(
             &locks,
             &fingerprint,
-            HunterSignalSource::Helius,
+            HunterSignalSource::SecondaryRpc,
             103,
             FireOutcome::BundleSent,
         );
@@ -4026,7 +4067,7 @@ mod tests {
         mark_lock_fired(
             &locks,
             &fingerprint,
-            HunterSignalSource::QuickNode,
+            HunterSignalSource::PrimaryRpc,
             104,
             FireOutcome::BundleSent,
         );
@@ -4039,7 +4080,7 @@ mod tests {
                 fired_at_ms,
                 outcome,
             } => {
-                assert_eq!(*winner_source, HunterSignalSource::QuickNode);
+                assert_eq!(*winner_source, HunterSignalSource::PrimaryRpc);
                 assert_eq!(*acquired_at_ms, 100);
                 assert_eq!(*firing_started_at_ms, 102);
                 assert_eq!(*fired_at_ms, 104);
@@ -4059,7 +4100,7 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::QuickNode, 100),
+            &test_signal(HunterSignalSource::PrimaryRpc, 100),
             10,
         ));
 
@@ -4067,7 +4108,7 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::Helius, 111),
+            &test_signal(HunterSignalSource::SecondaryRpc, 111),
             10,
         );
 
@@ -4075,11 +4116,11 @@ mod tests {
         let summary = rx
             .try_recv()
             .expect("expired lock summary should be emitted");
-        assert_eq!(summary.winner_source, "quicknode");
+        assert_eq!(summary.winner_source, "primary_rpc");
         assert_eq!(summary.fire_outcome, "held_expired");
         assert_eq!(
             locks.get(&fingerprint).unwrap().winner_source(),
-            HunterSignalSource::Helius
+            HunterSignalSource::SecondaryRpc
         );
     }
 
@@ -4094,9 +4135,9 @@ mod tests {
 
             let mut tasks = Vec::new();
             for source in [
-                HunterSignalSource::QuickNode,
-                HunterSignalSource::Helius,
-                HunterSignalSource::Hermes,
+                HunterSignalSource::PrimaryRpc,
+                HunterSignalSource::SecondaryRpc,
+                HunterSignalSource::PriceFeed,
             ] {
                 let locks = locks.clone();
                 let metrics = metrics.clone();
@@ -4134,7 +4175,7 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::QuickNode, 100),
+            &test_signal(HunterSignalSource::PrimaryRpc, 100),
             10,
         ));
 
@@ -4145,7 +4186,7 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::Helius, 111),
+            &test_signal(HunterSignalSource::SecondaryRpc, 111),
             10,
         ));
 
@@ -4165,37 +4206,39 @@ mod tests {
 
     #[test]
     fn source_toggles_are_read_independently() {
+        let _guard = env_test_guard();
         unsafe {
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_QUICKNODE", "false");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_HELIUS", "true");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_HERMES", "true");
+            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRIMARY", "false");
+            std::env::set_var("ENABLE_HUNTER_SIGNAL_SECONDARY", "true");
+            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED", "true");
         }
         let cfg = read_kamino_signal_source_config(true);
-        assert!(!cfg.quicknode_enabled);
-        assert!(cfg.helius_enabled);
-        assert!(cfg.hermes_enabled);
+        assert!(!cfg.primary_rpc_enabled);
+        assert!(cfg.secondary_rpc_enabled);
+        assert!(cfg.price_feed_enabled);
         unsafe {
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_QUICKNODE");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_HELIUS");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_HERMES");
+            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRIMARY");
+            std::env::remove_var("ENABLE_HUNTER_SIGNAL_SECONDARY");
+            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED");
         }
     }
 
     #[test]
-    fn quicknode_only_mode_disables_helius_and_hermes_effectively() {
+    fn primary_only_mode_disables_secondary_and_price_feed_effectively() {
+        let _guard = env_test_guard();
         unsafe {
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_QUICKNODE", "true");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_HELIUS", "false");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_HERMES", "false");
+            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRIMARY", "true");
+            std::env::set_var("ENABLE_HUNTER_SIGNAL_SECONDARY", "false");
+            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED", "false");
         }
         let cfg = read_kamino_signal_source_config(true);
-        assert!(cfg.quicknode_enabled);
-        assert!(!cfg.helius_enabled);
-        assert!(!cfg.hermes_enabled);
+        assert!(cfg.primary_rpc_enabled);
+        assert!(!cfg.secondary_rpc_enabled);
+        assert!(!cfg.price_feed_enabled);
         unsafe {
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_QUICKNODE");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_HELIUS");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_HERMES");
+            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRIMARY");
+            std::env::remove_var("ENABLE_HUNTER_SIGNAL_SECONDARY");
+            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED");
         }
     }
 
@@ -4273,7 +4316,7 @@ mod tests {
         assert_eq!(signals[0].received_at_ms, 1234);
         assert!(matches!(
             signals[0].signal_kind,
-            HunterSignalKind::HermesPredictedLiquidable
+            HunterSignalKind::PriceFeedPredictedLiquidable
         ));
     }
 
@@ -4299,27 +4342,27 @@ mod tests {
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::QuickNode, 100),
+            &test_signal(HunterSignalSource::PrimaryRpc, 100),
             1_500,
         ));
-        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::QuickNode, 101);
+        mark_lock_firing(&locks, &fingerprint, HunterSignalSource::PrimaryRpc, 101);
         assert!(!try_accept_signal(
             &locks,
             &metrics,
             fingerprint.clone(),
-            &test_signal(HunterSignalSource::Helius, 102),
+            &test_signal(HunterSignalSource::SecondaryRpc, 102),
             1_500,
         ));
         mark_lock_fired(
             &locks,
             &fingerprint,
-            HunterSignalSource::QuickNode,
+            HunterSignalSource::PrimaryRpc,
             103,
             FireOutcome::BundleSent,
         );
 
         let record = locks.get(&fingerprint).unwrap();
-        assert_eq!(record.winner_source(), HunterSignalSource::QuickNode);
+        assert_eq!(record.winner_source(), HunterSignalSource::PrimaryRpc);
         match &record.state {
             LockState::Fired { outcome, .. } => assert!(matches!(outcome, FireOutcome::BundleSent)),
             other => panic!("unexpected state: {other:?}"),
@@ -4337,7 +4380,7 @@ mod tests {
         fn sample_duration_ns(metrics: &SignalMetricsLogger, iteration: u64) -> u128 {
             let locks = DashMap::new();
             let fingerprint = test_fingerprint();
-            let signal = test_signal(HunterSignalSource::QuickNode, iteration);
+            let signal = test_signal(HunterSignalSource::PrimaryRpc, iteration);
 
             let started = Instant::now();
             let won = try_accept_signal(&locks, metrics, fingerprint.clone(), &signal, 1_500);
@@ -4345,7 +4388,7 @@ mod tests {
             mark_lock_firing(
                 &locks,
                 &fingerprint,
-                HunterSignalSource::QuickNode,
+                HunterSignalSource::PrimaryRpc,
                 iteration + 1,
             );
             started.elapsed().as_nanos()
@@ -4366,7 +4409,7 @@ mod tests {
             protocol: "kamino",
             obligation: "prefill".to_string(),
             repay_mint: None,
-            winner_source: "quicknode".to_string(),
+            winner_source: "primary_rpc".to_string(),
             fire_outcome: "held_expired".to_string(),
             detections: HashMap::new(),
         });
@@ -4423,9 +4466,9 @@ mod tests {
 
             let mut tasks = Vec::new();
             for source in [
-                HunterSignalSource::QuickNode,
-                HunterSignalSource::Helius,
-                HunterSignalSource::Hermes,
+                HunterSignalSource::PrimaryRpc,
+                HunterSignalSource::SecondaryRpc,
+                HunterSignalSource::PriceFeed,
             ] {
                 let locks = locks.clone();
                 let metrics = metrics.clone();

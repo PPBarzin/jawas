@@ -78,6 +78,9 @@ Important variables:
 
 - `OBSERVER_RPC_URL`, `OBSERVER_WS_URL`
 - `HUNTER_RPC_URL`, `HUNTER_WS_URL`
+- `HUNTER_SIGNAL_SECONDARY_RPC_URL`, `HUNTER_SIGNAL_SECONDARY_WS_URL`
+- `ENABLE_HUNTER_SIGNAL_PRIMARY`, `ENABLE_HUNTER_SIGNAL_SECONDARY`
+- `ENABLE_HUNTER_SIGNAL_PRICE_FEED`, `SIGNAL_FEED_WS_URL`
 - `AIRTABLE_TOKEN`, `AIRTABLE_BASE_ID`
 - `TARGET_PROTOCOL`
 - `ENABLE_OBSERVER`, `ENABLE_HUNTER`
@@ -91,6 +94,7 @@ Recent runtime notes:
 - the price oracle is now `Jupiter`-first with a static fallback, to improve research accuracy without introducing heavy infrastructure
 - the Jito send path includes a bounded retry on clearly recoverable failures such as congestion or expired blockhash
 - hunter traces and signal metrics can be converted into a dated Markdown report for longitudinal comparison
+- RPC variable names are role-based: observer variables configure the observer, hunter variables configure the hunter, and optional hunter secondary signal variables configure only the hunter comparison path
 
 ## Install
 

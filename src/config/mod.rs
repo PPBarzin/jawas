@@ -20,6 +20,7 @@ pub struct HunterConfig {
     pub rpc_url: String,
     pub ws_url: String,
     pub tx_commitment: String,
+    pub signal_secondary: Option<RpcConfig>,
     pub keypair_path: Option<String>,
     pub jito_url: String,
     pub jupiter_base_url: String,
@@ -64,6 +65,11 @@ impl AppConfig {
                 rpc_url: required_env_with_fallback("HUNTER_RPC_URL", "RPC_URL")?,
                 ws_url: required_env_with_fallback("HUNTER_WS_URL", "WS_URL")?,
                 tx_commitment: env_string("HUNTER_TX_COMMITMENT", "confirmed"),
+                signal_secondary: optional_rpc_config(
+                    "HUNTER_SIGNAL_SECONDARY_RPC_URL",
+                    "HUNTER_SIGNAL_SECONDARY_WS_URL",
+                    "HUNTER_SIGNAL_SECONDARY_TX_COMMITMENT",
+                ),
                 keypair_path: std::env::var("SOLANA_KEYPAIR_PATH").ok(),
                 jito_url: env_string(
                     "JITO_URL",
@@ -115,6 +121,17 @@ fn required_env_with_fallback(primary: &str, fallback: &str) -> anyhow::Result<S
     std::env::var(primary)
         .or_else(|_| std::env::var(fallback))
         .map_err(|_| anyhow::anyhow!("{primary} or {fallback} must be set"))
+}
+
+fn optional_rpc_config(rpc_env: &str, ws_env: &str, tx_commitment_env: &str) -> Option<RpcConfig> {
+    let rpc_url = std::env::var(rpc_env).ok()?;
+    let ws_url = std::env::var(ws_env).ok()?;
+
+    Some(RpcConfig {
+        rpc_url,
+        ws_url,
+        tx_commitment: env_string(tx_commitment_env, "confirmed"),
+    })
 }
 
 #[cfg(test)]

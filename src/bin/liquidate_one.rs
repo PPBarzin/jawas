@@ -77,7 +77,9 @@ async fn main() -> Result<()> {
     let obligation_pk = Pubkey::from_str(&args[1])?;
     let dry_run = args.iter().any(|a| a == "--dry-run");
 
-    let rpc_url = std::env::var("OBSERVER_RPC_URL").expect("OBSERVER_RPC_URL not set");
+    let rpc_url = std::env::var("HUNTER_RPC_URL")
+        .or_else(|_| std::env::var("RPC_URL"))
+        .expect("HUNTER_RPC_URL or RPC_URL not set");
     let keypair_path = std::env::var("SOLANA_KEYPAIR_PATH").expect("SOLANA_KEYPAIR_PATH not set");
     let rpc = RpcClient::new(rpc_url);
     let keypair = read_keypair_file(&keypair_path).expect("Failed to read keypair");

@@ -30,6 +30,9 @@ pub async fn run() -> anyhow::Result<()> {
         &config.hunter.ws_url,
         &config.hunter.tx_commitment,
     );
+    let hunter_signal_secondary_rpc = config.hunter.signal_secondary.as_ref().map(|rpc| {
+        HeliusAdapter::with_tx_commitment(&rpc.rpc_url, &rpc.ws_url, &rpc.tx_commitment)
+    });
 
     let logger = AirtableAdapter::new(
         config.airtable.token.clone(),
@@ -43,15 +46,23 @@ pub async fn run() -> anyhow::Result<()> {
     let protocol = config.runtime.protocol();
     let hunter_service = build_hunter_service(
         &config,
-        observer_rpc.clone(),
         hunter_rpc.clone(),
+        hunter_signal_secondary_rpc.clone(),
         logger.clone(),
         oracle.clone(),
         jito,
         jupiter,
     )?;
 
-    verify_observer_rpc(&observer_rpc).await?;
+    if config.runtime.enable_hunter {
+        log_rpc_healthcheck("hunter RPC", &hunter_rpc).await;
+        if let Some(rpc) = hunter_signal_secondary_rpc.as_ref() {
+            log_rpc_healthcheck("hunter signal secondary RPC", rpc).await;
+        }
+    }
+    if config.runtime.enable_observer {
+        log_rpc_healthcheck("observer RPC", &observer_rpc).await;
+    }
     send_boot_ping(&logger, protocol).await?;
 
     if let Some(hunter) = hunter_service {
@@ -91,8 +102,8 @@ type JawasHunter =
 
 fn build_hunter_service(
     config: &AppConfig,
-    observer_rpc: HeliusAdapter,
     hunter_rpc: HeliusAdapter,
+    hunter_signal_secondary_rpc: Option<HeliusAdapter>,
     logger: AirtableAdapter,
     oracle: SimplePriceOracle,
     jito: JitoAdapter,
@@ -130,7 +141,7 @@ fn build_hunter_service(
 
     Ok(Some(HunterService::new(
         hunter_rpc,
-        Some(observer_rpc),
+        hunter_signal_secondary_rpc,
         jito,
         jupiter,
         oracle,
@@ -140,25 +151,20 @@ fn build_hunter_service(
     )))
 }
 
-async fn verify_observer_rpc(observer_rpc: &HeliusAdapter) -> anyhow::Result<()> {
-    match observer_rpc.get_version().await {
+async fn log_rpc_healthcheck(label: &str, rpc: &HeliusAdapter) {
+    match rpc.get_version().await {
         Ok(version) => {
             log_runtime(
                 "rpc",
-                "observer RPC reachable",
+                &format!("{label} reachable"),
                 None,
                 Some("healthcheck"),
                 Some(&format!("solana-core {}", version)),
                 None,
             );
-            Ok(())
         }
         Err(error) => {
-            log_error(
-                "rpc",
-                &format!("observer RPC healthcheck failed: {}", error),
-            );
-            Err(error)
+            log_error("rpc", &format!("{label} healthcheck failed: {}", error));
         }
     }
 }
