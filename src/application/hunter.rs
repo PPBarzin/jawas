@@ -1,3 +1,7 @@
+use crate::application::kamino_shortlist::{
+    PreparedExecutionContext, ShortlistCandidate, ShortlistEntry, ShortlistState,
+    enforce_candidate_history_limit, select_shortlist,
+};
 use crate::ports::config::ConfigPort;
 use crate::ports::jito::JitoPort;
 use crate::ports::jupiter::JupiterPort;
@@ -73,6 +77,12 @@ struct HunterRuntimeConfig {
     non_whitelist_cooldown_ms: u128,
     ws_idle_timeout_secs: u64,
     signal_lock_ms: u64,
+    shortlist_enabled: bool,
+    shortlist_max_obligations: usize,
+    shortlist_refresh_secs: u64,
+    shortlist_refresh_debounce_ms: u64,
+    shortlist_cooling_down_ms: u64,
+    shortlist_candidate_history_limit: usize,
     verbose: bool,
 }
 
@@ -150,6 +160,51 @@ impl HunterRuntimeConfig {
             })
             .unwrap_or(true);
 
+        let shortlist_enabled = std::env::var(format!("{prefix}_SHORTLIST_ENABLED"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_SHORTLIST_ENABLED").ok())
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(true);
+
+        let shortlist_max_obligations =
+            std::env::var(format!("{prefix}_SHORTLIST_MAX_OBLIGATIONS"))
+                .ok()
+                .or_else(|| std::env::var("HUNTER_SHORTLIST_MAX_OBLIGATIONS").ok())
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.clamp(1, 10))
+                .unwrap_or(10);
+
+        let shortlist_refresh_secs = std::env::var(format!("{prefix}_SHORTLIST_REFRESH_SECS"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_SHORTLIST_REFRESH_SECS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20);
+
+        let shortlist_refresh_debounce_ms =
+            std::env::var(format!("{prefix}_SHORTLIST_REFRESH_DEBOUNCE_MS"))
+                .ok()
+                .or_else(|| std::env::var("HUNTER_SHORTLIST_REFRESH_DEBOUNCE_MS").ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1_500);
+
+        let shortlist_cooling_down_ms =
+            std::env::var(format!("{prefix}_SHORTLIST_COOLDOWN_MS"))
+                .ok()
+                .or_else(|| std::env::var("HUNTER_SHORTLIST_COOLDOWN_MS").ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(20_000);
+
+        let shortlist_candidate_history_limit =
+            std::env::var(format!("{prefix}_SHORTLIST_CANDIDATE_HISTORY_LIMIT"))
+                .ok()
+                .or_else(|| std::env::var("HUNTER_SHORTLIST_CANDIDATE_HISTORY_LIMIT").ok())
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.max(shortlist_max_obligations))
+                .unwrap_or(64);
+
         Self {
             signal_commitment,
             tx_fetch: HunterTxFetchConfig::from_env(prefix),
@@ -157,6 +212,12 @@ impl HunterRuntimeConfig {
             non_whitelist_cooldown_ms,
             ws_idle_timeout_secs,
             signal_lock_ms,
+            shortlist_enabled,
+            shortlist_max_obligations,
+            shortlist_refresh_secs,
+            shortlist_refresh_debounce_ms,
+            shortlist_cooling_down_ms,
+            shortlist_candidate_history_limit,
             verbose,
         }
     }
@@ -279,6 +340,12 @@ struct HunterTraceEvent {
     ws_received_at_ms: Option<u64>,
     elapsed_ms: Option<u64>,
     bundle_id: Option<String>,
+    shortlist_hit: Option<bool>,
+    shortlist_state: Option<String>,
+    shortlist_age_ms: Option<u64>,
+    prepared_context_used: Option<bool>,
+    candidate_score: Option<f64>,
+    refresh_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -636,6 +703,51 @@ struct KaminoReserveMeta {
     switchboard_price_oracle: Option<Pubkey>,
     switchboard_twap_oracle: Option<Pubkey>,
     scope_prices: Option<Pubkey>,
+}
+
+#[derive(Debug, Clone)]
+struct KaminoResolvedAccounts {
+    obligation_pubkey: String,
+    market: String,
+    market_authority: String,
+    repay_reserve: String,
+    repay_mint: String,
+    repay_supply: String,
+    withdraw_reserve: String,
+    withdraw_liquidity_mint: String,
+    withdraw_collateral_mint: String,
+    withdraw_collateral_supply: String,
+    withdraw_liquidity_supply: String,
+    withdraw_liquidity_fee_receiver: String,
+}
+
+#[derive(Debug, Clone)]
+struct KaminoShortlistRuntime {
+    candidates: HashMap<String, ShortlistCandidate>,
+    active: HashMap<String, ShortlistEntry>,
+    last_refresh_requested_at_ms: Option<u64>,
+    last_refresh_completed_at_ms: Option<u64>,
+}
+
+impl KaminoShortlistRuntime {
+    fn new() -> Self {
+        Self {
+            candidates: HashMap::new(),
+            active: HashMap::new(),
+            last_refresh_requested_at_ms: None,
+            last_refresh_completed_at_ms: None,
+        }
+    }
+
+    fn shortlist_entry(&self, obligation: &str) -> Option<ShortlistEntry> {
+        self.active.get(obligation).cloned()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KaminoShortlistRefreshRequest {
+    reason: String,
+    prioritize_obligation: Option<String>,
 }
 
 /// Parses wallet.toml and returns the list of available tokens.
@@ -1151,13 +1263,19 @@ impl<
         )?);
         let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let shortlist_runtime = Arc::new(tokio::sync::RwLock::new(KaminoShortlistRuntime::new()));
+        let (shortlist_refresh_tx, mut shortlist_refresh_rx) =
+            mpsc::channel::<KaminoShortlistRefreshRequest>(64);
 
         log_stderr(format!(
-            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | tokens: {}",
+            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | tokens: {}",
             self.keypair.pubkey(),
             self.max_repay_usd,
             runtime.signal_commitment,
             runtime.tx_fetch,
+            runtime.shortlist_enabled,
+            runtime.shortlist_max_obligations,
+            runtime.shortlist_refresh_secs,
             wallet_tokens.iter().map(|t| t.symbol.as_str()).collect::<Vec<_>>().join(", ")
         ));
 
@@ -1274,7 +1392,159 @@ impl<
             );
         }
 
+        if runtime.shortlist_enabled {
+            let shortlist_runtime_for_refresh = shortlist_runtime.clone();
+            let reserve_cache = reserve_cache.clone();
+            let trace_logger = self.trace_logger.clone();
+            let refresh_runtime = runtime;
+            let refresh_rpc = self.hunter_rpc.clone();
+            tokio::spawn(async move {
+                while let Some(request) = shortlist_refresh_rx.recv().await {
+                    match refresh_kamino_shortlist(
+                        &refresh_rpc,
+                        &shortlist_runtime_for_refresh,
+                        &reserve_cache,
+                        refresh_runtime,
+                        &request.reason,
+                    )
+                    .await
+                    {
+                        Ok(active_count) => {
+                            trace_logger.log(HunterTraceEvent {
+                                timestamp: crate::utils::utc_now(),
+                                protocol: "kamino",
+                                stage: "shortlist_refresh",
+                                signature: request.prioritize_obligation.unwrap_or_else(|| {
+                                    format!("shortlist:{}", request.reason)
+                                }),
+                                obligation: None,
+                                repay_mint: None,
+                                repay_symbol: None,
+                                reason: None,
+                                detail: Some(format!(
+                                    "reason={} active={}",
+                                    request.reason, active_count
+                                )),
+                                ws_received_at_ms: Some(now_ms()),
+                                elapsed_ms: Some(0),
+                                bundle_id: None,
+                                shortlist_hit: None,
+                                shortlist_state: None,
+                                shortlist_age_ms: None,
+                                prepared_context_used: None,
+                                candidate_score: None,
+                                refresh_reason: Some(request.reason),
+                            });
+                        }
+                        Err(error) => {
+                            trace_logger.log(HunterTraceEvent {
+                                timestamp: crate::utils::utc_now(),
+                                protocol: "kamino",
+                                stage: "error",
+                                signature: format!("shortlist:{}", request.reason),
+                                obligation: None,
+                                repay_mint: None,
+                                repay_symbol: None,
+                                reason: Some("shortlist_refresh_failed".to_string()),
+                                detail: Some(error.to_string()),
+                                ws_received_at_ms: Some(now_ms()),
+                                elapsed_ms: Some(0),
+                                bundle_id: None,
+                                shortlist_hit: None,
+                                shortlist_state: None,
+                                shortlist_age_ms: None,
+                                prepared_context_used: None,
+                                candidate_score: None,
+                                refresh_reason: Some(request.reason),
+                            });
+                        }
+                    }
+                }
+            });
+
+            let shortlist_runtime = shortlist_runtime.clone();
+            let shortlist_refresh_tx = shortlist_refresh_tx.clone();
+            let refresh_secs = runtime.shortlist_refresh_secs;
+            let debounce_ms = runtime.shortlist_refresh_debounce_ms;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
+                    request_shortlist_refresh(
+                        &shortlist_refresh_tx,
+                        &shortlist_runtime,
+                        debounce_ms,
+                        "safety_interval",
+                        None,
+                    )
+                    .await;
+                }
+            });
+        }
+
         while let Some(signal) = signal_rx.recv().await {
+            if runtime.shortlist_enabled {
+                if let (Some(repay_mint), Some(tx_info)) =
+                    (signal.repay_mint.as_ref(), signal.tx_info.as_ref())
+                {
+                    if let Some(wallet_token) = wallet_index.get(repay_mint) {
+                        if let Ok(resolved) = resolve_kamino_accounts_from_tx_info(
+                            tx_info,
+                            Some(&signal.obligation_pubkey),
+                            Some(repay_mint),
+                        ) {
+                            let mut shortlist_state = shortlist_runtime.write().await;
+                            let candidate = shortlist_state
+                                .candidates
+                                .entry(signal.obligation_pubkey.clone())
+                                .or_insert_with(|| {
+                                    ShortlistCandidate::new(
+                                        prepared_context_from_resolved_accounts(
+                                            &resolved,
+                                            wallet_token.symbol.clone(),
+                                            "observed_liquidation".to_string(),
+                                        ),
+                                        signal.received_at_ms,
+                                    )
+                                });
+                            candidate.context = prepared_context_from_resolved_accounts(
+                                &resolved,
+                                wallet_token.symbol.clone(),
+                                "observed_liquidation".to_string(),
+                            );
+                            candidate.record_observation(signal.received_at_ms);
+                            enforce_candidate_history_limit(
+                                &mut shortlist_state.candidates,
+                                runtime.shortlist_candidate_history_limit,
+                            );
+                            drop(shortlist_state);
+
+                            request_shortlist_refresh(
+                                &shortlist_refresh_tx,
+                                &shortlist_runtime,
+                                runtime.shortlist_refresh_debounce_ms,
+                                "candidate_observed",
+                                Some(signal.obligation_pubkey.clone()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+
+            let shortlist_entry = if runtime.shortlist_enabled {
+                let state = shortlist_runtime.read().await;
+                shortlist_entry_for_signal(&state, &signal)
+            } else {
+                None
+            };
+            let (
+                shortlist_hit,
+                shortlist_state_value,
+                shortlist_age_ms,
+                shortlist_score,
+                shortlist_refresh_reason,
+            ) = shortlist_trace_fields(shortlist_entry.as_ref());
+
             let fingerprint = SignalFingerprint {
                 protocol: signal.protocol,
                 obligation: signal.obligation_pubkey.clone(),
@@ -1310,10 +1580,35 @@ impl<
                 ws_received_at_ms: Some(signal.received_at_ms),
                 elapsed_ms: Some(0),
                 bundle_id: None,
+                shortlist_hit,
+                shortlist_state: shortlist_state_value.clone(),
+                shortlist_age_ms,
+                prepared_context_used: Some(false),
+                candidate_score: shortlist_score,
+                refresh_reason: shortlist_refresh_reason.clone(),
             });
 
             if !won_lock {
                 continue;
+            }
+
+            if runtime.shortlist_enabled && shortlist_entry.is_some() {
+                {
+                    let mut state = shortlist_runtime.write().await;
+                    if let Some(candidate) = state.candidates.get_mut(&signal.obligation_pubkey) {
+                        candidate.cooldown(
+                            now_ms().saturating_add(runtime.shortlist_cooling_down_ms),
+                        );
+                    }
+                }
+                request_shortlist_refresh(
+                    &shortlist_refresh_tx,
+                    &shortlist_runtime,
+                    runtime.shortlist_refresh_debounce_ms,
+                    "shortlisted_liquidation",
+                    Some(signal.obligation_pubkey.clone()),
+                )
+                .await;
             }
 
             let keypair = self.keypair.clone();
@@ -1329,6 +1624,7 @@ impl<
             let airtable_logger = self._config.clone();
             let hunter_wallet = hunter_wallet.clone();
             let signal_locks = signal_locks.clone();
+            let shortlist_context = shortlist_entry.map(|entry| entry.context);
             let sig_for_error = signal.signature.clone().unwrap_or_else(|| {
                 format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
             });
@@ -1362,6 +1658,7 @@ impl<
                     signal.tx_info,
                     Some(signal.obligation_pubkey.clone()),
                     signal.repay_mint.clone(),
+                    shortlist_context,
                 )
                 .await;
 
@@ -1394,6 +1691,12 @@ impl<
                         ws_received_at_ms: Some(signal.received_at_ms),
                         elapsed_ms: Some(elapsed_ms_since(signal.received_at_ms)),
                         bundle_id: None,
+                        shortlist_hit: None,
+                        shortlist_state: None,
+                        shortlist_age_ms: None,
+                        prepared_context_used: None,
+                        candidate_score: None,
+                        refresh_reason: None,
                     });
                     let _ = log_hunter_observation(
                         &airtable_logger,
@@ -1461,6 +1764,12 @@ impl<
             ws_received_at_ms: Some(now_ms()),
             elapsed_ms: Some(0),
             bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
         });
 
         execute_kamino_opportunity(
@@ -1479,6 +1788,7 @@ impl<
             self.trace_logger.clone(),
             self._config.clone(),
             HunterSignalSource::PrimaryRpc,
+            None,
             None,
             None,
             None,
@@ -1650,6 +1960,12 @@ impl<
                     ws_received_at_ms: Some(entry.received_at_ms),
                     elapsed_ms: Some(0),
                     bundle_id: None,
+                    shortlist_hit: None,
+                    shortlist_state: None,
+                    shortlist_age_ms: None,
+                    prepared_context_used: None,
+                    candidate_score: None,
+                    refresh_reason: None,
                 });
                 let _ = log_hunter_observation(
                     &airtable_logger,
@@ -1694,6 +2010,12 @@ impl<
                             ws_received_at_ms: Some(entry.received_at_ms),
                             elapsed_ms: Some(elapsed_ms_since(entry.received_at_ms)),
                             bundle_id: None,
+                            shortlist_hit: None,
+                            shortlist_state: None,
+                            shortlist_age_ms: None,
+                            prepared_context_used: None,
+                            candidate_score: None,
+                            refresh_reason: None,
                         });
                         let _ = log_hunter_observation(
                             &airtable_logger,
@@ -1754,6 +2076,12 @@ impl<
             ws_received_at_ms: Some(now_ms()),
             elapsed_ms: Some(0),
             bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
         });
 
         execute_solend_opportunity(
@@ -1862,6 +2190,201 @@ fn remove_expired_signal_fingerprints(
             }
         }
     }
+}
+
+fn resolve_kamino_accounts_from_tx_info(
+    tx_info: &crate::ports::rpc::TransactionInfo,
+    known_obligation: Option<&str>,
+    known_repay_mint: Option<&str>,
+) -> anyhow::Result<KaminoResolvedAccounts> {
+    let liquidate_ix_idx = find_kamino_liquidate_ix(tx_info)
+        .ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
+    let ix_accs = &tx_info.instruction_accounts[liquidate_ix_idx];
+    if ix_accs.len() < 13 {
+        anyhow::bail!(
+            "liquidate instruction has too few accounts ({})",
+            ix_accs.len()
+        );
+    }
+
+    let resolve = |index: usize| -> anyhow::Result<String> {
+        tx_info
+            .account_keys
+            .get(
+                *ix_accs
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("missing liquidate account index {index}"))?,
+            )
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing account key for liquidate account {index}"))
+    };
+
+    Ok(KaminoResolvedAccounts {
+        obligation_pubkey: known_obligation
+            .map(|value| value.to_string())
+            .unwrap_or(resolve(1)?),
+        market: resolve(2)?,
+        market_authority: resolve(3)?,
+        repay_reserve: resolve(4)?,
+        repay_mint: known_repay_mint
+            .map(|value| value.to_string())
+            .unwrap_or(resolve(5)?),
+        repay_supply: resolve(6)?,
+        withdraw_reserve: resolve(7)?,
+        withdraw_liquidity_mint: resolve(8)?,
+        withdraw_collateral_mint: resolve(9)?,
+        withdraw_collateral_supply: resolve(10)?,
+        withdraw_liquidity_supply: resolve(11)?,
+        withdraw_liquidity_fee_receiver: resolve(12)?,
+    })
+}
+
+fn shortlist_trace_fields(entry: Option<&ShortlistEntry>) -> (Option<bool>, Option<String>, Option<u64>, Option<f64>, Option<String>) {
+    match entry {
+        Some(entry) => (
+            Some(true),
+            Some(entry.state.as_str().to_string()),
+            Some(entry.shortlist_age_ms),
+            Some(entry.distance_to_liq),
+            Some(entry.refresh_reason.clone()),
+        ),
+        None => (Some(false), None, None, None, None),
+    }
+}
+
+fn prepared_context_from_resolved_accounts(
+    resolved: &KaminoResolvedAccounts,
+    repay_symbol: String,
+    inclusion_reason: String,
+) -> PreparedExecutionContext {
+    PreparedExecutionContext {
+        obligation_pubkey: resolved.obligation_pubkey.clone(),
+        repay_mint: resolved.repay_mint.clone(),
+        repay_symbol,
+        wallet_eligible: true,
+        repay_reserve: resolved.repay_reserve.clone(),
+        withdraw_reserve: resolved.withdraw_reserve.clone(),
+        withdraw_mint: resolved.withdraw_liquidity_mint.clone(),
+        inclusion_reason,
+    }
+}
+
+async fn refresh_kamino_shortlist<R: RpcClient>(
+    rpc: &R,
+    runtime: &tokio::sync::RwLock<KaminoShortlistRuntime>,
+    reserve_cache: &tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>,
+    config: HunterRuntimeConfig,
+    reason: &str,
+) -> anyhow::Result<usize> {
+    let candidate_snapshot = {
+        let state = runtime.read().await;
+        state
+            .candidates
+            .iter()
+            .map(|(obligation, candidate)| (obligation.clone(), candidate.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    if candidate_snapshot.is_empty() {
+        let mut state = runtime.write().await;
+        state.active.clear();
+        state.last_refresh_completed_at_ms = Some(now_ms());
+        return Ok(0);
+    }
+
+    let refreshed_at_ms = now_ms();
+    let mut refreshed_candidates = HashMap::new();
+
+    for (obligation, mut candidate) in candidate_snapshot {
+        candidate.clear_cooldown_if_expired(refreshed_at_ms);
+        match rpc.get_account_info(&obligation).await {
+            Ok(data) => {
+                if let Some(obligation_account) = decode_kamino_obligation(&data) {
+                    if obligation_account.has_debt == 0
+                        || obligation_account.borrowed_assets_market_value_sf == 0
+                    {
+                        candidate.distance_to_liq = None;
+                    } else {
+                        candidate.update_refresh(
+                            obligation_account.dist_to_liq(),
+                            refreshed_at_ms,
+                            reason,
+                        );
+                        let repay_reserve_pk =
+                            Pubkey::from_str(&candidate.context.repay_reserve)?;
+                        let withdraw_reserve_pk =
+                            Pubkey::from_str(&candidate.context.withdraw_reserve)?;
+                        let _ = get_or_fetch_kamino_reserve_meta(
+                            rpc,
+                            reserve_cache,
+                            &repay_reserve_pk,
+                        )
+                        .await?;
+                        let _ = get_or_fetch_kamino_reserve_meta(
+                            rpc,
+                            reserve_cache,
+                            &withdraw_reserve_pk,
+                        )
+                        .await?;
+                    }
+                } else {
+                    candidate.distance_to_liq = None;
+                }
+            }
+            Err(_) => {
+                candidate.distance_to_liq = None;
+            }
+        }
+        refreshed_candidates.insert(obligation, candidate);
+    }
+
+    let active = select_shortlist(
+        &refreshed_candidates,
+        config.shortlist_max_obligations,
+        refreshed_at_ms,
+    );
+
+    let mut state = runtime.write().await;
+    state.candidates = refreshed_candidates;
+    state.active = active;
+    state.last_refresh_completed_at_ms = Some(refreshed_at_ms);
+    Ok(state.active.len())
+}
+
+async fn request_shortlist_refresh(
+    tx: &mpsc::Sender<KaminoShortlistRefreshRequest>,
+    runtime: &tokio::sync::RwLock<KaminoShortlistRuntime>,
+    debounce_ms: u64,
+    reason: &str,
+    prioritize_obligation: Option<String>,
+) {
+    let now = now_ms();
+    {
+        let state = runtime.read().await;
+        if state
+            .last_refresh_requested_at_ms
+            .is_some_and(|last| now.saturating_sub(last) < debounce_ms)
+        {
+            return;
+        }
+    }
+    {
+        let mut state = runtime.write().await;
+        state.last_refresh_requested_at_ms = Some(now);
+    }
+    let _ = tx
+        .send(KaminoShortlistRefreshRequest {
+            reason: reason.to_string(),
+            prioritize_obligation,
+        })
+        .await;
+}
+
+fn shortlist_entry_for_signal(
+    runtime: &KaminoShortlistRuntime,
+    signal: &HunterSignalEvent,
+) -> Option<ShortlistEntry> {
+    runtime.shortlist_entry(&signal.obligation_pubkey)
 }
 
 async fn resolve_kamino_signal_event<R: RpcClient>(
@@ -1985,6 +2508,12 @@ fn spawn_kamino_log_signal_source<R, L>(
                         ws_received_at_ms: Some(entry.received_at_ms),
                         elapsed_ms: Some(0),
                         bundle_id: None,
+                        shortlist_hit: None,
+                        shortlist_state: None,
+                        shortlist_age_ms: None,
+                        prepared_context_used: None,
+                        candidate_score: None,
+                        refresh_reason: None,
                     });
                     continue;
                 }
@@ -2013,6 +2542,12 @@ fn spawn_kamino_log_signal_source<R, L>(
                     ws_received_at_ms: Some(entry.received_at_ms),
                     elapsed_ms: Some(0),
                     bundle_id: None,
+                    shortlist_hit: None,
+                    shortlist_state: None,
+                    shortlist_age_ms: None,
+                    prepared_context_used: None,
+                    candidate_score: None,
+                    refresh_reason: None,
                 });
                 let _ = log_hunter_observation(
                     &logger,
@@ -2056,6 +2591,12 @@ fn spawn_kamino_log_signal_source<R, L>(
                             ws_received_at_ms: Some(entry.received_at_ms),
                             elapsed_ms: Some(elapsed_ms_since(entry.received_at_ms)),
                             bundle_id: None,
+                            shortlist_hit: None,
+                            shortlist_state: None,
+                            shortlist_age_ms: None,
+                            prepared_context_used: None,
+                            candidate_score: None,
+                            refresh_reason: None,
                         });
                     }
                 }
@@ -2381,6 +2922,12 @@ fn spawn_price_feed_signal_source<R>(
                                             ws_received_at_ms: Some(chunk_received_at_ms),
                                             elapsed_ms: Some(0),
                                             bundle_id: None,
+                                            shortlist_hit: None,
+                                            shortlist_state: None,
+                                            shortlist_age_ms: None,
+                                            prepared_context_used: None,
+                                            candidate_score: None,
+                                            refresh_reason: None,
                                         });
                                         if signal_tx.send(signal).await.is_err() {
                                             return;
@@ -2429,6 +2976,7 @@ async fn execute_kamino_opportunity<R, JI>(
     preloaded_tx_info: Option<crate::ports::rpc::TransactionInfo>,
     known_obligation: Option<String>,
     known_repay_mint: Option<String>,
+    prepared_context: Option<PreparedExecutionContext>,
 ) -> anyhow::Result<KaminoExecutionOutcome>
 where
     R: RpcClient,
@@ -2538,6 +3086,17 @@ where
     let wdr_liq_sup_str = resolve!(11);
     let wdr_fee_str = resolve!(12);
     let resolve_ms = resolve_started_at.elapsed().as_millis();
+    let prepared_context_used = prepared_context
+        .as_ref()
+        .is_some_and(|context| context.obligation_pubkey == obligation_str);
+    let shortlist_hit = Some(prepared_context.is_some());
+    let shortlist_state = prepared_context
+        .as_ref()
+        .map(|_| ShortlistState::Armed.as_str().to_string());
+    let shortlist_age_ms = None;
+    let refresh_reason = prepared_context
+        .as_ref()
+        .map(|context| context.inclusion_reason.clone());
 
     // ── 4. Check we hold the repay token ────────────────────────────────────
     let Some(repay_token) = wallet_index.get(repay_mint_str) else {
@@ -2565,6 +3124,12 @@ where
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
+            shortlist_hit,
+            shortlist_state: shortlist_state.clone(),
+            shortlist_age_ms,
+            prepared_context_used: Some(prepared_context_used),
+            candidate_score: None,
+            refresh_reason: refresh_reason.clone(),
         });
         if should_log {
             log_stderr(format!(
@@ -2599,6 +3164,12 @@ where
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
+            shortlist_hit,
+            shortlist_state: shortlist_state.clone(),
+            shortlist_age_ms,
+            prepared_context_used: Some(prepared_context_used),
+            candidate_score: None,
+            refresh_reason: refresh_reason.clone(),
         });
         return Ok(KaminoExecutionOutcome::Skipped);
     }
@@ -2771,6 +3342,12 @@ where
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
+        shortlist_hit,
+        shortlist_state: shortlist_state.clone(),
+        shortlist_age_ms,
+        prepared_context_used: Some(prepared_context_used),
+        candidate_score: None,
+        refresh_reason: refresh_reason.clone(),
     });
     let _ = log_hunter_observation(
         &logger,
@@ -2841,6 +3418,12 @@ where
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
+            shortlist_hit,
+            shortlist_state: shortlist_state.clone(),
+            shortlist_age_ms,
+            prepared_context_used: Some(prepared_context_used),
+            candidate_score: None,
+            refresh_reason: refresh_reason.clone(),
         });
         log_stderr(format!(
             "[hunter-kamino] DRY RUN | obligation={} repay={} tx_size={}",
@@ -2910,6 +3493,12 @@ where
                     ws_received_at_ms: Some(ws_received_at_ms),
                     elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                     bundle_id: Some(bundle_id.clone()),
+                    shortlist_hit,
+                    shortlist_state: shortlist_state.clone(),
+                    shortlist_age_ms,
+                    prepared_context_used: Some(prepared_context_used),
+                    candidate_score: None,
+                    refresh_reason: refresh_reason.clone(),
                 });
                 let _ = log_hunter_observation(
                     &logger,
@@ -2970,6 +3559,12 @@ where
                         ws_received_at_ms: Some(ws_received_at_ms),
                         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                         bundle_id: None,
+                        shortlist_hit,
+                        shortlist_state: shortlist_state.clone(),
+                        shortlist_age_ms,
+                        prepared_context_used: Some(prepared_context_used),
+                        candidate_score: None,
+                        refresh_reason: refresh_reason.clone(),
                     });
                     let backoff_ms = retry_backoff_ms(attempt);
                     if backoff_ms > 0 {
@@ -2995,6 +3590,12 @@ where
                     ws_received_at_ms: Some(ws_received_at_ms),
                     elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                     bundle_id: None,
+                    shortlist_hit,
+                    shortlist_state: shortlist_state.clone(),
+                    shortlist_age_ms,
+                    prepared_context_used: Some(prepared_context_used),
+                    candidate_score: None,
+                    refresh_reason: refresh_reason.clone(),
                 });
                 let _ = log_hunter_observation(
                     &logger,
@@ -3153,6 +3754,12 @@ where
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
         });
         log_stderr(format!(
             "[hunter-solend] skip: token not whitelisted | repay_mint={}",
@@ -3193,6 +3800,12 @@ where
                 ws_received_at_ms: Some(ws_received_at_ms),
                 elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                 bundle_id: None,
+                shortlist_hit: None,
+                shortlist_state: None,
+                shortlist_age_ms: None,
+                prepared_context_used: None,
+                candidate_score: None,
+                refresh_reason: None,
             });
             return Ok(());
         }
@@ -3212,6 +3825,12 @@ where
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
         });
         return Ok(());
     }
@@ -3385,6 +4004,12 @@ where
         ws_received_at_ms: Some(ws_received_at_ms),
         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
         bundle_id: None,
+        shortlist_hit: None,
+        shortlist_state: None,
+        shortlist_age_ms: None,
+        prepared_context_used: None,
+        candidate_score: None,
+        refresh_reason: None,
     });
     let _ = log_hunter_observation(
         &logger,
@@ -3451,6 +4076,12 @@ where
             ws_received_at_ms: Some(ws_received_at_ms),
             elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
             bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
         });
         log_stderr(format!(
             "[hunter-solend] DRY RUN | obligation={} repay={} tx_size={}",
@@ -3516,6 +4147,12 @@ where
                     ws_received_at_ms: Some(ws_received_at_ms),
                     elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                     bundle_id: Some(bundle_id.clone()),
+                    shortlist_hit: None,
+                    shortlist_state: None,
+                    shortlist_age_ms: None,
+                    prepared_context_used: None,
+                    candidate_score: None,
+                    refresh_reason: None,
                 });
                 let _ = log_hunter_observation(
                     &logger,
@@ -3575,6 +4212,12 @@ where
                         ws_received_at_ms: Some(ws_received_at_ms),
                         elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                         bundle_id: None,
+                        shortlist_hit: None,
+                        shortlist_state: None,
+                        shortlist_age_ms: None,
+                        prepared_context_used: None,
+                        candidate_score: None,
+                        refresh_reason: None,
                     });
                     let backoff_ms = retry_backoff_ms(attempt);
                     if backoff_ms > 0 {
@@ -3596,6 +4239,12 @@ where
                     ws_received_at_ms: Some(ws_received_at_ms),
                     elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
                     bundle_id: None,
+                    shortlist_hit: None,
+                    shortlist_state: None,
+                    shortlist_age_ms: None,
+                    prepared_context_used: None,
+                    candidate_score: None,
+                    refresh_reason: None,
                 });
                 let _ = log_hunter_observation(
                     &logger,
@@ -3863,6 +4512,12 @@ mod tests {
             ws_received_at_ms: Some(1),
             elapsed_ms: Some(2),
             bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
         });
 
         let content = std::fs::read_to_string(&path).unwrap();
