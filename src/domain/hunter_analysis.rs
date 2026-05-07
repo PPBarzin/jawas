@@ -16,6 +16,12 @@ pub struct HunterTraceEntry {
     pub ws_received_at_ms: Option<u64>,
     pub elapsed_ms: Option<u64>,
     pub bundle_id: Option<String>,
+    pub shortlist_hit: Option<bool>,
+    pub shortlist_state: Option<String>,
+    pub shortlist_age_ms: Option<u64>,
+    pub prepared_context_used: Option<bool>,
+    pub candidate_score: Option<f64>,
+    pub refresh_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +65,9 @@ pub struct HunterReport {
     pub fire_outcome_by_winner: Vec<(String, Vec<(String, usize)>)>,
     pub lead_time_by_winner: Vec<(String, LeadTimeSummary)>,
     pub missing_wallet_mints: Vec<MissingMintStat>,
+    pub shortlist_hit_counts: Vec<(String, usize)>,
+    pub prepared_context_counts: Vec<(String, usize)>,
+    pub shortlist_state_counts: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -246,6 +255,33 @@ pub fn analyze_hunter_data(
         .collect::<Vec<_>>();
     missing_wallet_mints.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.mint.cmp(&b.mint)));
 
+    let shortlist_hit_counts = sorted_counts(
+        traces
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .shortlist_hit
+                    .map(|value| if value { "true" } else { "false" }.to_string())
+            })
+            .collect::<Vec<_>>(),
+    );
+    let prepared_context_counts = sorted_counts(
+        traces
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .prepared_context_used
+                    .map(|value| if value { "true" } else { "false" }.to_string())
+            })
+            .collect::<Vec<_>>(),
+    );
+    let shortlist_state_counts = sorted_counts(
+        traces
+            .iter()
+            .filter_map(|entry| entry.shortlist_state.clone())
+            .collect::<Vec<_>>(),
+    );
+
     HunterReport {
         trace_count: traces.len(),
         metrics_count: metrics.len(),
@@ -261,6 +297,9 @@ pub fn analyze_hunter_data(
         fire_outcome_by_winner,
         lead_time_by_winner,
         missing_wallet_mints,
+        shortlist_hit_counts,
+        prepared_context_counts,
+        shortlist_state_counts,
     }
 }
 
@@ -351,6 +390,18 @@ pub fn render_report_markdown(
         for (outcome, count) in outcomes {
             out.push_str(&format!("  - `{outcome}`: `{count}`\n"));
         }
+    }
+    out.push('\n');
+
+    out.push_str("## Shortlist Signals\n\n");
+    for (value, count) in &report.shortlist_hit_counts {
+        out.push_str(&format!("- `shortlist_hit={value}`: `{count}`\n"));
+    }
+    for (value, count) in &report.prepared_context_counts {
+        out.push_str(&format!("- `prepared_context_used={value}`: `{count}`\n"));
+    }
+    for (state, count) in &report.shortlist_state_counts {
+        out.push_str(&format!("- `shortlist_state={state}`: `{count}`\n"));
     }
     out.push('\n');
 

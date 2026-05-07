@@ -20,6 +20,12 @@ Jawas currently exposes two runtime modes:
 - `observer`: subscribes to protocol logs, enriches liquidation events, and writes research data
 - `hunter`: listens for liquidation signals and attempts a reaction pipeline for Kamino or Solend
 
+For Kamino, the current P1 direction is now explicit in the runtime:
+
+- observed liquidation signals can seed a small proactive shortlist
+- only obligations whose `repay mint` is already in the wallet are eligible
+- firing stays reactive, but preparation is moved out of the hottest part of the path where possible
+
 The repository also includes analysis tooling to turn raw JSONL traces into dated research reports. This is used to quantify:
 
 - the hunter funnel from signal reception to bundle send
@@ -33,6 +39,7 @@ The public value of the project is not "a profitable bot". The value is the inst
 
 - The hunter is still mostly reactive and therefore frequently second in competitive situations.
 - Some execution paths still depend on post-factum transaction reads, which is structurally slower than a pre-computed strategy.
+- The new shortlist logic does not remove the structural dependence on signal timing from Helius or comparable sources.
 - `bundle_sent` is not equivalent to a confirmed liquidation win. It only means the Jito endpoint accepted the bundle submission.
 - Wallet coverage is intentionally narrow, so some observed opportunities are skipped by design.
 - Profitability is not demonstrated and should not be assumed.
@@ -43,6 +50,7 @@ The public value of the project is not "a profitable bot". The value is the inst
 - Observation is useful even when liquidation execution is not yet competitive.
 - The bottleneck is less "can we send a liquidation transaction?" and more "can we know what to send before the winner is visible on-chain?"
 - A wallet-driven shortlist and preloaded state are prerequisites for moving beyond reactive execution.
+- A narrow, wallet-first shortlist is more honest for early race experiments than a broad theoretical universe.
 
 ## Repository Layout
 
@@ -81,6 +89,8 @@ Important variables:
 - `HUNTER_SIGNAL_SECONDARY_RPC_URL`, `HUNTER_SIGNAL_SECONDARY_WS_URL`
 - `ENABLE_HUNTER_SIGNAL_PRIMARY`, `ENABLE_HUNTER_SIGNAL_SECONDARY`
 - `ENABLE_HUNTER_SIGNAL_PRICE_FEED`, `SIGNAL_FEED_WS_URL`
+- `HUNTER_SHORTLIST_ENABLED`, `HUNTER_SHORTLIST_MAX_OBLIGATIONS`
+- `HUNTER_SHORTLIST_REFRESH_SECS`, `HUNTER_SHORTLIST_REFRESH_DEBOUNCE_MS`
 - `AIRTABLE_TOKEN`, `AIRTABLE_BASE_ID`
 - `TARGET_PROTOCOL`
 - `ENABLE_OBSERVER`, `ENABLE_HUNTER`
@@ -95,6 +105,7 @@ Recent runtime notes:
 - the Jito send path includes a bounded retry on clearly recoverable failures such as congestion or expired blockhash
 - hunter traces and signal metrics can be converted into a dated Markdown report for longitudinal comparison
 - RPC variable names are role-based: observer variables configure the observer, hunter variables configure the hunter, and optional hunter secondary signal variables configure only the hunter comparison path
+- the Kamino hunter can maintain a wallet-constrained shortlist seeded by observed liquidation signals, with event-driven refresh plus a safety refresh interval
 
 ## Install
 
@@ -155,6 +166,8 @@ Research traces remain file-based:
 - `HUNTER_SIGNAL_METRICS_FILE`: signal lock and source comparison metrics
 - `LOG_FILE`: raw observer capture
 
+The hunter trace now also records shortlist-specific fields such as whether a signal hit the shortlist and whether prepared context was reused.
+
 Recommended research loop:
 
 ```bash
@@ -179,4 +192,5 @@ Even without proven profitability, Jawas is useful as a documented case study in
 - it separates observation from execution
 - it preserves practical tooling for obligation inspection
 - it makes the "reactive vs proactive" gap explicit
+- it now includes a measured P1 attempt at bridging that gap without pretending the signal problem is already solved
 - it provides a base for further research without pretending the problem is already solved
