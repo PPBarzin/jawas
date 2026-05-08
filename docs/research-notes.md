@@ -42,6 +42,6 @@ The observer mode still creates value:
 
 ## Local Analysis Artifacts
 
-The repository intentionally ignores local folders such as `analysis/` and runtime JSONL traces. They are useful during investigation but should not be treated as stable source code.
+Runtime JSONL traces remain intentionally ignored. The `analysis/` folder, however, may contain tracked Markdown reports when a concrete investigation produces reusable findings or an execution protocol worth preserving.
 
 The archived notes under `docs/specifications/` are kept as design history, not as a promise that the corresponding approach is complete.

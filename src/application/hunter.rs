@@ -703,6 +703,7 @@ struct KaminoReserveMeta {
     switchboard_price_oracle: Option<Pubkey>,
     switchboard_twap_oracle: Option<Pubkey>,
     scope_prices: Option<Pubkey>,
+    token_program: Pubkey,
 }
 
 #[derive(Debug, Clone)]
@@ -1029,14 +1030,51 @@ fn discriminator(name: &str) -> [u8; 8] {
     hash[..8].try_into().unwrap()
 }
 
-fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+fn get_ata_with_program(wallet: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
     Pubkey::find_program_address(
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program,
     )
     .0
+}
+
+fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    get_ata_with_program(wallet, mint, &token_program)
+}
+
+fn build_create_ata_idempotent_ix(
+    funding_address: &Pubkey,
+    wallet_address: &Pubkey,
+    token_mint_address: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata_address = get_ata_with_program(wallet_address, token_mint_address, token_program);
+    Instruction {
+        program_id: Pubkey::from_str(ATA_PROGRAM).unwrap(),
+        accounts: vec![
+            AccountMeta::new(*funding_address, true),
+            AccountMeta::new(ata_address, false),
+            AccountMeta::new_readonly(*wallet_address, false),
+            AccountMeta::new_readonly(*token_mint_address, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1],
+    }
+}
+
+fn kamino_destination_ata_setup_enabled() -> bool {
+    std::env::var("KAMINO_CREATE_DESTINATION_ATAS")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !(value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
 }
 
 fn jito_tip_accounts() -> Vec<Pubkey> {
@@ -1126,6 +1164,7 @@ fn reserve_meta_from_account(data: &[u8]) -> anyhow::Result<KaminoReserveMeta> {
                 .twap_aggregator,
         ),
         scope_prices: optional_pubkey(reserve.config.token_info.scope_configuration.price_feed),
+        token_program: Pubkey::new_from_array(reserve.liquidity.token_program),
     })
 }
 
@@ -2265,8 +2304,35 @@ fn prepared_context_from_resolved_accounts(
         repay_reserve: resolved.repay_reserve.clone(),
         withdraw_reserve: resolved.withdraw_reserve.clone(),
         withdraw_mint: resolved.withdraw_liquidity_mint.clone(),
+        active_reserve_pubkeys: vec![],
         inclusion_reason,
     }
+}
+
+fn active_kamino_reserve_pubkeys(
+    obligation: &crate::domain::kamino::Obligation,
+) -> Vec<String> {
+    let mut reserve_pubkeys = Vec::new();
+
+    for deposit in obligation.deposits.iter() {
+        if deposit.deposited_amount > 0 || deposit.market_value_sf > 0 {
+            let reserve = Pubkey::new_from_array(deposit.deposit_reserve).to_string();
+            if !reserve_pubkeys.contains(&reserve) {
+                reserve_pubkeys.push(reserve);
+            }
+        }
+    }
+
+    for borrow in obligation.borrows.iter() {
+        if borrow.borrowed_amount_sf > 0 || borrow.market_value_sf > 0 {
+            let reserve = Pubkey::new_from_array(borrow.borrow_reserve).to_string();
+            if !reserve_pubkeys.contains(&reserve) {
+                reserve_pubkeys.push(reserve);
+            }
+        }
+    }
+
+    reserve_pubkeys
 }
 
 async fn refresh_kamino_shortlist<R: RpcClient>(
@@ -2305,6 +2371,8 @@ async fn refresh_kamino_shortlist<R: RpcClient>(
                     {
                         candidate.distance_to_liq = None;
                     } else {
+                        candidate.context.active_reserve_pubkeys =
+                            active_kamino_reserve_pubkeys(&obligation_account);
                         candidate.update_refresh(
                             obligation_account.dist_to_liq(),
                             refreshed_at_ms,
@@ -3193,17 +3261,43 @@ where
     let wdr_fee_pk = Pubkey::from_str(wdr_fee_str)?;
 
     let klend_pk = Pubkey::from_str(KLEND_PROGRAM).unwrap();
-    let token_prog_pk = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let farms_pk = Pubkey::from_str(FARMS_PROGRAM).unwrap();
     let tip_account = select_jito_tip_account(&sig)?;
 
     let liquidator = keypair.pubkey();
+    let active_reserve_pubkeys = prepared_context
+        .as_ref()
+        .map(|context| context.active_reserve_pubkeys.clone())
+        .filter(|pubkeys| !pubkeys.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                repay_reserve_pk.to_string(),
+                wdr_reserve_pk.to_string(),
+            ]
+        });
+    let active_reserve_pks = active_reserve_pubkeys
+        .iter()
+        .map(|value| Pubkey::from_str(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let full_refresh_context = !active_reserve_pubkeys.is_empty()
+        && active_reserve_pubkeys.len() > 2;
     let reserve_meta_started_at = Instant::now();
-    let repay_reserve_meta =
-        get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &repay_reserve_pk).await?;
-    let withdraw_reserve_meta =
-        get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, &wdr_reserve_pk).await?;
+    let mut reserve_refresh_order = Vec::with_capacity(active_reserve_pks.len());
+    for reserve_pk in &active_reserve_pks {
+        let reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, reserve_pk).await?;
+        reserve_refresh_order.push((*reserve_pk, reserve_meta));
+    }
     let reserve_meta_ms = reserve_meta_started_at.elapsed().as_millis();
+    let repay_reserve_meta = reserve_refresh_order
+        .iter()
+        .find(|(reserve_pk, _)| *reserve_pk == repay_reserve_pk)
+        .map(|(_, meta)| meta.clone())
+        .ok_or_else(|| anyhow::anyhow!("missing repay reserve metadata"))?;
+    let withdraw_reserve_meta = reserve_refresh_order
+        .iter()
+        .find(|(reserve_pk, _)| *reserve_pk == wdr_reserve_pk)
+        .map(|(_, meta)| meta.clone())
+        .ok_or_else(|| anyhow::anyhow!("missing withdraw reserve metadata"))?;
 
     // ── 7. Build instructions ────────────────────────────────────────────────
     // Compute budget: 350k CU is sufficient for refresh x2 + refresh_obligation + liquidate.
@@ -3218,99 +3312,119 @@ where
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(5_000);
 
-    let mut instructions: Vec<Instruction> = vec![
+    let mut instruction_prefix: Vec<Instruction> = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
         ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
-        ix_refresh_reserve(&klend_pk, &repay_reserve_pk, &repay_reserve_meta),
-        ix_refresh_reserve(&klend_pk, &wdr_reserve_pk, &withdraw_reserve_meta),
-        ix_refresh_obligation(
-            &klend_pk,
-            &market_pk,
-            &obligation_pk,
-            &[&repay_reserve_pk, &wdr_reserve_pk],
-        ),
     ];
+    for (reserve_pk, reserve_meta) in &reserve_refresh_order {
+        instruction_prefix.push(ix_refresh_reserve(&klend_pk, reserve_pk, reserve_meta));
+    }
+    let refresh_obligation_reserve_refs = active_reserve_pks.iter().collect::<Vec<_>>();
+    instruction_prefix.push(ix_refresh_obligation(
+        &klend_pk,
+        &market_pk,
+        &obligation_pk,
+        &refresh_obligation_reserve_refs,
+    ));
+    let user_src =
+        get_ata_with_program(&liquidator, &repay_mint_pk, &repay_reserve_meta.token_program);
+    let user_dst_col = get_ata_with_program(
+        &liquidator,
+        &wdr_col_mint_pk,
+        &withdraw_reserve_meta.token_program,
+    );
+    let user_dst_liq = get_ata_with_program(
+        &liquidator,
+        &wdr_liq_mint_pk,
+        &withdraw_reserve_meta.token_program,
+    );
+    let ata_setup_instructions = if kamino_destination_ata_setup_enabled() {
+        vec![
+            build_create_ata_idempotent_ix(
+                &liquidator,
+                &liquidator,
+                &wdr_col_mint_pk,
+                &withdraw_reserve_meta.token_program,
+            ),
+            build_create_ata_idempotent_ix(
+                &liquidator,
+                &liquidator,
+                &wdr_liq_mint_pk,
+                &withdraw_reserve_meta.token_program,
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
 
     // Liquidate instruction
-    {
-        let disc = discriminator("liquidate_obligation_and_redeem_reserve_collateral_v2");
-        let liquidity_amount = repay_token.max_repay_native;
+    let disc = discriminator("liquidate_obligation_and_redeem_reserve_collateral_v2");
+    let liquidity_amount = repay_token.max_repay_native;
 
-        let mut data = disc.to_vec();
-        data.extend_from_slice(&liquidity_amount.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes()); // minAcceptableReceivedLiquidityAmount
-        data.extend_from_slice(&0u64.to_le_bytes()); // maxAllowedLtvOverridePercent
+    let mut liquidation_data = disc.to_vec();
+    liquidation_data.extend_from_slice(&liquidity_amount.to_le_bytes());
+    liquidation_data.extend_from_slice(&0u64.to_le_bytes()); // minAcceptableReceivedLiquidityAmount
+    liquidation_data.extend_from_slice(&0u64.to_le_bytes()); // maxAllowedLtvOverridePercent
 
-        let user_src = repay_token.source_ata;
-        let user_dst_col = get_ata(&liquidator, &wdr_col_mint_pk);
-        let user_dst_liq = get_ata(&liquidator, &wdr_liq_mint_pk);
-
-        let mut accounts = vec![
-            AccountMeta::new_readonly(liquidator, true),
-            AccountMeta::new(obligation_pk, false),
-            AccountMeta::new_readonly(market_pk, false),
-            AccountMeta::new_readonly(market_auth_pk, false),
-            AccountMeta::new(repay_reserve_pk, false),
-            AccountMeta::new_readonly(repay_mint_pk, false),
-            AccountMeta::new(repay_supply_pk, false),
-            AccountMeta::new(wdr_reserve_pk, false),
-            AccountMeta::new_readonly(wdr_liq_mint_pk, false),
-            AccountMeta::new(wdr_col_mint_pk, false),
-            AccountMeta::new(wdr_col_sup_pk, false),
-            AccountMeta::new(wdr_liq_sup_pk, false),
-            AccountMeta::new(wdr_fee_pk, false),
-            AccountMeta::new(user_src, false),
-            AccountMeta::new(user_dst_col, false),
-            AccountMeta::new(user_dst_liq, false),
-            AccountMeta::new_readonly(token_prog_pk, false), // collateral token program
-            AccountMeta::new_readonly(token_prog_pk, false), // repay liquidity token program
-            AccountMeta::new_readonly(token_prog_pk, false), // withdraw liquidity token program
-            AccountMeta::new_readonly(sysvar::instructions::id(), false),
-        ];
-        if ix_accs.len() >= 25 {
-            for &account_idx in &ix_accs[20..24] {
-                let pk = Pubkey::from_str(
-                    tx_info
-                        .account_keys
-                        .get(account_idx)
-                        .ok_or_else(|| anyhow::anyhow!("missing farm account"))?,
-                )?;
-                accounts.push(AccountMeta::new(pk, false));
-            }
-            let farms_program_idx = *ix_accs
-                .get(24)
-                .ok_or_else(|| anyhow::anyhow!("missing farms program"))?;
-            let farms_program_pk = Pubkey::from_str(
+    let mut liquidation_accounts = vec![
+        AccountMeta::new_readonly(liquidator, true),
+        AccountMeta::new(obligation_pk, false),
+        AccountMeta::new_readonly(market_pk, false),
+        AccountMeta::new_readonly(market_auth_pk, false),
+        AccountMeta::new(repay_reserve_pk, false),
+        AccountMeta::new_readonly(repay_mint_pk, false),
+        AccountMeta::new(repay_supply_pk, false),
+        AccountMeta::new(wdr_reserve_pk, false),
+        AccountMeta::new_readonly(wdr_liq_mint_pk, false),
+        AccountMeta::new(wdr_col_mint_pk, false),
+        AccountMeta::new(wdr_col_sup_pk, false),
+        AccountMeta::new(wdr_liq_sup_pk, false),
+        AccountMeta::new(wdr_fee_pk, false),
+        AccountMeta::new(user_src, false),
+        AccountMeta::new(user_dst_col, false),
+        AccountMeta::new(user_dst_liq, false),
+        AccountMeta::new_readonly(withdraw_reserve_meta.token_program, false),
+        AccountMeta::new_readonly(repay_reserve_meta.token_program, false),
+        AccountMeta::new_readonly(withdraw_reserve_meta.token_program, false),
+        AccountMeta::new_readonly(sysvar::instructions::id(), false),
+    ];
+    if ix_accs.len() >= 25 {
+        for &account_idx in &ix_accs[20..24] {
+            let pk = Pubkey::from_str(
                 tx_info
                     .account_keys
-                    .get(farms_program_idx)
-                    .ok_or_else(|| anyhow::anyhow!("missing farms program key"))?,
+                    .get(account_idx)
+                    .ok_or_else(|| anyhow::anyhow!("missing farm account"))?,
             )?;
-            accounts.push(AccountMeta::new_readonly(farms_program_pk, false));
-        } else {
-            accounts.push(AccountMeta::new(klend_pk, false));
-            accounts.push(AccountMeta::new(klend_pk, false));
-            accounts.push(AccountMeta::new(klend_pk, false));
-            accounts.push(AccountMeta::new(klend_pk, false));
-            accounts.push(AccountMeta::new_readonly(farms_pk, false));
+            liquidation_accounts.push(AccountMeta::new(pk, false));
         }
-
-        instructions.push(Instruction {
-            program_id: klend_pk,
-            accounts,
-            data,
-        });
+        let farms_program_idx = *ix_accs
+            .get(24)
+            .ok_or_else(|| anyhow::anyhow!("missing farms program"))?;
+        let farms_program_pk = Pubkey::from_str(
+            tx_info
+                .account_keys
+                .get(farms_program_idx)
+                .ok_or_else(|| anyhow::anyhow!("missing farms program key"))?,
+        )?;
+        liquidation_accounts.push(AccountMeta::new_readonly(farms_program_pk, false));
+    } else {
+        liquidation_accounts.push(AccountMeta::new(klend_pk, false));
+        liquidation_accounts.push(AccountMeta::new(klend_pk, false));
+        liquidation_accounts.push(AccountMeta::new(klend_pk, false));
+        liquidation_accounts.push(AccountMeta::new(klend_pk, false));
+        liquidation_accounts.push(AccountMeta::new_readonly(farms_pk, false));
     }
+    let liquidation_ix = Instruction {
+        program_id: klend_pk,
+        accounts: liquidation_accounts,
+        data: liquidation_data,
+    };
 
-    // Jito tip (pre-cached)
     let base_tip_lamports = cached_tip.load(Ordering::Relaxed);
-    instructions.push(solana_sdk::system_instruction::transfer(
-        &liquidator,
-        &tip_account,
-        base_tip_lamports,
-    ));
-    let tip_instruction_idx = instructions.len() - 1;
     let max_send_attempts = jito_send_max_attempts();
+    let ata_setup_instruction_count = ata_setup_instructions.len();
+    let max_tx_size_bytes = 1232usize;
     let initial_timing_detail = format_stage_timings(
         tx_fetch_ms,
         resolve_ms,
@@ -3331,12 +3445,15 @@ where
         repay_symbol: Some(repay_token.symbol.clone()),
         reason: None,
         detail: Some(format!(
-            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} {}",
+            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} {}",
             source.as_str(),
             base_tip_lamports,
             tip_account,
             compute_unit_price,
             max_send_attempts,
+            active_reserve_pks.len(),
+            full_refresh_context,
+            ata_setup_instruction_count,
             initial_timing_detail
         )),
         ws_received_at_ms: Some(ws_received_at_ms),
@@ -3358,38 +3475,79 @@ where
         Some(liquidator.to_string()),
         Some(repay_token),
         Some(format!(
-            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} {}",
+            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} {}",
             source.as_str(),
             base_tip_lamports,
             tip_account,
             compute_unit_price,
             max_send_attempts,
+            active_reserve_pks.len(),
+            full_refresh_context,
+            ata_setup_instruction_count,
             initial_timing_detail
         )),
         Some(elapsed_ms_since(ws_received_at_ms)),
     )
     .await;
     log_stderr(format!(
-        "[hunter-kamino] FIRING | source={} obligation={} repay={} tip={} cu_price={} max_attempts={}",
+        "[hunter-kamino] FIRING | source={} obligation={} repay={} tip={} cu_price={} max_attempts={} reserves={} full_refresh={} ata_setup={}",
         source.as_str(),
         &obligation_str[..8],
         repay_token.symbol,
         base_tip_lamports,
         compute_unit_price,
-        max_send_attempts
+        max_send_attempts,
+        active_reserve_pks.len(),
+        full_refresh_context,
+        ata_setup_instruction_count
     ));
+
+    let build_attempt_tx = |blockhash, tip_lamports| -> anyhow::Result<(VersionedTransaction, usize, bool)> {
+        let mut attempt_instructions = instruction_prefix.clone();
+        attempt_instructions.extend(ata_setup_instructions.clone());
+        attempt_instructions.push(liquidation_ix.clone());
+        attempt_instructions.push(solana_sdk::system_instruction::transfer(
+            &liquidator,
+            &tip_account,
+            tip_lamports,
+        ));
+
+        let message = Message::try_compile(&liquidator, &attempt_instructions, &[], blockhash)
+            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
+        let mut tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
+            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let mut tx_bytes = bincode::serialize(&tx)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let mut ata_setup_dropped_for_size = false;
+
+        if ata_setup_instruction_count > 0 && tx_bytes > max_tx_size_bytes {
+            ata_setup_dropped_for_size = true;
+            let mut fallback_instructions = instruction_prefix.clone();
+            fallback_instructions.push(liquidation_ix.clone());
+            fallback_instructions.push(solana_sdk::system_instruction::transfer(
+                &liquidator,
+                &tip_account,
+                tip_lamports,
+            ));
+            let message = Message::try_compile(&liquidator, &fallback_instructions, &[], blockhash)
+                .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
+            tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
+                .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+            tx_bytes = bincode::serialize(&tx)
+                .map(|bytes| bytes.len())
+                .unwrap_or_default();
+        }
+
+        Ok((tx, tx_bytes, ata_setup_dropped_for_size))
+    };
 
     if hunter_dry_run_enabled() {
         let dry_run_blockhash = *cached_blockhash.read().await;
         let build_started_at = Instant::now();
-        let message = Message::try_compile(&liquidator, &instructions, &[], dry_run_blockhash)
-            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let (_tx, tx_bytes, ata_setup_dropped_for_size) =
+            build_attempt_tx(dry_run_blockhash, base_tip_lamports)?;
         let build_ms = build_started_at.elapsed().as_millis();
-        let tx_bytes = bincode::serialize(&tx)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
         trace_logger.log(HunterTraceEvent {
             timestamp: crate::utils::utc_now(),
             protocol: "kamino",
@@ -3400,12 +3558,16 @@ where
             repay_symbol: Some(repay_token.symbol.clone()),
             reason: Some("dry_run_enabled".to_string()),
             detail: Some(format!(
-                "source={} tx_size_bytes={} tip={} cu_price={} attempt=1/{} {}",
+                "source={} tx_size_bytes={} tip={} cu_price={} attempt=1/{} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {}",
                 source.as_str(),
                 tx_bytes,
                 base_tip_lamports,
                 compute_unit_price,
                 max_send_attempts,
+                active_reserve_pks.len(),
+                full_refresh_context,
+                ata_setup_instruction_count,
+                ata_setup_dropped_for_size,
                 format_stage_timings(
                     tx_fetch_ms,
                     resolve_ms,
@@ -3426,18 +3588,20 @@ where
             refresh_reason: refresh_reason.clone(),
         });
         log_stderr(format!(
-            "[hunter-kamino] DRY RUN | obligation={} repay={} tx_size={}",
+            "[hunter-kamino] DRY RUN | obligation={} repay={} tx_size={} reserves={} full_refresh={} ata_setup={} ata_dropped={}",
             &obligation_str[..8],
             repay_token.symbol,
-            tx_bytes
+            tx_bytes,
+            active_reserve_pks.len(),
+            full_refresh_context,
+            ata_setup_instruction_count,
+            ata_setup_dropped_for_size
         ));
         return Ok(KaminoExecutionOutcome::DryRun);
     }
 
     for attempt in 1..=max_send_attempts {
         let tip_lamports = retry_tip_lamports(base_tip_lamports, attempt);
-        instructions[tip_instruction_idx] =
-            solana_sdk::system_instruction::transfer(&liquidator, &tip_account, tip_lamports);
 
         let blockhash = if attempt == 1 {
             *cached_blockhash.read().await
@@ -3452,10 +3616,8 @@ where
         };
 
         let build_started_at = Instant::now();
-        let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
-            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+        let (tx, tx_bytes, ata_setup_dropped_for_size) =
+            build_attempt_tx(blockhash, tip_lamports)?;
         let build_ms = build_started_at.elapsed().as_millis();
 
         let send_started_at = Instant::now();
@@ -3463,10 +3625,15 @@ where
             Ok(bundle_id) => {
                 let send_bundle_ms = send_started_at.elapsed().as_millis();
                 let bundle_detail = format!(
-                    "attempt={}/{} tip={} {}",
+                    "attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {}",
                     attempt,
                     max_send_attempts,
                     tip_lamports,
+                    tx_bytes,
+                    active_reserve_pks.len(),
+                    full_refresh_context,
+                    ata_setup_instruction_count,
+                    ata_setup_dropped_for_size,
                     format_stage_timings(
                         tx_fetch_ms,
                         resolve_ms,
@@ -3513,12 +3680,17 @@ where
                 )
                 .await;
                 log_stderr(format!(
-                    "[hunter-kamino] BUNDLE SENT | source={} obligation={} bundle={} attempt={}/{}",
+                    "[hunter-kamino] BUNDLE SENT | source={} obligation={} bundle={} attempt={}/{} tx_size={} reserves={} full_refresh={} ata_setup={} ata_dropped={}",
                     source.as_str(),
                     &obligation_str[..8],
                     &bundle_id[..12.min(bundle_id.len())],
                     attempt,
-                    max_send_attempts
+                    max_send_attempts,
+                    tx_bytes,
+                    active_reserve_pks.len(),
+                    full_refresh_context,
+                    ata_setup_instruction_count,
+                    ata_setup_dropped_for_size
                 ));
                 return Ok(KaminoExecutionOutcome::BundleSent);
             }
@@ -3526,10 +3698,15 @@ where
                 let send_bundle_ms = send_started_at.elapsed().as_millis();
                 let error_message = error.to_string();
                 let bundle_detail = format!(
-                    "attempt={}/{} tip={} {} | {}",
+                    "attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {} | {}",
                     attempt,
                     max_send_attempts,
                     tip_lamports,
+                    tx_bytes,
+                    active_reserve_pks.len(),
+                    full_refresh_context,
+                    ata_setup_instruction_count,
+                    ata_setup_dropped_for_size,
                     error_message,
                     format_stage_timings(
                         tx_fetch_ms,

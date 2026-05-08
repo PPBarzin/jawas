@@ -69,6 +69,8 @@ docs/
   research-notes.md      current findings and open questions
   specifications/        archived design notes from the exploration
   reference/             protocol reference material used during research
+analysis/
+  *.md                   dated local research and validation reports
 ```
 
 ## Requirements
@@ -153,8 +155,38 @@ cargo run --bin inspect_kamino_obligation -- <OBLIGATION_PUBKEY>
 cargo run --bin inspect_solend_obligation -- <OBLIGATION_PUBKEY>
 cargo run --bin generate_weekly_token_report
 cargo run --bin generate_hunter_report
+cargo run --bin select_kamino_candidates -- 2026-05-08T07-46_export.csv --single-borrow-only
 cargo run --bin liquidate_one -- <OBLIGATION_PUBKEY> --dry-run
 ```
+
+## Kamino Liquidation Probe
+
+`liquidate_one` is an experimental single-obligation probe used to validate the transaction chain one link at a time. It is not a batch liquidator and should be used manually on one candidate obligation per run.
+
+`select_kamino_candidates` is the companion selector used to scan a Kamino Risk CSV export locally, keep only obligations whose borrow tokens are covered by `wallet.toml`, and optionally filter them against RPC so stale or already-closed obligations are discarded before the probe. It never sends a transaction.
+
+Recommended workflow:
+
+1. Scan a CSV export and shortlist candidates that match the current wallet coverage.
+2. Pick one obligation and run `simulate` to confirm it is still non-healthy on-chain and inspect runtime logs.
+3. If simulation succeeds, run `rpc` to prove that a real transaction can leave the wallet and confirm on-chain.
+4. Only after that use `jito` to compare block-engine behavior.
+
+Examples:
+
+```bash
+cargo run --bin select_kamino_candidates -- 2026-05-08T07-46_export.csv --single-borrow-only --borrow-symbol USDC
+cargo run --bin select_kamino_candidates -- 2026-05-08T07-46_export.csv --liquidatable-only
+cargo run --bin liquidate_one -- <OBLIGATION_PUBKEY> --mode simulate
+cargo run --bin liquidate_one -- <OBLIGATION_PUBKEY> --mode rpc
+cargo run --bin liquidate_one -- <OBLIGATION_PUBKEY> --mode jito
+```
+
+Important:
+
+- the probe stops before sending if the obligation is healthy or otherwise non-liquidatable on-chain
+- `bundle_id` from `sendBundle` proves Jito API acceptance only, not on-chain inclusion
+- the goal is transaction-path validation, not profitable liquidation execution
 
 ## Logging
 
@@ -175,7 +207,7 @@ cargo run --bin jawas
 cargo run --bin generate_hunter_report
 ```
 
-This produces a dated file under `docs/analysis/` that can be compared across runs.
+This produces a dated file under `analysis/` that can be compared across runs.
 
 ## Safety and Disclaimers
 

@@ -28,6 +28,7 @@ pub struct PreparedExecutionContext {
     pub repay_reserve: String,
     pub withdraw_reserve: String,
     pub withdraw_mint: String,
+    pub active_reserve_pubkeys: Vec<String>,
     pub inclusion_reason: String,
 }
 
@@ -191,6 +192,7 @@ mod tests {
             repay_reserve: "repay-reserve".to_string(),
             withdraw_reserve: "withdraw-reserve".to_string(),
             withdraw_mint: "withdraw-mint".to_string(),
+            active_reserve_pubkeys: vec![],
             inclusion_reason: "observed_liquidation".to_string(),
         }
     }

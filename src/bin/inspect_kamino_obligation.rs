@@ -13,6 +13,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     message::Message,
+    signature::{read_keypair_file, Keypair, Signer},
     transaction::Transaction,
 };
 use std::collections::BTreeSet;
@@ -199,6 +200,14 @@ fn is_default_pubkey(bytes: &[u8; 32]) -> bool {
     bytes.iter().all(|b| *b == 0)
 }
 
+fn optional_or_placeholder(bytes: &[u8; 32], placeholder: &Pubkey) -> Pubkey {
+    if is_default_pubkey(bytes) {
+        *placeholder
+    } else {
+        Pubkey::new_from_array(*bytes)
+    }
+}
+
 fn decode_anchor_account<T: BorshDeserialize>(data: &[u8]) -> Result<T> {
     if data.len() < 8 {
         anyhow::bail!("Compte trop petit pour contenir un discriminator Anchor");
@@ -213,51 +222,39 @@ fn ix_refresh_reserve(
     reserve_pk: &Pubkey,
     reserve: &Reserve,
 ) -> Instruction {
-    let mut accounts = vec![
-        AccountMeta::new(*reserve_pk, false),
-        AccountMeta::new_readonly(*market, false),
-    ];
-
-    let pyth = Pubkey::new_from_array(reserve.config.token_info.pyth_configuration.price);
-    let sb_price = Pubkey::new_from_array(
-        reserve
+    let pyth = optional_or_placeholder(
+        &reserve.config.token_info.pyth_configuration.price,
+        klend,
+    );
+    let sb_price = optional_or_placeholder(
+        &reserve
             .config
             .token_info
             .switchboard_configuration
             .price_aggregator,
+        klend,
     );
-    let sb_twap = Pubkey::new_from_array(
-        reserve
+    let sb_twap = optional_or_placeholder(
+        &reserve
             .config
             .token_info
             .switchboard_configuration
             .twap_aggregator,
+        klend,
     );
-    let scope = Pubkey::new_from_array(reserve.config.token_info.scope_configuration.price_feed);
+    let scope = optional_or_placeholder(
+        &reserve.config.token_info.scope_configuration.price_feed,
+        klend,
+    );
 
-    let has_any_optional = !is_default_pubkey(&reserve.config.token_info.pyth_configuration.price)
-        || !is_default_pubkey(
-            &reserve
-                .config
-                .token_info
-                .switchboard_configuration
-                .price_aggregator,
-        )
-        || !is_default_pubkey(
-            &reserve
-                .config
-                .token_info
-                .switchboard_configuration
-                .twap_aggregator,
-        )
-        || !is_default_pubkey(&reserve.config.token_info.scope_configuration.price_feed);
-
-    if has_any_optional {
-        accounts.push(AccountMeta::new_readonly(pyth, false));
-        accounts.push(AccountMeta::new_readonly(sb_price, false));
-        accounts.push(AccountMeta::new_readonly(sb_twap, false));
-        accounts.push(AccountMeta::new_readonly(scope, false));
-    }
+    let accounts = vec![
+        AccountMeta::new(*reserve_pk, false),
+        AccountMeta::new_readonly(*market, false),
+        AccountMeta::new_readonly(pyth, false),
+        AccountMeta::new_readonly(sb_price, false),
+        AccountMeta::new_readonly(sb_twap, false),
+        AccountMeta::new_readonly(scope, false),
+    ];
 
     Instruction {
         program_id: *klend,
@@ -277,7 +274,7 @@ fn ix_refresh_obligation(
         AccountMeta::new(*obligation_pk, false),
     ];
     for reserve_pk in reserve_pks {
-        accounts.push(AccountMeta::new_readonly(*reserve_pk, false));
+        accounts.push(AccountMeta::new(*reserve_pk, false));
     }
     Instruction {
         program_id: *klend,
@@ -440,14 +437,21 @@ async fn main() -> Result<()> {
         &reserve_pks,
     ));
 
-    let message = Message::new(&refresh_ixs, None);
-    let tx = Transaction::new_unsigned(message);
+    let payer = if let Ok(path) = std::env::var("SOLANA_KEYPAIR_PATH") {
+        read_keypair_file(&path)
+            .map_err(|error| anyhow::anyhow!("failed to read keypair from {path}: {error}"))?
+    } else {
+        Keypair::new()
+    };
+    let recent_blockhash = rpc.get_latest_blockhash()?;
+    let message = Message::new(&refresh_ixs, Some(&payer.pubkey()));
+    let tx = Transaction::new(&[&payer], message, recent_blockhash);
 
     let sim = rpc.simulate_transaction_with_config(
         &tx,
         RpcSimulateTransactionConfig {
             sig_verify: false,
-            replace_recent_blockhash: true,
+            replace_recent_blockhash: false,
             accounts: Some(RpcSimulateTransactionAccountsConfig {
                 encoding: Some(UiAccountEncoding::Base64),
                 addresses: vec![pubkey.to_string()],
