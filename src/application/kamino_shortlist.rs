@@ -55,6 +55,35 @@ pub struct ShortlistEntry {
     pub refresh_reason: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct KaminoShortlistRuntime {
+    pub candidates: HashMap<String, ShortlistCandidate>,
+    pub active: HashMap<String, ShortlistEntry>,
+    pub last_refresh_requested_at_ms: Option<u64>,
+    pub last_refresh_completed_at_ms: Option<u64>,
+}
+
+impl KaminoShortlistRuntime {
+    pub fn new() -> Self {
+        Self {
+            candidates: HashMap::new(),
+            active: HashMap::new(),
+            last_refresh_requested_at_ms: None,
+            last_refresh_completed_at_ms: None,
+        }
+    }
+
+    pub fn shortlist_entry(&self, obligation: &str) -> Option<ShortlistEntry> {
+        self.active.get(obligation).cloned()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KaminoShortlistRefreshRequest {
+    pub reason: String,
+    pub prioritize_obligation: Option<String>,
+}
+
 impl ShortlistCandidate {
     pub fn new(context: PreparedExecutionContext, observed_at_ms: u64) -> Self {
         Self {

@@ -37,3 +37,9 @@ symbol   = "bSOL"
 mint     = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"
 decimals = 9
 max_repay_native = 290_000_000   # 0.29 bSOL
+
+[[tokens]]
+symbol   = "ETH"
+mint     = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
+decimals = 8
+max_repay_native = 700_000       # 0.007 ETH

@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
 use borsh::BorshDeserialize;
+use jawas::config::wallet::{WalletToken, load_wallet_tokens};
+use jawas::domain::protocol::KAMINO_PROGRAM_ID;
 use jawas::domain::{kamino::Obligation, token::token_info};
 use jawas::infrastructure::jito::JitoAdapter;
 use jawas::ports::jito::JitoPort;
@@ -21,10 +23,8 @@ use solana_sdk::{
 };
 use std::{str::FromStr, time::Duration};
 
-const KLEND_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const LENDING_MARKET: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
 const MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const DEFAULT_TIP_ACCOUNT: &str = "96g9sAg9u3P7Q9ebKsC6SA47cySvnV6S1S1K6ssB1vD";
 
@@ -264,14 +264,6 @@ struct ReserveAccount {
 }
 
 #[derive(Debug, Clone)]
-struct WalletToken {
-    symbol: String,
-    mint: String,
-    decimals: u8,
-    max_repay_native: u64,
-}
-
-#[derive(Debug, Clone)]
 struct TransactionPlan {
     tx: VersionedTransaction,
     repay_token_symbol: String,
@@ -287,7 +279,7 @@ fn discriminator(name: &str) -> [u8; 8] {
 }
 
 fn get_ata(wallet: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-    let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
+    let ata_program = Pubkey::from_str(ATA_PROGRAM).expect("static constant ATA_PROGRAM");
     Pubkey::find_program_address(
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program,
@@ -303,7 +295,7 @@ fn build_create_ata_idempotent_ix(
 ) -> Instruction {
     let ata_address = get_ata(wallet_address, token_mint_address, token_program);
     Instruction {
-        program_id: Pubkey::from_str(ATA_PROGRAM).unwrap(),
+        program_id: Pubkey::from_str(ATA_PROGRAM).expect("static constant ATA_PROGRAM"),
         accounts: vec![
             AccountMeta::new(*funding_address, true),
             AccountMeta::new(ata_address, false),
@@ -427,81 +419,28 @@ Options:
     );
 }
 
-fn load_wallet_tokens(path: &str) -> Vec<WalletToken> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return vec![],
-    };
+fn active_reserve_pubkeys_in_refresh_order(obligation: &Obligation) -> Vec<Pubkey> {
+    let mut reserve_pks = Vec::new();
 
-    let mut tokens = Vec::new();
-    let mut current: Option<(String, String, u8, u64)> = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "[[tokens]]" {
-            if let Some((symbol, mint, decimals, max_repay_native)) = current.take() {
-                tokens.push(WalletToken {
-                    symbol,
-                    mint,
-                    decimals,
-                    max_repay_native,
-                });
-            }
-            current = Some((String::new(), String::new(), 6, 0));
-            continue;
-        }
-        if let Some(ref mut token) = current {
-            if let Some(value) = parse_toml_str(line, "symbol") {
-                token.0 = value;
-            }
-            if let Some(value) = parse_toml_str(line, "mint") {
-                token.1 = value;
-            }
-            if let Some(value) = parse_toml_u8(line, "decimals") {
-                token.2 = value;
-            }
-            if let Some(value) = parse_toml_u64(line, "max_repay_native") {
-                token.3 = value;
+    for deposit in obligation.deposits.iter() {
+        if deposit.deposited_amount > 0 || deposit.market_value_sf > 0 {
+            let reserve_pk = Pubkey::new_from_array(deposit.deposit_reserve);
+            if !reserve_pks.contains(&reserve_pk) {
+                reserve_pks.push(reserve_pk);
             }
         }
     }
 
-    if let Some((symbol, mint, decimals, max_repay_native)) = current.take() {
-        tokens.push(WalletToken {
-            symbol,
-            mint,
-            decimals,
-            max_repay_native,
-        });
+    for borrow in obligation.borrows.iter() {
+        if borrow.borrowed_amount_sf > 0 || borrow.market_value_sf > 0 {
+            let reserve_pk = Pubkey::new_from_array(borrow.borrow_reserve);
+            if !reserve_pks.contains(&reserve_pk) {
+                reserve_pks.push(reserve_pk);
+            }
+        }
     }
 
-    tokens
-}
-
-fn parse_toml_str(line: &str, key: &str) -> Option<String> {
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    Some(rhs.trim().trim_matches('"').to_string())
-}
-
-fn parse_toml_u8(line: &str, key: &str) -> Option<u8> {
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    rhs.trim().parse().ok()
-}
-
-fn parse_toml_u64(line: &str, key: &str) -> Option<u64> {
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    let clean: String = rhs.trim().chars().filter(|&c| c != '_').collect();
-    let clean = clean.split('#').next().unwrap_or("").trim();
-    clean.parse().ok()
+    reserve_pks
 }
 
 fn fetch_reserve_metadata(rpc: &RpcClient, reserve_pk: &Pubkey) -> Result<ReserveInfo> {
@@ -601,56 +540,56 @@ fn build_transaction(
         .iter()
         .find(|deposit| deposit.deposited_amount > 0)
         .context("no active deposit found in obligation")?;
-    let borrow = obligation
-        .borrows
-        .iter()
-        .find(|borrow| borrow.borrowed_amount_sf > 0)
-        .context("no active borrow found in obligation")?;
-
-    let repay_reserve_pk = Pubkey::new_from_array(borrow.borrow_reserve);
     let withdraw_reserve_pk = Pubkey::new_from_array(deposit.deposit_reserve);
-    let mut obligation_reserve_pks = Vec::new();
-    for deposit in obligation.deposits.iter() {
-        if deposit.deposited_amount > 0 || deposit.market_value_sf > 0 {
-            let reserve_pk = Pubkey::new_from_array(deposit.deposit_reserve);
-            if !obligation_reserve_pks.contains(&reserve_pk) {
-                obligation_reserve_pks.push(reserve_pk);
-            }
-        }
-    }
-    for borrow in obligation.borrows.iter() {
-        if borrow.borrowed_amount_sf > 0 || borrow.market_value_sf > 0 {
-            let reserve_pk = Pubkey::new_from_array(borrow.borrow_reserve);
-            if !obligation_reserve_pks.contains(&reserve_pk) {
-                obligation_reserve_pks.push(reserve_pk);
-            }
-        }
-    }
-
-    let repay_info = fetch_reserve_metadata(rpc, &repay_reserve_pk)?;
+    let obligation_reserve_pks = active_reserve_pubkeys_in_refresh_order(obligation);
     let withdraw_info = fetch_reserve_metadata(rpc, &withdraw_reserve_pk)?;
     let obligation_reserve_infos = obligation_reserve_pks
         .iter()
         .map(|reserve_pk| fetch_reserve_metadata(rpc, reserve_pk))
         .collect::<Result<Vec<_>>>()?;
-    let repay_mint = repay_info.liquidity_mint.to_string();
-    let Some(wallet_token) = wallet_tokens.iter().find(|token| token.mint == repay_mint) else {
-        bail!("repay mint {repay_mint} is not covered by wallet.toml");
-    };
-    if wallet_token.max_repay_native == 0 {
-        bail!(
-            "repay mint {} ({}) is configured with max_repay_native=0 in wallet.toml",
-            wallet_token.symbol,
-            wallet_token.mint
-        );
+    let mut covered_borrows = Vec::new();
+    let mut uncovered_mints = Vec::new();
+    for borrow in obligation
+        .borrows
+        .iter()
+        .filter(|borrow| borrow.borrowed_amount_sf > 0 || borrow.market_value_sf > 0)
+    {
+        let repay_reserve_pk = Pubkey::new_from_array(borrow.borrow_reserve);
+        let repay_info = fetch_reserve_metadata(rpc, &repay_reserve_pk)?;
+        let repay_mint = repay_info.liquidity_mint.to_string();
+        let Some(wallet_token) = wallet_tokens.iter().find(|token| token.mint == repay_mint) else {
+            uncovered_mints.push(repay_mint);
+            continue;
+        };
+        if wallet_token.max_repay_native == 0 {
+            uncovered_mints.push(format!(
+                "{} ({}) configured with max_repay_native=0",
+                wallet_token.symbol, wallet_token.mint
+            ));
+            continue;
+        }
+        covered_borrows.push((borrow, repay_info, wallet_token));
     }
+    let Some((_borrow, repay_info, wallet_token)) = covered_borrows
+        .into_iter()
+        .max_by_key(|(borrow, _, _)| borrow.market_value_sf.max(borrow.borrowed_amount_sf))
+    else {
+        if uncovered_mints.is_empty() {
+            bail!("no active borrow found in obligation");
+        }
+        bail!(
+            "no active borrow is covered by wallet.toml; observed repay mints: {}",
+            uncovered_mints.join(", ")
+        );
+    };
+
     let effective_repay_native = if cli.repay_native == u64::MAX {
         wallet_token.max_repay_native
     } else {
         cli.repay_native.min(wallet_token.max_repay_native)
     };
 
-    let klend_pk = Pubkey::from_str(KLEND_PROGRAM)?;
+    let klend_pk = Pubkey::from_str(KAMINO_PROGRAM_ID)?;
     let market_pk = Pubkey::from_str(LENDING_MARKET)?;
     let market_authority_pk = Pubkey::from_str(MARKET_AUTHORITY)?;
     let mut instructions = vec![
@@ -847,16 +786,16 @@ async fn main() -> Result<()> {
     println!("  cu_price          : {}", cli.cu_price);
     println!("  wallet_toml       : {}", wallet_toml_path);
 
-    let wallet_tokens = load_wallet_tokens(&wallet_toml_path);
+    let wallet_tokens = load_wallet_tokens(&wallet_toml_path)?;
     println!("  wallet_tokens     : {}", wallet_tokens.len());
 
     let obligation = load_obligation(&rpc, &cli.obligation)?;
     print_obligation_summary(&obligation);
 
     if !obligation.is_liquidatable() {
-        println!("Obligation is healthy or not liquidatable on-chain. Stopping before simulation/send.");
-        print_status(ProbeStatus::StoppedHealthyBeforeSend);
-        return Ok(());
+        println!(
+            "Raw obligation snapshot is not liquidatable. Continuing anyway so refresh + simulation can decide."
+        );
     }
 
     let blockhash = rpc.get_latest_blockhash().context("failed to fetch latest blockhash")?;
@@ -901,6 +840,20 @@ async fn main() -> Result<()> {
     print_simulation(&simulation);
 
     if simulation.err.is_some() {
+        if simulation
+            .logs
+            .as_ref()
+            .map(|logs| {
+                logs.iter().any(|line| {
+                    line.contains("ObligationHealthy") || line.contains("healthy or not liquidatable")
+                })
+            })
+            .unwrap_or(false)
+        {
+            println!("Simulation shows the obligation is still healthy after refresh.");
+            print_status(ProbeStatus::StoppedHealthyBeforeSend);
+            return Ok(());
+        }
         println!("Aborting send because simulation failed.");
         print_status(ProbeStatus::SimulationFailed);
         return Ok(());

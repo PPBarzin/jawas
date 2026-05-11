@@ -11,53 +11,31 @@ use crate::ports::config::ConfigPort;
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 
 #[derive(Clone)]
-pub struct AirtableAdapter {
-    tx: mpsc::Sender<ObservationEvent>,
+pub struct AirtableWhitelistAdapter {
     api_token: Arc<String>,
     base_id: Arc<String>,
     client: Client,
 }
 
-impl AirtableAdapter {
-    pub fn new(api_token: String, base_id: String, table_watch: String) -> Self {
-        let (tx, mut rx) = mpsc::channel::<ObservationEvent>(100);
-        let client = Client::new();
-        let api_token_arc = Arc::new(api_token.clone());
-        let base_id_arc = Arc::new(base_id.clone());
-        let table_watch_arc = Arc::new(table_watch);
+#[derive(Clone)]
+pub struct AirtableLoggerAdapter {
+    tx: mpsc::Sender<ObservationEvent>,
+}
 
-        // Spawn background worker for batching
-        let worker_client = client.clone();
-        let worker_token = api_token_arc.clone();
-        let worker_base = base_id_arc.clone();
-        tokio::spawn(async move {
-            let mut buffer = Vec::with_capacity(10);
-            let mut last_flush = tokio::time::Instant::now();
+pub struct AirtableLoggerWorker {
+    rx: mpsc::Receiver<ObservationEvent>,
+    client: Client,
+    api_token: Arc<String>,
+    base_id: Arc<String>,
+    table_watch: Arc<String>,
+}
 
-            loop {
-                tokio::select! {
-                    Some(event) = rx.recv() => {
-                        buffer.push(event);
-                        if buffer.len() >= 10 {
-                            let _ = flush_batch(&worker_client, &worker_token, &worker_base, &table_watch_arc, &mut buffer).await;
-                            last_flush = tokio::time::Instant::now();
-                        }
-                    }
-                    _ = sleep(Duration::from_secs(30)) => {
-                        if !buffer.is_empty() && last_flush.elapsed() >= Duration::from_secs(30) {
-                            let _ = flush_batch(&worker_client, &worker_token, &worker_base, &table_watch_arc, &mut buffer).await;
-                            last_flush = tokio::time::Instant::now();
-                        }
-                    }
-                }
-            }
-        });
-
+impl AirtableWhitelistAdapter {
+    pub fn new(api_token: String, base_id: String) -> Self {
         Self {
-            tx,
-            api_token: api_token_arc,
-            base_id: base_id_arc,
-            client,
+            api_token: Arc::new(api_token),
+            base_id: Arc::new(base_id),
+            client: Client::new(),
         }
     }
 
@@ -98,8 +76,58 @@ impl AirtableAdapter {
     }
 }
 
+impl AirtableLoggerAdapter {
+    pub fn new(
+        api_token: String,
+        base_id: String,
+        table_watch: String,
+    ) -> (Self, AirtableLoggerWorker) {
+        let (tx, rx) = mpsc::channel::<ObservationEvent>(100);
+        let client = Client::new();
+        let api_token_arc = Arc::new(api_token.clone());
+        let base_id_arc = Arc::new(base_id.clone());
+        let table_watch_arc = Arc::new(table_watch);
+
+        (
+            Self { tx },
+            AirtableLoggerWorker {
+                rx,
+                client,
+                api_token: api_token_arc,
+                base_id: base_id_arc,
+                table_watch: table_watch_arc,
+            },
+        )
+    }
+}
+
+impl AirtableLoggerWorker {
+    pub async fn run(mut self) {
+        let mut buffer = Vec::with_capacity(10);
+        let mut last_flush = tokio::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                Some(event) = self.rx.recv() => {
+                    buffer.push(event);
+                    if buffer.len() >= 10 {
+                        let _ = flush_batch(&self.client, &self.api_token, &self.base_id, &self.table_watch, &mut buffer).await;
+                        last_flush = tokio::time::Instant::now();
+                    }
+                }
+                _ = sleep(Duration::from_secs(30)) => {
+                    if !buffer.is_empty() && last_flush.elapsed() >= Duration::from_secs(30) {
+                        let _ = flush_batch(&self.client, &self.api_token, &self.base_id, &self.table_watch, &mut buffer).await;
+                        last_flush = tokio::time::Instant::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
-impl ConfigPort for AirtableAdapter {
+impl ConfigPort for AirtableWhitelistAdapter {
     async fn fetch_whitelist(&self) -> Result<Vec<String>> {
         self.fetch_whitelist_internal().await
     }
@@ -304,7 +332,7 @@ async fn fetch_existing_event_keys(
 }
 
 #[async_trait]
-impl LiquidationLogger for AirtableAdapter {
+impl LiquidationLogger for AirtableLoggerAdapter {
     async fn log_observation(&self, event: &ObservationEvent) -> Result<()> {
         self.tx
             .send(event.clone())

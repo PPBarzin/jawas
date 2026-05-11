@@ -1,5 +1,6 @@
 // Phase 1: Observes liquidations executed by other bots on Kamino.
 
+use crate::domain::protocol::{KAMINO_PROGRAM_ID, Protocol, SOLEND_PROGRAM_ID};
 use crate::domain::token::{native_to_human, token_info, token_mint_by_symbol};
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
@@ -8,33 +9,9 @@ use crate::utils::{log_stderr, log_stdout, utc_now};
 use std::collections::VecDeque;
 use std::io::Write;
 
-const KAMINO_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 const LIQUIDATE_FILTER: &str = "Liquidate";
 const RPC_TIMEOUT_SECONDS: u64 = 120;
 const COMPETING_BOTS_WINDOW_MS: u64 = 30_000;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Protocol {
-    Kamino,
-    Solend,
-}
-
-impl Protocol {
-    pub fn program_id(&self) -> &'static str {
-        match self {
-            Protocol::Kamino => KAMINO_PROGRAM_ID,
-            Protocol::Solend => SOLEND_PROGRAM_ID,
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Protocol::Kamino => "Kamino",
-            Protocol::Solend => "Solend",
-        }
-    }
-}
 
 /// Represents a failed liquidation attempt observed on-chain.
 /// Used to estimate competition for successful liquidations.

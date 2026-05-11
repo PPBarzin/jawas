@@ -1,4 +1,4 @@
-use crate::application::hunter::{load_wallet_tokens, WalletToken};
+use crate::config::wallet::{WalletToken, load_wallet_tokens};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -443,7 +443,7 @@ pub fn report_file_date() -> String {
 }
 
 pub fn load_wallet_or_default(path: &str) -> Vec<WalletToken> {
-    load_wallet_tokens(path)
+    load_wallet_tokens(path).unwrap_or_default()
 }
 
 fn metric_time_bounds(metrics: &[SignalMetricEntry]) -> Option<(u64, u64)> {

@@ -83,6 +83,10 @@ pub fn token_info(mint_or_reserve: &str) -> Option<TokenInfo> {
             symbol: "tBTC",
             decimals: 8,
         }),
+        "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs" => Some(TokenInfo {
+            symbol: "ETH",
+            decimals: 8,
+        }),
         "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH" => Some(TokenInfo {
             symbol: "USDG",
             decimals: 6,

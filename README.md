@@ -25,6 +25,7 @@ For Kamino, the current P1 direction is now explicit in the runtime:
 - observed liquidation signals can seed a small proactive shortlist
 - only obligations whose `repay mint` is already in the wallet are eligible
 - firing stays reactive, but preparation is moved out of the hottest part of the path where possible
+- the hunter now refreshes all known active reserves before firing and builds Kamino token accounts from reserve-derived token programs rather than assuming a fixed SPL layout
 
 The repository also includes analysis tooling to turn raw JSONL traces into dated research reports. This is used to quantify:
 
@@ -40,6 +41,7 @@ The public value of the project is not "a profitable bot". The value is the inst
 - The hunter is still mostly reactive and therefore frequently second in competitive situations.
 - Some execution paths still depend on post-factum transaction reads, which is structurally slower than a pre-computed strategy.
 - The new shortlist logic does not remove the structural dependence on signal timing from Helius or comparable sources.
+- Some Kamino candidates still look liquidatable in a stale snapshot or CSV export and become healthy again once all reserves are refreshed in the actual transaction path.
 - `bundle_sent` is not equivalent to a confirmed liquidation win. It only means the Jito endpoint accepted the bundle submission.
 - Wallet coverage is intentionally narrow, so some observed opportunities are skipped by design.
 - Profitability is not demonstrated and should not be assumed.
@@ -199,6 +201,14 @@ Research traces remain file-based:
 - `LOG_FILE`: raw observer capture
 
 The hunter trace now also records shortlist-specific fields such as whether a signal hit the shortlist and whether prepared context was reused.
+
+For Kamino shots, the trace now also exposes execution-shape fields such as:
+
+- `active_reserve_count`
+- `full_refresh_context`
+- `tx_size_bytes`
+- `ata_setup_instruction_count`
+- `ata_setup_dropped_for_size`
 
 Recommended research loop:
 

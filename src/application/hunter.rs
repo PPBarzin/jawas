@@ -1,14 +1,26 @@
 use crate::application::kamino_shortlist::{
-    PreparedExecutionContext, ShortlistCandidate, ShortlistEntry, ShortlistState,
-    enforce_candidate_history_limit, select_shortlist,
+    KaminoShortlistRefreshRequest, KaminoShortlistRuntime, PreparedExecutionContext,
+    ShortlistCandidate, ShortlistEntry, ShortlistState, enforce_candidate_history_limit,
+    select_shortlist,
 };
-use crate::ports::config::ConfigPort;
+use crate::application::kamino_tx::{
+    KaminoBuildRequest, KaminoBuiltAttempt, KaminoReserveMeta, KaminoResolvedAccounts,
+    build_create_ata_idempotent_ix, build_kamino_attempt_tx, decode_kamino_reserve,
+    discriminator, find_kamino_liquidate_ix, get_or_fetch_kamino_reserve_meta,
+    get_ata, get_ata_with_program, ix_refresh_obligation, ix_refresh_reserve,
+    kamino_destination_ata_setup_enabled, optional_pubkey,
+    resolve_kamino_accounts_from_tx_info,
+};
+use crate::application::solend_hunter::execute_solend_opportunity;
+use crate::config::hunter::{
+    HunterRuntimeConfig, HunterTxFetchConfig, read_kamino_signal_source_config,
+};
+use crate::config::wallet::WalletToken;
+use crate::domain::protocol::{KAMINO_PROGRAM_ID, SOLEND_PROGRAM_ID};
 use crate::ports::jito::JitoPort;
-use crate::ports::jupiter::JupiterPort;
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
-use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::{
-    ProgramAccount, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient,
+    ProgramAccount, RpcClient, SignatureStatusInfo, StreamingRpcClient,
 };
 use crate::utils::log_stderr;
 use borsh::BorshDeserialize;
@@ -19,13 +31,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::v0::Message;
-use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::sysvar;
-use solana_sdk::transaction::VersionedTransaction;
 use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
@@ -34,17 +43,12 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const KLEND_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const FARMS_PROGRAM: &str = "FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr";
 
 // Solend
-const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 const SOLEND_LIQUIDATE_FILTER: &str = "LiquidateWithoutReceivingCtokens";
 
 // Kamino
-const KAMINO_LIQUIDATE_FILTER: &str = "LiquidateObligationAndRedeemReserveCollateralV2";
 pub const DEFAULT_KAMINO_REPLAY_SIGNATURE: &str =
     "3V11m9fyEiUqbrihZPF1QJdXW9g6tr4mHS9VtCS2BNSunUeQWvRTgXf48uoC7gXgij8bKp7hSERZ1CZvNhSYgCLA";
 const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
@@ -60,170 +64,8 @@ const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
 
 /// Tip is refreshed every 60s.
 const TIP_REFRESH_SECS: u64 = 60;
-const DEFAULT_OBLIGATION_DEDUP_MS: u128 = 3_000;
 
-#[derive(Debug, Clone, Copy)]
-struct HunterTxFetchConfig {
-    attempts: usize,
-    retry_delay_ms: u64,
-    timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HunterRuntimeConfig {
-    signal_commitment: RpcCommitment,
-    tx_fetch: HunterTxFetchConfig,
-    obligation_dedup_ms: u128,
-    non_whitelist_cooldown_ms: u128,
-    ws_idle_timeout_secs: u64,
-    signal_lock_ms: u64,
-    shortlist_enabled: bool,
-    shortlist_max_obligations: usize,
-    shortlist_refresh_secs: u64,
-    shortlist_refresh_debounce_ms: u64,
-    shortlist_cooling_down_ms: u64,
-    shortlist_candidate_history_limit: usize,
-    verbose: bool,
-}
-
-impl HunterTxFetchConfig {
-    fn from_env(prefix: &str) -> Self {
-        let attempts = std::env::var(format!("{prefix}_GET_TX_ATTEMPTS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_GET_TX_ATTEMPTS").ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3);
-        let retry_delay_ms = std::env::var(format!("{prefix}_GET_TX_RETRY_DELAY_MS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_GET_TX_RETRY_DELAY_MS").ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(40);
-        let timeout_ms = std::env::var(format!("{prefix}_GET_TX_TIMEOUT_MS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_GET_TX_TIMEOUT_MS").ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(800);
-
-        Self {
-            attempts,
-            retry_delay_ms,
-            timeout_ms,
-        }
-    }
-}
-
-impl HunterRuntimeConfig {
-    fn from_env(prefix: &str) -> Self {
-        let signal_commitment = match std::env::var(format!("{prefix}_SIGNAL_COMMITMENT"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_SIGNAL_COMMITMENT").ok())
-            .unwrap_or_else(|| "confirmed".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "processed" => RpcCommitment::Processed,
-            _ => RpcCommitment::Confirmed,
-        };
-
-        let obligation_dedup_ms = std::env::var(format!("{prefix}_OBLIGATION_DEDUP_MS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_OBLIGATION_DEDUP_MS").ok())
-            .and_then(|v| v.parse::<u128>().ok())
-            .unwrap_or(DEFAULT_OBLIGATION_DEDUP_MS);
-
-        let non_whitelist_cooldown_ms =
-            std::env::var(format!("{prefix}_NON_WHITELIST_COOLDOWN_MS"))
-                .ok()
-                .or_else(|| std::env::var("HUNTER_NON_WHITELIST_COOLDOWN_MS").ok())
-                .and_then(|v| v.parse::<u128>().ok())
-                .unwrap_or(30_000);
-
-        let ws_idle_timeout_secs = std::env::var(format!("{prefix}_WS_IDLE_TIMEOUT_SECS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_WS_IDLE_TIMEOUT_SECS").ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(180);
-
-        let signal_lock_ms = std::env::var(format!("{prefix}_SIGNAL_LOCK_MS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_SIGNAL_LOCK_MS").ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1_500);
-
-        let verbose = std::env::var(format!("{prefix}_VERBOSE"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_VERBOSE").ok())
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(true);
-
-        let shortlist_enabled = std::env::var(format!("{prefix}_SHORTLIST_ENABLED"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_SHORTLIST_ENABLED").ok())
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(true);
-
-        let shortlist_max_obligations =
-            std::env::var(format!("{prefix}_SHORTLIST_MAX_OBLIGATIONS"))
-                .ok()
-                .or_else(|| std::env::var("HUNTER_SHORTLIST_MAX_OBLIGATIONS").ok())
-                .and_then(|v| v.parse::<usize>().ok())
-                .map(|v| v.clamp(1, 10))
-                .unwrap_or(10);
-
-        let shortlist_refresh_secs = std::env::var(format!("{prefix}_SHORTLIST_REFRESH_SECS"))
-            .ok()
-            .or_else(|| std::env::var("HUNTER_SHORTLIST_REFRESH_SECS").ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20);
-
-        let shortlist_refresh_debounce_ms =
-            std::env::var(format!("{prefix}_SHORTLIST_REFRESH_DEBOUNCE_MS"))
-                .ok()
-                .or_else(|| std::env::var("HUNTER_SHORTLIST_REFRESH_DEBOUNCE_MS").ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1_500);
-
-        let shortlist_cooling_down_ms =
-            std::env::var(format!("{prefix}_SHORTLIST_COOLDOWN_MS"))
-                .ok()
-                .or_else(|| std::env::var("HUNTER_SHORTLIST_COOLDOWN_MS").ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20_000);
-
-        let shortlist_candidate_history_limit =
-            std::env::var(format!("{prefix}_SHORTLIST_CANDIDATE_HISTORY_LIMIT"))
-                .ok()
-                .or_else(|| std::env::var("HUNTER_SHORTLIST_CANDIDATE_HISTORY_LIMIT").ok())
-                .and_then(|v| v.parse::<usize>().ok())
-                .map(|v| v.max(shortlist_max_obligations))
-                .unwrap_or(64);
-
-        Self {
-            signal_commitment,
-            tx_fetch: HunterTxFetchConfig::from_env(prefix),
-            obligation_dedup_ms,
-            non_whitelist_cooldown_ms,
-            ws_idle_timeout_secs,
-            signal_lock_ms,
-            shortlist_enabled,
-            shortlist_max_obligations,
-            shortlist_refresh_secs,
-            shortlist_refresh_debounce_ms,
-            shortlist_cooling_down_ms,
-            shortlist_candidate_history_limit,
-            verbose,
-        }
-    }
-}
-
-fn hunter_dry_run_enabled() -> bool {
+pub(crate) fn hunter_dry_run_enabled() -> bool {
     std::env::var("HUNTER_DRY_RUN")
         .ok()
         .map(|v| {
@@ -233,22 +75,12 @@ fn hunter_dry_run_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn jito_send_max_attempts() -> usize {
+pub(crate) fn jito_send_max_attempts() -> usize {
     std::env::var("JITO_SEND_MAX_ATTEMPTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.clamp(1, 4))
         .unwrap_or(2)
-}
-
-fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(default)
 }
 
 fn hunter_verbose_log(enabled: bool, protocol: &str, message: impl AsRef<str>) {
@@ -257,7 +89,7 @@ fn hunter_verbose_log(enabled: bool, protocol: &str, message: impl AsRef<str>) {
     }
 }
 
-fn format_signature_status(status: Option<&SignatureStatusInfo>) -> String {
+pub(crate) fn format_signature_status(status: Option<&SignatureStatusInfo>) -> String {
     match status {
         Some(status) => format!(
             "status(slot={:?},confirmation={:?},has_error={})",
@@ -267,11 +99,11 @@ fn format_signature_status(status: Option<&SignatureStatusInfo>) -> String {
     }
 }
 
-fn is_expired_blockhash_error(message: &str) -> bool {
+pub(crate) fn is_expired_blockhash_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("expired blockhash")
 }
 
-fn is_retryable_jito_error(message: &str) -> bool {
+pub(crate) fn is_retryable_jito_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("rate limited")
         || lower.contains("network congested")
@@ -281,7 +113,7 @@ fn is_retryable_jito_error(message: &str) -> bool {
         || is_expired_blockhash_error(&lower)
 }
 
-fn retry_tip_lamports(base_tip_lamports: u64, attempt: usize) -> u64 {
+pub(crate) fn retry_tip_lamports(base_tip_lamports: u64, attempt: usize) -> u64 {
     if attempt <= 1 {
         return base_tip_lamports;
     }
@@ -289,7 +121,7 @@ fn retry_tip_lamports(base_tip_lamports: u64, attempt: usize) -> u64 {
     ((base_tip_lamports as f64) * multiplier).round() as u64
 }
 
-fn retry_backoff_ms(attempt: usize) -> u64 {
+pub(crate) fn retry_backoff_ms(attempt: usize) -> u64 {
     match attempt {
         0 | 1 => 0,
         2 => 40,
@@ -327,34 +159,132 @@ fn summarize_candidate_logs(logs: &[String]) -> String {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HunterTraceEvent {
-    timestamp: String,
-    protocol: &'static str,
-    stage: &'static str,
-    signature: String,
-    obligation: Option<String>,
-    repay_mint: Option<String>,
-    repay_symbol: Option<String>,
-    reason: Option<String>,
-    detail: Option<String>,
-    ws_received_at_ms: Option<u64>,
-    elapsed_ms: Option<u64>,
-    bundle_id: Option<String>,
-    shortlist_hit: Option<bool>,
-    shortlist_state: Option<String>,
-    shortlist_age_ms: Option<u64>,
-    prepared_context_used: Option<bool>,
-    candidate_score: Option<f64>,
-    refresh_reason: Option<String>,
+pub(crate) struct HunterTraceEvent {
+    pub(crate) timestamp: String,
+    pub(crate) protocol: &'static str,
+    pub(crate) stage: &'static str,
+    pub(crate) signature: String,
+    pub(crate) obligation: Option<String>,
+    pub(crate) repay_mint: Option<String>,
+    pub(crate) repay_symbol: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) detail: Option<String>,
+    pub(crate) ws_received_at_ms: Option<u64>,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) bundle_id: Option<String>,
+    pub(crate) shortlist_hit: Option<bool>,
+    pub(crate) shortlist_state: Option<String>,
+    pub(crate) shortlist_age_ms: Option<u64>,
+    pub(crate) prepared_context_used: Option<bool>,
+    pub(crate) candidate_score: Option<f64>,
+    pub(crate) refresh_reason: Option<String>,
+}
+
+impl HunterTraceEvent {
+    pub(crate) fn new(
+        protocol: &'static str,
+        stage: &'static str,
+        signature: impl Into<String>,
+    ) -> Self {
+        Self {
+            timestamp: crate::utils::utc_now(),
+            protocol,
+            stage,
+            signature: signature.into(),
+            obligation: None,
+            repay_mint: None,
+            repay_symbol: None,
+            reason: None,
+            detail: None,
+            ws_received_at_ms: None,
+            elapsed_ms: None,
+            bundle_id: None,
+            shortlist_hit: None,
+            shortlist_state: None,
+            shortlist_age_ms: None,
+            prepared_context_used: None,
+            candidate_score: None,
+            refresh_reason: None,
+        }
+    }
+
+    pub(crate) fn with_obligation(mut self, obligation: impl Into<String>) -> Self {
+        self.obligation = Some(obligation.into());
+        self
+    }
+
+    pub(crate) fn with_optional_repay_mint(mut self, repay_mint: Option<String>) -> Self {
+        self.repay_mint = repay_mint;
+        self
+    }
+
+    pub(crate) fn with_repay_mint(mut self, repay_mint: impl Into<String>) -> Self {
+        self.repay_mint = Some(repay_mint.into());
+        self
+    }
+
+    pub(crate) fn with_repay_symbol(mut self, repay_symbol: impl Into<String>) -> Self {
+        self.repay_symbol = Some(repay_symbol.into());
+        self
+    }
+
+    pub(crate) fn with_optional_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
+
+    pub(crate) fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub(crate) fn with_optional_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    pub(crate) fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub(crate) fn with_timing(mut self, ws_received_at_ms: u64, elapsed_ms: u64) -> Self {
+        self.ws_received_at_ms = Some(ws_received_at_ms);
+        self.elapsed_ms = Some(elapsed_ms);
+        self
+    }
+
+    pub(crate) fn with_optional_bundle_id(mut self, bundle_id: Option<String>) -> Self {
+        self.bundle_id = bundle_id;
+        self
+    }
+
+    pub(crate) fn with_shortlist_context(
+        mut self,
+        shortlist_hit: Option<bool>,
+        shortlist_state: Option<String>,
+        shortlist_age_ms: Option<u64>,
+        prepared_context_used: Option<bool>,
+        candidate_score: Option<f64>,
+        refresh_reason: Option<String>,
+    ) -> Self {
+        self.shortlist_hit = shortlist_hit;
+        self.shortlist_state = shortlist_state;
+        self.shortlist_age_ms = shortlist_age_ms;
+        self.prepared_context_used = prepared_context_used;
+        self.candidate_score = candidate_score;
+        self.refresh_reason = refresh_reason;
+        self
+    }
 }
 
 #[derive(Clone)]
-struct HunterTraceLogger {
+pub(crate) struct HunterTraceLogger {
     writer: Option<Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
 impl HunterTraceLogger {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         let path =
             std::env::var("HUNTER_LOG_FILE").unwrap_or_else(|_| "hunter_trace.jsonl".to_string());
 
@@ -379,7 +309,7 @@ impl HunterTraceLogger {
         Self { writer }
     }
 
-    fn log(&self, event: HunterTraceEvent) {
+    pub(crate) fn log(&self, event: HunterTraceEvent) {
         let Some(writer) = &self.writer else {
             return;
         };
@@ -414,6 +344,15 @@ impl HunterSignalSource {
 enum HunterSignalKind {
     KaminoLogLiquidation,
     PriceFeedPredictedLiquidable,
+}
+
+impl HunterSignalKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            HunterSignalKind::KaminoLogLiquidation => "kamino_log_liquidation",
+            HunterSignalKind::PriceFeedPredictedLiquidable => "price_feed_predicted_liquidable",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -492,13 +431,10 @@ enum LockState {
     Firing {
         winner_source: HunterSignalSource,
         acquired_at_ms: u64,
-        firing_started_at_ms: u64,
     },
     Fired {
         winner_source: HunterSignalSource,
         acquired_at_ms: u64,
-        firing_started_at_ms: u64,
-        fired_at_ms: u64,
         outcome: FireOutcome,
     },
 }
@@ -526,6 +462,7 @@ impl LockRecord {
         }
     }
 
+    #[cfg(test)]
     fn winner_source(&self) -> HunterSignalSource {
         match &self.state {
             LockState::Held { winner_source, .. }
@@ -562,7 +499,7 @@ impl LockRecord {
         entry.won_lock |= won_lock;
     }
 
-    fn transition_to_firing(&mut self, source: HunterSignalSource, now_ms: u64) -> bool {
+    fn transition_to_firing(&mut self, source: HunterSignalSource, _now_ms: u64) -> bool {
         match &self.state {
             LockState::Held {
                 winner_source,
@@ -571,7 +508,6 @@ impl LockRecord {
                 self.state = LockState::Firing {
                     winner_source: *winner_source,
                     acquired_at_ms: *acquired_at_ms,
-                    firing_started_at_ms: now_ms,
                 };
                 true
             }
@@ -582,20 +518,17 @@ impl LockRecord {
     fn transition_to_fired(
         &mut self,
         source: HunterSignalSource,
-        now_ms: u64,
+        _now_ms: u64,
         outcome: FireOutcome,
     ) -> bool {
         match &self.state {
             LockState::Firing {
                 winner_source,
                 acquired_at_ms,
-                firing_started_at_ms,
             } if *winner_source == source => {
                 self.state = LockState::Fired {
                     winner_source: *winner_source,
                     acquired_at_ms: *acquired_at_ms,
-                    firing_started_at_ms: *firing_started_at_ms,
-                    fired_at_ms: now_ms,
                     outcome,
                 };
                 true
@@ -681,400 +614,11 @@ impl SignalMetricsLogger {
 
 /// Token available in the hunter wallet (loaded from wallet.toml at startup).
 #[derive(Debug, Clone)]
-pub struct WalletToken {
-    pub symbol: String,
-    pub mint: String,
-    pub decimals: u8,
-    pub max_repay_native: u64,
-}
-
-#[derive(Debug, Clone)]
-struct WalletTokenRuntime {
-    symbol: String,
-    mint: String,
-    max_repay_native: u64,
-    source_ata: Pubkey,
-}
-
-#[derive(Debug, Clone)]
-struct KaminoReserveMeta {
-    lending_market: Pubkey,
-    pyth_oracle: Option<Pubkey>,
-    switchboard_price_oracle: Option<Pubkey>,
-    switchboard_twap_oracle: Option<Pubkey>,
-    scope_prices: Option<Pubkey>,
-    token_program: Pubkey,
-}
-
-#[derive(Debug, Clone)]
-struct KaminoResolvedAccounts {
-    obligation_pubkey: String,
-    market: String,
-    market_authority: String,
-    repay_reserve: String,
-    repay_mint: String,
-    repay_supply: String,
-    withdraw_reserve: String,
-    withdraw_liquidity_mint: String,
-    withdraw_collateral_mint: String,
-    withdraw_collateral_supply: String,
-    withdraw_liquidity_supply: String,
-    withdraw_liquidity_fee_receiver: String,
-}
-
-#[derive(Debug, Clone)]
-struct KaminoShortlistRuntime {
-    candidates: HashMap<String, ShortlistCandidate>,
-    active: HashMap<String, ShortlistEntry>,
-    last_refresh_requested_at_ms: Option<u64>,
-    last_refresh_completed_at_ms: Option<u64>,
-}
-
-impl KaminoShortlistRuntime {
-    fn new() -> Self {
-        Self {
-            candidates: HashMap::new(),
-            active: HashMap::new(),
-            last_refresh_requested_at_ms: None,
-            last_refresh_completed_at_ms: None,
-        }
-    }
-
-    fn shortlist_entry(&self, obligation: &str) -> Option<ShortlistEntry> {
-        self.active.get(obligation).cloned()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct KaminoShortlistRefreshRequest {
-    reason: String,
-    prioritize_obligation: Option<String>,
-}
-
-/// Parses wallet.toml and returns the list of available tokens.
-pub fn load_wallet_tokens(path: &str) -> Vec<WalletToken> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            log_stderr(format!("[hunter] wallet.toml not found at {}: {}", path, e));
-            return vec![];
-        }
-    };
-
-    let mut tokens = Vec::new();
-    let mut current: Option<(String, String, u8, u64)> = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "[[tokens]]" {
-            if let Some((symbol, mint, decimals, max)) = current.take() {
-                tokens.push(WalletToken {
-                    symbol,
-                    mint,
-                    decimals,
-                    max_repay_native: max,
-                });
-            }
-            current = Some((String::new(), String::new(), 6, 0));
-            continue;
-        }
-        if let Some(ref mut t) = current {
-            if let Some(v) = parse_toml_str(line, "symbol") {
-                t.0 = v;
-            }
-            if let Some(v) = parse_toml_str(line, "mint") {
-                t.1 = v;
-            }
-            if let Some(v) = parse_toml_u8(line, "decimals") {
-                t.2 = v;
-            }
-            if let Some(v) = parse_toml_u64(line, "max_repay_native") {
-                t.3 = v;
-            }
-        }
-    }
-    if let Some((symbol, mint, decimals, max)) = current {
-        tokens.push(WalletToken {
-            symbol,
-            mint,
-            decimals,
-            max_repay_native: max,
-        });
-    }
-
-    tokens
-}
-
-fn parse_toml_str(line: &str, key: &str) -> Option<String> {
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    Some(rhs.trim().trim_matches('"').to_string())
-}
-
-fn parse_toml_u8(line: &str, key: &str) -> Option<u8> {
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    rhs.trim().parse().ok()
-}
-
-fn parse_toml_u64(line: &str, key: &str) -> Option<u64> {
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    let clean: String = rhs.trim().chars().filter(|&c| c != '_').collect();
-    let clean = clean.split('#').next().unwrap_or("").trim();
-    clean.parse().ok()
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct BigFractionBytes {
-    value: [u64; 4],
-    padding: [u64; 2],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct LastUpdate {
-    slot: u64,
-    stale: u8,
-    price_status: u8,
-    placeholder: [u8; 6],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct PriceHeuristic {
-    lower: u64,
-    upper: u64,
-    exp: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct ScopeConfiguration {
-    price_feed: [u8; 32],
-    price_chain: [u16; 4],
-    twap_chain: [u16; 4],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct SwitchboardConfiguration {
-    price_aggregator: [u8; 32],
-    twap_aggregator: [u8; 32],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct PythConfiguration {
-    price: [u8; 32],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct TokenInfo {
-    name: [u8; 32],
-    heuristic: PriceHeuristic,
-    max_twap_divergence_bps: u64,
-    max_age_price_seconds: u64,
-    max_age_twap_seconds: u64,
-    scope_configuration: ScopeConfiguration,
-    switchboard_configuration: SwitchboardConfiguration,
-    pyth_configuration: PythConfiguration,
-    block_price_usage: u8,
-    reserved: [u8; 7],
-    padding: [u64; 19],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct ReserveFees {
-    origination_fee_sf: u64,
-    flash_loan_fee_sf: u64,
-    padding: [u8; 8],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct CurvePoint {
-    utilization_rate_bps: u32,
-    borrow_rate_bps: u32,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct BorrowRateCurve {
-    points: [CurvePoint; 11],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct WithdrawalCaps {
-    config_capacity: i64,
-    current_total: i64,
-    last_interval_start_timestamp: u64,
-    config_interval_length_seconds: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct ReserveConfig {
-    status: u8,
-    padding_deprecated_asset_tier: u8,
-    host_fixed_interest_rate_bps: u16,
-    min_deleveraging_bonus_bps: u16,
-    block_ctoken_usage: u8,
-    reserved1: [u8; 6],
-    protocol_order_execution_fee_pct: u8,
-    protocol_take_rate_pct: u8,
-    protocol_liquidation_fee_pct: u8,
-    loan_to_value_pct: u8,
-    liquidation_threshold_pct: u8,
-    min_liquidation_bonus_bps: u16,
-    max_liquidation_bonus_bps: u16,
-    bad_debt_liquidation_bonus_bps: u16,
-    deleveraging_margin_call_period_secs: u64,
-    deleveraging_threshold_decrease_bps_per_day: u64,
-    fees: ReserveFees,
-    borrow_rate_curve: BorrowRateCurve,
-    borrow_factor_pct: u64,
-    deposit_limit: u64,
-    borrow_limit: u64,
-    token_info: TokenInfo,
-    deposit_withdrawal_cap: WithdrawalCaps,
-    debt_withdrawal_cap: WithdrawalCaps,
-    elevation_groups: [u8; 20],
-    disable_usage_as_coll_outside_emode: u8,
-    utilization_limit_block_borrowing_above_pct: u8,
-    autodeleverage_enabled: u8,
-    proposer_authority_locked: u8,
-    borrow_limit_outside_elevation_group: u64,
-    borrow_limit_against_this_collateral_in_elevation_group: [u64; 32],
-    deleveraging_bonus_increase_bps_per_day: u64,
-    debt_maturity_timestamp: u64,
-    debt_term_seconds: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct ReserveLiquidity {
-    mint_pubkey: [u8; 32],
-    supply_vault: [u8; 32],
-    fee_vault: [u8; 32],
-    total_available_amount: u64,
-    borrowed_amount_sf: u128,
-    market_price_sf: u128,
-    market_price_last_updated_ts: u64,
-    mint_decimals: u64,
-    deposit_limit_crossed_timestamp: u64,
-    borrow_limit_crossed_timestamp: u64,
-    cumulative_borrow_rate_bsf: BigFractionBytes,
-    accumulated_protocol_fees_sf: u128,
-    accumulated_referrer_fees_sf: u128,
-    pending_referrer_fees_sf: u128,
-    absolute_referral_rate_sf: u128,
-    token_program: [u8; 32],
-    padding2: [u64; 51],
-    padding3: [u128; 32],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct ReserveCollateral {
-    mint_pubkey: [u8; 32],
-    mint_total_supply: u64,
-    supply_vault: [u8; 32],
-    padding1: [u128; 32],
-    padding2: [u128; 32],
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct WithdrawQueue {
-    queued_collateral_amount: u64,
-    next_issued_ticket_sequence_number: u64,
-    next_withdrawable_ticket_sequence_number: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, BorshDeserialize)]
-struct Reserve {
-    version: u64,
-    last_update: LastUpdate,
-    lending_market: [u8; 32],
-    farm_collateral: [u8; 32],
-    farm_debt: [u8; 32],
-    liquidity: ReserveLiquidity,
-    reserve_liquidity_padding: [u64; 150],
-    collateral: ReserveCollateral,
-    reserve_collateral_padding: [u64; 150],
-    config: ReserveConfig,
-    config_padding: [u64; 114],
-    borrowed_amount_outside_elevation_group: u64,
-    borrowed_amounts_against_this_reserve_in_elevation_groups: [u64; 32],
-    withdraw_queue: WithdrawQueue,
-    padding: [u64; 204],
-}
-
-// ── Helper functions for instruction building ────────────────────────────────
-
-fn discriminator(name: &str) -> [u8; 8] {
-    let preimage = format!("global:{}", name);
-    let hash = Sha256::digest(preimage.as_bytes());
-    hash[..8].try_into().unwrap()
-}
-
-fn get_ata_with_program(wallet: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-    let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
-    Pubkey::find_program_address(
-        &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
-        &ata_program,
-    )
-    .0
-}
-
-fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    get_ata_with_program(wallet, mint, &token_program)
-}
-
-fn build_create_ata_idempotent_ix(
-    funding_address: &Pubkey,
-    wallet_address: &Pubkey,
-    token_mint_address: &Pubkey,
-    token_program: &Pubkey,
-) -> Instruction {
-    let ata_address = get_ata_with_program(wallet_address, token_mint_address, token_program);
-    Instruction {
-        program_id: Pubkey::from_str(ATA_PROGRAM).unwrap(),
-        accounts: vec![
-            AccountMeta::new(*funding_address, true),
-            AccountMeta::new(ata_address, false),
-            AccountMeta::new_readonly(*wallet_address, false),
-            AccountMeta::new_readonly(*token_mint_address, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
-            AccountMeta::new_readonly(*token_program, false),
-        ],
-        data: vec![1],
-    }
-}
-
-fn kamino_destination_ata_setup_enabled() -> bool {
-    std::env::var("KAMINO_CREATE_DESTINATION_ATAS")
-        .ok()
-        .map(|value| {
-            let value = value.trim();
-            !(value.eq_ignore_ascii_case("0")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("off"))
-        })
-        .unwrap_or(true)
+pub(crate) struct WalletTokenRuntime {
+    pub(crate) symbol: String,
+    pub(crate) mint: String,
+    pub(crate) max_repay_native: u64,
+    pub(crate) source_ata: Pubkey,
 }
 
 fn jito_tip_accounts() -> Vec<Pubkey> {
@@ -1097,7 +641,7 @@ fn jito_tip_accounts() -> Vec<Pubkey> {
         .collect()
 }
 
-fn select_jito_tip_account(seed: &str) -> anyhow::Result<Pubkey> {
+pub(crate) fn select_jito_tip_account(seed: &str) -> anyhow::Result<Pubkey> {
     let accounts = jito_tip_accounts();
     if accounts.is_empty() {
         anyhow::bail!("no valid Jito tip account configured");
@@ -1106,14 +650,6 @@ fn select_jito_tip_account(seed: &str) -> anyhow::Result<Pubkey> {
     let digest = Sha256::digest(seed.as_bytes());
     let idx = (digest[0] as usize) % accounts.len();
     Ok(accounts[idx])
-}
-
-fn optional_pubkey(bytes: [u8; 32]) -> Option<Pubkey> {
-    if bytes.iter().all(|b| *b == 0) {
-        None
-    } else {
-        Some(Pubkey::new_from_array(bytes))
-    }
 }
 
 fn build_wallet_token_index(
@@ -1136,113 +672,15 @@ fn build_wallet_token_index(
     Ok(index)
 }
 
-fn decode_kamino_reserve(data: &[u8]) -> anyhow::Result<Reserve> {
-    if data.len() < 8 {
-        anyhow::bail!("reserve account too small");
-    }
-    let mut cursor = &data[8..];
-    Reserve::deserialize(&mut cursor).map_err(|e| anyhow::anyhow!("reserve decode failed: {}", e))
-}
-
-fn reserve_meta_from_account(data: &[u8]) -> anyhow::Result<KaminoReserveMeta> {
-    let reserve = decode_kamino_reserve(data)?;
-    Ok(KaminoReserveMeta {
-        lending_market: Pubkey::new_from_array(reserve.lending_market),
-        pyth_oracle: optional_pubkey(reserve.config.token_info.pyth_configuration.price),
-        switchboard_price_oracle: optional_pubkey(
-            reserve
-                .config
-                .token_info
-                .switchboard_configuration
-                .price_aggregator,
-        ),
-        switchboard_twap_oracle: optional_pubkey(
-            reserve
-                .config
-                .token_info
-                .switchboard_configuration
-                .twap_aggregator,
-        ),
-        scope_prices: optional_pubkey(reserve.config.token_info.scope_configuration.price_feed),
-        token_program: Pubkey::new_from_array(reserve.liquidity.token_program),
-    })
-}
-
-fn ix_refresh_reserve(klend: &Pubkey, reserve: &Pubkey, meta: &KaminoReserveMeta) -> Instruction {
-    let disc = discriminator("refresh_reserve");
-    let mut accounts = vec![
-        AccountMeta::new(*reserve, false),
-        AccountMeta::new_readonly(meta.lending_market, false),
-    ];
-    if let Some(pk) = meta.pyth_oracle {
-        accounts.push(AccountMeta::new_readonly(pk, false));
-    }
-    if let Some(pk) = meta.switchboard_price_oracle {
-        accounts.push(AccountMeta::new_readonly(pk, false));
-    }
-    if let Some(pk) = meta.switchboard_twap_oracle {
-        accounts.push(AccountMeta::new_readonly(pk, false));
-    }
-    if let Some(pk) = meta.scope_prices {
-        accounts.push(AccountMeta::new_readonly(pk, false));
-    }
-    Instruction {
-        program_id: *klend,
-        accounts,
-        data: disc.to_vec(),
-    }
-}
-
-fn ix_refresh_obligation(
-    klend: &Pubkey,
-    lending_market: &Pubkey,
-    obligation: &Pubkey,
-    reserves: &[&Pubkey],
-) -> Instruction {
-    let disc = discriminator("refresh_obligation");
-    let mut accounts = vec![
-        AccountMeta::new_readonly(*lending_market, false),
-        AccountMeta::new(*obligation, false),
-    ];
-    for r in reserves {
-        accounts.push(AccountMeta::new_readonly(**r, false));
-    }
-    Instruction {
-        program_id: *klend,
-        accounts,
-        data: disc.to_vec(),
-    }
-}
-
-async fn get_or_fetch_kamino_reserve_meta<R: RpcClient>(
-    rpc: &R,
-    cache: &tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>,
-    reserve_pk: &Pubkey,
-) -> anyhow::Result<KaminoReserveMeta> {
-    let key = reserve_pk.to_string();
-    if let Some(meta) = cache.read().await.get(&key).cloned() {
-        return Ok(meta);
-    }
-
-    let data = rpc.get_account_info(&key).await?;
-    let meta = reserve_meta_from_account(&data)?;
-    cache.write().await.insert(key, meta.clone());
-    Ok(meta)
-}
-
 pub struct HunterService<
     R: RpcClient,
     JI: JitoPort,
-    JU: JupiterPort,
-    O: PriceOracle,
-    C: ConfigPort + LiquidationLogger + Clone,
+    L: LiquidationLogger + Clone,
 > {
     hunter_rpc: R,
     signal_secondary_rpc: Option<R>,
     jito: JI,
-    _jupiter: JU,
-    _oracle: O,
-    _config: C,
+    logger: L,
     keypair: Arc<Keypair>,
     max_repay_usd: f64,
     trace_logger: HunterTraceLogger,
@@ -1251,18 +689,14 @@ pub struct HunterService<
 impl<
         R: RpcClient,
         JI: JitoPort,
-        JU: JupiterPort,
-        O: PriceOracle,
-        C: ConfigPort + LiquidationLogger + Clone + 'static,
-    > HunterService<R, JI, JU, O, C>
+        L: LiquidationLogger + Clone + 'static,
+    > HunterService<R, JI, L>
 {
     pub fn new(
         hunter_rpc: R,
         signal_secondary_rpc: Option<R>,
         jito: JI,
-        jupiter: JU,
-        oracle: O,
-        config: C,
+        logger: L,
         keypair: Arc<Keypair>,
         max_repay_usd: f64,
     ) -> Self {
@@ -1270,9 +704,7 @@ impl<
             hunter_rpc,
             signal_secondary_rpc,
             jito,
-            _jupiter: jupiter,
-            _oracle: oracle,
-            _config: config,
+            logger,
             keypair,
             max_repay_usd,
             trace_logger: HunterTraceLogger::from_env(),
@@ -1290,12 +722,15 @@ impl<
     //   → sendBundle (Jito)
     //
     // The observer is NOT involved in this cycle. It logs independently.
+    /// Runs one Kamino hunter loop with runtime config reloaded from env at loop start.
+    /// The outer restart loop in `spawn_hunter` is therefore also the reload boundary.
     pub async fn run_kamino(&self, wallet_tokens: Vec<WalletToken>) -> anyhow::Result<()>
     where
         R: StreamingRpcClient + RpcClient + Clone + Send + Sync + 'static,
         JI: Clone + Send + Sync + 'static,
     {
         let runtime = HunterRuntimeConfig::from_env("KAMINO");
+        log_stderr("[hunter-kamino] runtime config reloaded from env at loop start".to_string());
         let wallet_index = Arc::new(build_wallet_token_index(
             &self.keypair.pubkey(),
             &wallet_tokens,
@@ -1399,7 +834,7 @@ impl<
                 runtime,
                 signal_tx.clone(),
                 self.trace_logger.clone(),
-                self._config.clone(),
+                self.logger.clone(),
                 hunter_wallet.clone(),
             );
         }
@@ -1412,7 +847,7 @@ impl<
                     runtime,
                     signal_tx.clone(),
                     self.trace_logger.clone(),
-                    self._config.clone(),
+                    self.logger.clone(),
                     hunter_wallet.clone(),
                 );
             } else {
@@ -1449,53 +884,48 @@ impl<
                     .await
                     {
                         Ok(active_count) => {
-                            trace_logger.log(HunterTraceEvent {
-                                timestamp: crate::utils::utc_now(),
-                                protocol: "kamino",
-                                stage: "shortlist_refresh",
-                                signature: request.prioritize_obligation.unwrap_or_else(|| {
-                                    format!("shortlist:{}", request.reason)
-                                }),
-                                obligation: None,
-                                repay_mint: None,
-                                repay_symbol: None,
-                                reason: None,
-                                detail: Some(format!(
+                            trace_logger.log(
+                                HunterTraceEvent::new(
+                                    "kamino",
+                                    "shortlist_refresh",
+                                    request.prioritize_obligation.unwrap_or_else(|| {
+                                        format!("shortlist:{}", request.reason)
+                                    }),
+                                )
+                                .with_detail(format!(
                                     "reason={} active={}",
                                     request.reason, active_count
-                                )),
-                                ws_received_at_ms: Some(now_ms()),
-                                elapsed_ms: Some(0),
-                                bundle_id: None,
-                                shortlist_hit: None,
-                                shortlist_state: None,
-                                shortlist_age_ms: None,
-                                prepared_context_used: None,
-                                candidate_score: None,
-                                refresh_reason: Some(request.reason),
-                            });
+                                ))
+                                .with_timing(now_ms(), 0)
+                                .with_shortlist_context(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(request.reason),
+                                ),
+                            );
                         }
                         Err(error) => {
-                            trace_logger.log(HunterTraceEvent {
-                                timestamp: crate::utils::utc_now(),
-                                protocol: "kamino",
-                                stage: "error",
-                                signature: format!("shortlist:{}", request.reason),
-                                obligation: None,
-                                repay_mint: None,
-                                repay_symbol: None,
-                                reason: Some("shortlist_refresh_failed".to_string()),
-                                detail: Some(error.to_string()),
-                                ws_received_at_ms: Some(now_ms()),
-                                elapsed_ms: Some(0),
-                                bundle_id: None,
-                                shortlist_hit: None,
-                                shortlist_state: None,
-                                shortlist_age_ms: None,
-                                prepared_context_used: None,
-                                candidate_score: None,
-                                refresh_reason: Some(request.reason),
-                            });
+                            trace_logger.log(
+                                HunterTraceEvent::new(
+                                    "kamino",
+                                    "error",
+                                    format!("shortlist:{}", request.reason),
+                                )
+                                .with_reason("shortlist_refresh_failed")
+                                .with_detail(error.to_string())
+                                .with_timing(now_ms(), 0)
+                                .with_shortlist_context(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(request.reason),
+                                ),
+                            );
                         }
                     }
                 }
@@ -1596,36 +1026,36 @@ impl<
                 runtime.signal_lock_ms,
             );
 
-            self.trace_logger.log(HunterTraceEvent {
-                timestamp: crate::utils::utc_now(),
-                protocol: "kamino",
-                stage: if won_lock {
-                    "signal_accepted"
-                } else {
-                    "signal_rejected_duplicate"
-                },
-                signature: signal.signature.clone().unwrap_or_else(|| {
-                    format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
-                }),
-                obligation: Some(signal.obligation_pubkey.clone()),
-                repay_mint: signal.repay_mint.clone(),
-                repay_symbol: None,
-                reason: if won_lock {
-                    None
-                } else {
-                    Some("lock_held".to_string())
-                },
-                detail: Some(format!("source={}", signal.source.as_str())),
-                ws_received_at_ms: Some(signal.received_at_ms),
-                elapsed_ms: Some(0),
-                bundle_id: None,
-                shortlist_hit,
-                shortlist_state: shortlist_state_value.clone(),
-                shortlist_age_ms,
-                prepared_context_used: Some(false),
-                candidate_score: shortlist_score,
-                refresh_reason: shortlist_refresh_reason.clone(),
-            });
+            self.trace_logger.log(
+                HunterTraceEvent::new(
+                    "kamino",
+                    if won_lock {
+                        "signal_accepted"
+                    } else {
+                        "signal_rejected_duplicate"
+                    },
+                    signal.signature.clone().unwrap_or_else(|| {
+                        format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
+                    }),
+                )
+                .with_obligation(signal.obligation_pubkey.clone())
+                .with_optional_repay_mint(signal.repay_mint.clone())
+                .with_optional_reason((!won_lock).then(|| "lock_held".to_string()))
+                .with_detail(format!(
+                    "source={} kind={}",
+                    signal.source.as_str(),
+                    signal.signal_kind.as_str()
+                ))
+                .with_timing(signal.received_at_ms, 0)
+                .with_shortlist_context(
+                    shortlist_hit,
+                    shortlist_state_value.clone(),
+                    shortlist_age_ms,
+                    Some(false),
+                    shortlist_score,
+                    shortlist_refresh_reason.clone(),
+                ),
+            );
 
             if !won_lock {
                 continue;
@@ -1660,7 +1090,7 @@ impl<
             let reserve_cache = reserve_cache.clone();
             let trace_logger = self.trace_logger.clone();
             let runtime_cfg = runtime;
-            let airtable_logger = self._config.clone();
+            let airtable_logger = self.logger.clone();
             let hunter_wallet = hunter_wallet.clone();
             let signal_locks = signal_locks.clone();
             let shortlist_context = shortlist_entry.map(|entry| entry.context);
@@ -1717,26 +1147,17 @@ impl<
                 );
 
                 if let Err(e) = result {
-                    trace_logger.log(HunterTraceEvent {
-                        timestamp: crate::utils::utc_now(),
-                        protocol: "kamino",
-                        stage: "error",
-                        signature: sig_for_error.clone(),
-                        obligation: Some(signal.obligation_pubkey.clone()),
-                        repay_mint: signal.repay_mint.clone(),
-                        repay_symbol: None,
-                        reason: Some("opportunity_error".to_string()),
-                        detail: Some(format!("source={} {}", signal.source.as_str(), e)),
-                        ws_received_at_ms: Some(signal.received_at_ms),
-                        elapsed_ms: Some(elapsed_ms_since(signal.received_at_ms)),
-                        bundle_id: None,
-                        shortlist_hit: None,
-                        shortlist_state: None,
-                        shortlist_age_ms: None,
-                        prepared_context_used: None,
-                        candidate_score: None,
-                        refresh_reason: None,
-                    });
+                    trace_logger.log(
+                        HunterTraceEvent::new("kamino", "error", sig_for_error.clone())
+                            .with_obligation(signal.obligation_pubkey.clone())
+                            .with_optional_repay_mint(signal.repay_mint.clone())
+                            .with_reason("opportunity_error")
+                            .with_detail(format!("source={} {}", signal.source.as_str(), e))
+                            .with_timing(
+                                signal.received_at_ms,
+                                elapsed_ms_since(signal.received_at_ms),
+                            ),
+                    );
                     let _ = log_hunter_observation(
                         &airtable_logger,
                         "Kamino",
@@ -1790,26 +1211,11 @@ impl<
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         log_stderr(format!("[hunter-kamino] REPLAY | signature={}", signature));
-        self.trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "kamino",
-            stage: "replay_start",
-            signature: signature.clone(),
-            obligation: None,
-            repay_mint: None,
-            repay_symbol: None,
-            reason: None,
-            detail: Some("manual replay".to_string()),
-            ws_received_at_ms: Some(now_ms()),
-            elapsed_ms: Some(0),
-            bundle_id: None,
-            shortlist_hit: None,
-            shortlist_state: None,
-            shortlist_age_ms: None,
-            prepared_context_used: None,
-            candidate_score: None,
-            refresh_reason: None,
-        });
+        self.trace_logger.log(
+            HunterTraceEvent::new("kamino", "replay_start", signature.clone())
+                .with_detail("manual replay")
+                .with_timing(now_ms(), 0),
+        );
 
         execute_kamino_opportunity(
             signature,
@@ -1825,7 +1231,7 @@ impl<
             self.max_repay_usd,
             runtime,
             self.trace_logger.clone(),
-            self._config.clone(),
+            self.logger.clone(),
             HunterSignalSource::PrimaryRpc,
             None,
             None,
@@ -1848,12 +1254,15 @@ impl<
     //
     // No getAccountInfo, no obligation decode, no is_liquidatable() check.
     // Optimistic: include RefreshObligation in tx, let Solend decide on-chain.
+    /// Runs one Solend hunter loop with runtime config reloaded from env at loop start.
+    /// The outer restart loop in `spawn_hunter` is therefore also the reload boundary.
     pub async fn run_solend(&self, wallet_tokens: Vec<WalletToken>) -> anyhow::Result<()>
     where
         R: StreamingRpcClient + RpcClient + Clone + Send + Sync + 'static,
         JI: Clone + Send + Sync + 'static,
     {
         let runtime = HunterRuntimeConfig::from_env("SOLEND");
+        log_stderr("[hunter-solend] runtime config reloaded from env at loop start".to_string());
         let wallet_index = Arc::new(build_wallet_token_index(
             &self.keypair.pubkey(),
             &wallet_tokens,
@@ -1920,7 +1329,7 @@ impl<
         loop {
             let mut rx = match self
                 .hunter_rpc
-                .subscribe_to_logs(SOLEND_PROGRAM, runtime.signal_commitment)
+                .subscribe_to_logs(SOLEND_PROGRAM_ID, runtime.signal_commitment)
                 .await
             {
                 Ok(r) => r,
@@ -1975,7 +1384,7 @@ impl<
                 let dedup = recent_obligations.clone();
                 let trace_logger = self.trace_logger.clone();
                 let tx_fetch_cfg = runtime.tx_fetch;
-                let airtable_logger = self._config.clone();
+                let airtable_logger = self.logger.clone();
                 let hunter_wallet = self.keypair.pubkey().to_string();
                 let err_sig = sig.clone();
                 let err_trace_logger = trace_logger.clone();
@@ -1986,26 +1395,10 @@ impl<
                     format!("candidate | sig={}", sig),
                 );
 
-                trace_logger.log(HunterTraceEvent {
-                    timestamp: crate::utils::utc_now(),
-                    protocol: "solend",
-                    stage: "ws_received",
-                    signature: sig.clone(),
-                    obligation: None,
-                    repay_mint: None,
-                    repay_symbol: None,
-                    reason: None,
-                    detail: None,
-                    ws_received_at_ms: Some(entry.received_at_ms),
-                    elapsed_ms: Some(0),
-                    bundle_id: None,
-                    shortlist_hit: None,
-                    shortlist_state: None,
-                    shortlist_age_ms: None,
-                    prepared_context_used: None,
-                    candidate_score: None,
-                    refresh_reason: None,
-                });
+                trace_logger.log(
+                    HunterTraceEvent::new("solend", "ws_received", sig.clone())
+                        .with_timing(entry.received_at_ms, 0),
+                );
                 let _ = log_hunter_observation(
                     &airtable_logger,
                     "Solend",
@@ -2036,26 +1429,15 @@ impl<
                     )
                     .await
                     {
-                        err_trace_logger.log(HunterTraceEvent {
-                            timestamp: crate::utils::utc_now(),
-                            protocol: "solend",
-                            stage: "error",
-                            signature: err_sig.clone(),
-                            obligation: None,
-                            repay_mint: None,
-                            repay_symbol: None,
-                            reason: Some("opportunity_error".to_string()),
-                            detail: Some(e.to_string()),
-                            ws_received_at_ms: Some(entry.received_at_ms),
-                            elapsed_ms: Some(elapsed_ms_since(entry.received_at_ms)),
-                            bundle_id: None,
-                            shortlist_hit: None,
-                            shortlist_state: None,
-                            shortlist_age_ms: None,
-                            prepared_context_used: None,
-                            candidate_score: None,
-                            refresh_reason: None,
-                        });
+                        err_trace_logger.log(
+                            HunterTraceEvent::new("solend", "error", err_sig.clone())
+                                .with_reason("opportunity_error")
+                                .with_detail(e.to_string())
+                                .with_timing(
+                                    entry.received_at_ms,
+                                    elapsed_ms_since(entry.received_at_ms),
+                                ),
+                        );
                         let _ = log_hunter_observation(
                             &airtable_logger,
                             "Solend",
@@ -2102,26 +1484,11 @@ impl<
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         log_stderr(format!("[hunter-solend] REPLAY | signature={}", signature));
-        self.trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "solend",
-            stage: "replay_start",
-            signature: signature.clone(),
-            obligation: None,
-            repay_mint: None,
-            repay_symbol: None,
-            reason: None,
-            detail: Some("manual replay".to_string()),
-            ws_received_at_ms: Some(now_ms()),
-            elapsed_ms: Some(0),
-            bundle_id: None,
-            shortlist_hit: None,
-            shortlist_state: None,
-            shortlist_age_ms: None,
-            prepared_context_used: None,
-            candidate_score: None,
-            refresh_reason: None,
-        });
+        self.trace_logger.log(
+            HunterTraceEvent::new("solend", "replay_start", signature.clone())
+                .with_detail("manual replay")
+                .with_timing(now_ms(), 0),
+        );
 
         execute_solend_opportunity(
             signature,
@@ -2135,7 +1502,7 @@ impl<
             dedup,
             tx_fetch,
             self.trace_logger.clone(),
-            self._config.clone(),
+            self.logger.clone(),
         )
         .await
     }
@@ -2229,53 +1596,6 @@ fn remove_expired_signal_fingerprints(
             }
         }
     }
-}
-
-fn resolve_kamino_accounts_from_tx_info(
-    tx_info: &crate::ports::rpc::TransactionInfo,
-    known_obligation: Option<&str>,
-    known_repay_mint: Option<&str>,
-) -> anyhow::Result<KaminoResolvedAccounts> {
-    let liquidate_ix_idx = find_kamino_liquidate_ix(tx_info)
-        .ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
-    let ix_accs = &tx_info.instruction_accounts[liquidate_ix_idx];
-    if ix_accs.len() < 13 {
-        anyhow::bail!(
-            "liquidate instruction has too few accounts ({})",
-            ix_accs.len()
-        );
-    }
-
-    let resolve = |index: usize| -> anyhow::Result<String> {
-        tx_info
-            .account_keys
-            .get(
-                *ix_accs
-                    .get(index)
-                    .ok_or_else(|| anyhow::anyhow!("missing liquidate account index {index}"))?,
-            )
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing account key for liquidate account {index}"))
-    };
-
-    Ok(KaminoResolvedAccounts {
-        obligation_pubkey: known_obligation
-            .map(|value| value.to_string())
-            .unwrap_or(resolve(1)?),
-        market: resolve(2)?,
-        market_authority: resolve(3)?,
-        repay_reserve: resolve(4)?,
-        repay_mint: known_repay_mint
-            .map(|value| value.to_string())
-            .unwrap_or(resolve(5)?),
-        repay_supply: resolve(6)?,
-        withdraw_reserve: resolve(7)?,
-        withdraw_liquidity_mint: resolve(8)?,
-        withdraw_collateral_mint: resolve(9)?,
-        withdraw_collateral_supply: resolve(10)?,
-        withdraw_liquidity_supply: resolve(11)?,
-        withdraw_liquidity_fee_receiver: resolve(12)?,
-    })
 }
 
 fn shortlist_trace_fields(entry: Option<&ShortlistEntry>) -> (Option<bool>, Option<String>, Option<u64>, Option<f64>, Option<String>) {
@@ -2515,7 +1835,7 @@ fn spawn_kamino_log_signal_source<R, L>(
     tokio::spawn(async move {
         loop {
             let mut rx = match rpc
-                .subscribe_to_logs(KLEND_PROGRAM, runtime.signal_commitment)
+                .subscribe_to_logs(KAMINO_PROGRAM_ID, runtime.signal_commitment)
                 .await
             {
                 Ok(r) => r,
@@ -2563,26 +1883,19 @@ fn spawn_kamino_log_signal_source<R, L>(
                             detail
                         ),
                     );
-                    trace_logger.log(HunterTraceEvent {
-                        timestamp: crate::utils::utc_now(),
-                        protocol: "kamino",
-                        stage: "skip",
-                        signature: entry.signature.clone(),
-                        obligation: extract_obligation_pda_from_logs(&entry.logs),
-                        repay_mint: extract_log_field(&entry.logs, "repay_reserve:"),
-                        repay_symbol: None,
-                        reason: Some("source_obligation_healthy".to_string()),
-                        detail: Some(format!("source={} {}", source.as_str(), detail)),
-                        ws_received_at_ms: Some(entry.received_at_ms),
-                        elapsed_ms: Some(0),
-                        bundle_id: None,
-                        shortlist_hit: None,
-                        shortlist_state: None,
-                        shortlist_age_ms: None,
-                        prepared_context_used: None,
-                        candidate_score: None,
-                        refresh_reason: None,
-                    });
+                    let mut event =
+                        HunterTraceEvent::new("kamino", "skip", entry.signature.clone())
+                            .with_optional_repay_mint(extract_log_field(
+                                &entry.logs,
+                                "repay_reserve:",
+                            ))
+                            .with_reason("source_obligation_healthy")
+                            .with_detail(format!("source={} {}", source.as_str(), detail))
+                            .with_timing(entry.received_at_ms, 0);
+                    if let Some(obligation) = extract_obligation_pda_from_logs(&entry.logs) {
+                        event = event.with_obligation(obligation);
+                    }
+                    trace_logger.log(event);
                     continue;
                 }
 
@@ -2597,26 +1910,17 @@ fn spawn_kamino_log_signal_source<R, L>(
                     ),
                 );
 
-                trace_logger.log(HunterTraceEvent {
-                    timestamp: crate::utils::utc_now(),
-                    protocol: "kamino",
-                    stage: "ws_received",
-                    signature: entry.signature.clone(),
-                    obligation: extract_obligation_pda_from_logs(&entry.logs),
-                    repay_mint: extract_log_field(&entry.logs, "repay_reserve:"),
-                    repay_symbol: None,
-                    reason: None,
-                    detail: Some(format!("source={} {}", source.as_str(), detail)),
-                    ws_received_at_ms: Some(entry.received_at_ms),
-                    elapsed_ms: Some(0),
-                    bundle_id: None,
-                    shortlist_hit: None,
-                    shortlist_state: None,
-                    shortlist_age_ms: None,
-                    prepared_context_used: None,
-                    candidate_score: None,
-                    refresh_reason: None,
-                });
+                let mut event = HunterTraceEvent::new("kamino", "ws_received", entry.signature.clone())
+                    .with_optional_repay_mint(extract_log_field(
+                        &entry.logs,
+                        "repay_reserve:",
+                    ))
+                    .with_detail(format!("source={} {}", source.as_str(), detail))
+                    .with_timing(entry.received_at_ms, 0);
+                if let Some(obligation) = extract_obligation_pda_from_logs(&entry.logs) {
+                    event = event.with_obligation(obligation);
+                }
+                trace_logger.log(event);
                 let _ = log_hunter_observation(
                     &logger,
                     "Kamino",
@@ -2646,26 +1950,15 @@ fn spawn_kamino_log_signal_source<R, L>(
                         }
                     }
                     Err(e) => {
-                        trace_logger.log(HunterTraceEvent {
-                            timestamp: crate::utils::utc_now(),
-                            protocol: "kamino",
-                            stage: "error",
-                            signature: entry.signature.clone(),
-                            obligation: None,
-                            repay_mint: None,
-                            repay_symbol: None,
-                            reason: Some("signal_resolution_failed".to_string()),
-                            detail: Some(format!("source={} {}", source.as_str(), e)),
-                            ws_received_at_ms: Some(entry.received_at_ms),
-                            elapsed_ms: Some(elapsed_ms_since(entry.received_at_ms)),
-                            bundle_id: None,
-                            shortlist_hit: None,
-                            shortlist_state: None,
-                            shortlist_age_ms: None,
-                            prepared_context_used: None,
-                            candidate_score: None,
-                            refresh_reason: None,
-                        });
+                        trace_logger.log(
+                            HunterTraceEvent::new("kamino", "error", entry.signature.clone())
+                                .with_reason("signal_resolution_failed")
+                                .with_detail(format!("source={} {}", source.as_str(), e))
+                                .with_timing(
+                                    entry.received_at_ms,
+                                    elapsed_ms_since(entry.received_at_ms),
+                                ),
+                        );
                     }
                 }
             }
@@ -2679,53 +1972,6 @@ struct HermesShortlistEntry {
     repay_mint: String,
     tracked_feed_ids: Vec<String>,
     distance_to_liq: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KaminoSignalSourceConfig {
-    primary_rpc_enabled: bool,
-    secondary_rpc_enabled: bool,
-    price_feed_enabled: bool,
-}
-
-fn read_kamino_signal_source_config(has_signal_secondary_rpc: bool) -> KaminoSignalSourceConfig {
-    let primary_rpc_enabled = env_flag_aliases(
-        &[
-            "ENABLE_HUNTER_SIGNAL_PRIMARY",
-            "ENABLE_HUNTER_SIGNAL_QUICKNODE",
-        ],
-        true,
-    );
-    let secondary_rpc_requested = env_flag_aliases(
-        &[
-            "ENABLE_HUNTER_SIGNAL_SECONDARY",
-            "ENABLE_HUNTER_SIGNAL_HELIUS",
-        ],
-        true,
-    );
-    let price_feed_enabled = env_flag_aliases(
-        &[
-            "ENABLE_HUNTER_SIGNAL_PRICE_FEED",
-            "ENABLE_HUNTER_SIGNAL_HERMES",
-        ],
-        false,
-    );
-
-    KaminoSignalSourceConfig {
-        primary_rpc_enabled,
-        secondary_rpc_enabled: secondary_rpc_requested && has_signal_secondary_rpc,
-        price_feed_enabled,
-    }
-}
-
-fn env_flag_aliases(names: &[&str], default: bool) -> bool {
-    for name in names {
-        if std::env::var(name).is_ok() {
-            return env_flag(name, default);
-        }
-    }
-
-    default
 }
 
 #[derive(Debug, Clone)]
@@ -2905,7 +2151,7 @@ fn spawn_price_feed_signal_source<R>(
             let shortlist = shortlist.clone();
             tokio::spawn(async move {
                 loop {
-                    match rpc.get_program_accounts(KLEND_PROGRAM).await {
+                    match rpc.get_program_accounts(KAMINO_PROGRAM_ID).await {
                         Ok(accounts) => {
                             let mut entries = build_hermes_shortlist(&wallet_tokens, accounts);
                             entries.truncate(shortlist_size);
@@ -2974,29 +2220,17 @@ fn spawn_price_feed_signal_source<R>(
                                         trigger_buffer_bps,
                                         chunk_received_at_ms,
                                     ) {
-                                        trace_logger.log(HunterTraceEvent {
-                                            timestamp: crate::utils::utc_now(),
-                                            protocol: "kamino",
-                                            stage: "signal_received",
-                                            signature: format!(
-                                                "hermes:{}",
-                                                signal.obligation_pubkey
-                                            ),
-                                            obligation: Some(signal.obligation_pubkey.clone()),
-                                            repay_mint: signal.repay_mint.clone(),
-                                            repay_symbol: None,
-                                            reason: None,
-                                            detail: signal.detail.clone(),
-                                            ws_received_at_ms: Some(chunk_received_at_ms),
-                                            elapsed_ms: Some(0),
-                                            bundle_id: None,
-                                            shortlist_hit: None,
-                                            shortlist_state: None,
-                                            shortlist_age_ms: None,
-                                            prepared_context_used: None,
-                                            candidate_score: None,
-                                            refresh_reason: None,
-                                        });
+                                        trace_logger.log(
+                                            HunterTraceEvent::new(
+                                                "kamino",
+                                                "signal_received",
+                                                format!("hermes:{}", signal.obligation_pubkey),
+                                            )
+                                            .with_obligation(signal.obligation_pubkey.clone())
+                                            .with_optional_repay_mint(signal.repay_mint.clone())
+                                            .with_optional_detail(signal.detail.clone())
+                                            .with_timing(chunk_received_at_ms, 0),
+                                        );
                                         if signal_tx.send(signal).await.is_err() {
                                             return;
                                         }
@@ -3179,26 +2413,22 @@ where
                 true
             }
         };
-        trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "kamino",
-            stage: "skip",
-            signature: sig.clone(),
-            obligation: Some(obligation_str.to_string()),
-            repay_mint: Some(repay_mint_str.to_string()),
-            repay_symbol: None,
-            reason: Some("token_not_whitelisted".to_string()),
-            detail: Some("token not whitelisted".to_string()),
-            ws_received_at_ms: Some(ws_received_at_ms),
-            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-            bundle_id: None,
-            shortlist_hit,
-            shortlist_state: shortlist_state.clone(),
-            shortlist_age_ms,
-            prepared_context_used: Some(prepared_context_used),
-            candidate_score: None,
-            refresh_reason: refresh_reason.clone(),
-        });
+        trace_logger.log(
+            HunterTraceEvent::new("kamino", "skip", sig.clone())
+                .with_obligation(obligation_str.to_string())
+                .with_repay_mint(repay_mint_str.to_string())
+                .with_reason("token_not_whitelisted")
+                .with_detail("token not whitelisted")
+                .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                .with_shortlist_context(
+                    shortlist_hit,
+                    shortlist_state.clone(),
+                    shortlist_age_ms,
+                    Some(prepared_context_used),
+                    None,
+                    refresh_reason.clone(),
+                ),
+        );
         if should_log {
             log_stderr(format!(
                 "[hunter-kamino] skip: token not whitelisted | obligation={} repay_mint={}",
@@ -3219,26 +2449,22 @@ where
         return Ok(KaminoExecutionOutcome::Skipped);
     };
     if repay_token.max_repay_native == 0 {
-        trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "kamino",
-            stage: "skip",
-            signature: sig.clone(),
-            obligation: Some(obligation_str.to_string()),
-            repay_mint: Some(repay_mint_str.to_string()),
-            repay_symbol: Some(repay_token.symbol.clone()),
-            reason: Some("wallet_token_zero_cap".to_string()),
-            detail: None,
-            ws_received_at_ms: Some(ws_received_at_ms),
-            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-            bundle_id: None,
-            shortlist_hit,
-            shortlist_state: shortlist_state.clone(),
-            shortlist_age_ms,
-            prepared_context_used: Some(prepared_context_used),
-            candidate_score: None,
-            refresh_reason: refresh_reason.clone(),
-        });
+        trace_logger.log(
+            HunterTraceEvent::new("kamino", "skip", sig.clone())
+                .with_obligation(obligation_str.to_string())
+                .with_repay_mint(repay_mint_str.to_string())
+                .with_repay_symbol(repay_token.symbol.clone())
+                .with_reason("wallet_token_zero_cap")
+                .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                .with_shortlist_context(
+                    shortlist_hit,
+                    shortlist_state.clone(),
+                    shortlist_age_ms,
+                    Some(prepared_context_used),
+                    None,
+                    refresh_reason.clone(),
+                ),
+        );
         return Ok(KaminoExecutionOutcome::Skipped);
     }
 
@@ -3260,8 +2486,9 @@ where
     let wdr_liq_sup_pk = Pubkey::from_str(wdr_liq_sup_str)?;
     let wdr_fee_pk = Pubkey::from_str(wdr_fee_str)?;
 
-    let klend_pk = Pubkey::from_str(KLEND_PROGRAM).unwrap();
-    let farms_pk = Pubkey::from_str(FARMS_PROGRAM).unwrap();
+    let klend_pk =
+        Pubkey::from_str(KAMINO_PROGRAM_ID).expect("static constant KAMINO_PROGRAM_ID");
+    let farms_pk = Pubkey::from_str(FARMS_PROGRAM).expect("static constant FARMS_PROGRAM");
     let tip_account = select_jito_tip_account(&sig)?;
 
     let liquidator = keypair.pubkey();
@@ -3435,37 +2662,33 @@ where
     );
 
     // ── 9. Send bundle ───────────────────────────────────────────────────────
-    trace_logger.log(HunterTraceEvent {
-        timestamp: crate::utils::utc_now(),
-        protocol: "kamino",
-        stage: "firing",
-        signature: sig.clone(),
-        obligation: Some(obligation_str.to_string()),
-        repay_mint: Some(repay_mint_str.to_string()),
-        repay_symbol: Some(repay_token.symbol.clone()),
-        reason: None,
-        detail: Some(format!(
-            "source={} tip={} tip_account={} cu_price={} max_send_attempts={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} {}",
-            source.as_str(),
-            base_tip_lamports,
-            tip_account,
-            compute_unit_price,
-            max_send_attempts,
-            active_reserve_pks.len(),
-            full_refresh_context,
-            ata_setup_instruction_count,
-            initial_timing_detail
-        )),
-        ws_received_at_ms: Some(ws_received_at_ms),
-        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-        bundle_id: None,
-        shortlist_hit,
-        shortlist_state: shortlist_state.clone(),
-        shortlist_age_ms,
-        prepared_context_used: Some(prepared_context_used),
-        candidate_score: None,
-        refresh_reason: refresh_reason.clone(),
-    });
+    trace_logger.log(
+        HunterTraceEvent::new("kamino", "firing", sig.clone())
+            .with_obligation(obligation_str.to_string())
+            .with_repay_mint(repay_mint_str.to_string())
+            .with_repay_symbol(repay_token.symbol.clone())
+            .with_detail(format!(
+                "source={} tip={} tip_account={} cu_price={} max_send_attempts={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} {}",
+                source.as_str(),
+                base_tip_lamports,
+                tip_account,
+                compute_unit_price,
+                max_send_attempts,
+                active_reserve_pks.len(),
+                full_refresh_context,
+                ata_setup_instruction_count,
+                initial_timing_detail
+            ))
+            .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+            .with_shortlist_context(
+                shortlist_hit,
+                shortlist_state.clone(),
+                shortlist_age_ms,
+                Some(prepared_context_used),
+                None,
+                refresh_reason.clone(),
+            ),
+    );
     let _ = log_hunter_observation(
         &logger,
         "Kamino",
@@ -3502,91 +2725,62 @@ where
         ata_setup_instruction_count
     ));
 
-    let build_attempt_tx = |blockhash, tip_lamports| -> anyhow::Result<(VersionedTransaction, usize, bool)> {
-        let mut attempt_instructions = instruction_prefix.clone();
-        attempt_instructions.extend(ata_setup_instructions.clone());
-        attempt_instructions.push(liquidation_ix.clone());
-        attempt_instructions.push(solana_sdk::system_instruction::transfer(
-            &liquidator,
-            &tip_account,
-            tip_lamports,
-        ));
-
-        let message = Message::try_compile(&liquidator, &attempt_instructions, &[], blockhash)
-            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-        let mut tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
-        let mut tx_bytes = bincode::serialize(&tx)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
-        let mut ata_setup_dropped_for_size = false;
-
-        if ata_setup_instruction_count > 0 && tx_bytes > max_tx_size_bytes {
-            ata_setup_dropped_for_size = true;
-            let mut fallback_instructions = instruction_prefix.clone();
-            fallback_instructions.push(liquidation_ix.clone());
-            fallback_instructions.push(solana_sdk::system_instruction::transfer(
-                &liquidator,
-                &tip_account,
-                tip_lamports,
-            ));
-            let message = Message::try_compile(&liquidator, &fallback_instructions, &[], blockhash)
-                .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-            tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-                .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
-            tx_bytes = bincode::serialize(&tx)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default();
-        }
-
-        Ok((tx, tx_bytes, ata_setup_dropped_for_size))
-    };
-
     if hunter_dry_run_enabled() {
         let dry_run_blockhash = *cached_blockhash.read().await;
         let build_started_at = Instant::now();
-        let (_tx, tx_bytes, ata_setup_dropped_for_size) =
-            build_attempt_tx(dry_run_blockhash, base_tip_lamports)?;
+        let KaminoBuiltAttempt {
+            tx_size_bytes: tx_bytes,
+            ata_setup_dropped_for_size,
+            ..
+        } = build_kamino_attempt_tx(KaminoBuildRequest {
+            liquidator,
+            keypair: keypair.clone(),
+            blockhash: dry_run_blockhash,
+            tip_account,
+            tip_lamports: base_tip_lamports,
+            instruction_prefix: instruction_prefix.clone(),
+            ata_setup_instructions: ata_setup_instructions.clone(),
+            liquidation_ix: liquidation_ix.clone(),
+            max_tx_size_bytes,
+            full_refresh_context,
+        })?;
         let build_ms = build_started_at.elapsed().as_millis();
-        trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "kamino",
-            stage: "dry_run",
-            signature: sig.clone(),
-            obligation: Some(obligation_str.to_string()),
-            repay_mint: Some(repay_mint_str.to_string()),
-            repay_symbol: Some(repay_token.symbol.clone()),
-            reason: Some("dry_run_enabled".to_string()),
-            detail: Some(format!(
-                "source={} tx_size_bytes={} tip={} cu_price={} attempt=1/{} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {}",
-                source.as_str(),
-                tx_bytes,
-                base_tip_lamports,
-                compute_unit_price,
-                max_send_attempts,
-                active_reserve_pks.len(),
-                full_refresh_context,
-                ata_setup_instruction_count,
-                ata_setup_dropped_for_size,
-                format_stage_timings(
-                    tx_fetch_ms,
-                    resolve_ms,
-                    reserve_meta_ms,
-                    build_ms,
+        trace_logger.log(
+            HunterTraceEvent::new("kamino", "dry_run", sig.clone())
+                .with_obligation(obligation_str.to_string())
+                .with_repay_mint(repay_mint_str.to_string())
+                .with_repay_symbol(repay_token.symbol.clone())
+                .with_reason("dry_run_enabled")
+                .with_detail(format!(
+                    "source={} tx_size_bytes={} tip={} cu_price={} attempt=1/{} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {}",
+                    source.as_str(),
+                    tx_bytes,
+                    base_tip_lamports,
+                    compute_unit_price,
+                    max_send_attempts,
+                    active_reserve_pks.len(),
+                    full_refresh_context,
+                    ata_setup_instruction_count,
+                    ata_setup_dropped_for_size,
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        reserve_meta_ms,
+                        build_ms,
+                        None,
+                        started_at.elapsed().as_millis(),
+                    )
+                ))
+                .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                .with_shortlist_context(
+                    shortlist_hit,
+                    shortlist_state.clone(),
+                    shortlist_age_ms,
+                    Some(prepared_context_used),
                     None,
-                    started_at.elapsed().as_millis(),
-                )
-            )),
-            ws_received_at_ms: Some(ws_received_at_ms),
-            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-            bundle_id: None,
-            shortlist_hit,
-            shortlist_state: shortlist_state.clone(),
-            shortlist_age_ms,
-            prepared_context_used: Some(prepared_context_used),
-            candidate_score: None,
-            refresh_reason: refresh_reason.clone(),
-        });
+                    refresh_reason.clone(),
+                ),
+        );
         log_stderr(format!(
             "[hunter-kamino] DRY RUN | obligation={} repay={} tx_size={} reserves={} full_refresh={} ata_setup={} ata_dropped={}",
             &obligation_str[..8],
@@ -3616,8 +2810,23 @@ where
         };
 
         let build_started_at = Instant::now();
-        let (tx, tx_bytes, ata_setup_dropped_for_size) =
-            build_attempt_tx(blockhash, tip_lamports)?;
+        let KaminoBuiltAttempt {
+            tx,
+            tx_size_bytes: tx_bytes,
+            ata_setup_dropped_for_size,
+            ..
+        } = build_kamino_attempt_tx(KaminoBuildRequest {
+            liquidator,
+            keypair: keypair.clone(),
+            blockhash,
+            tip_account,
+            tip_lamports,
+            instruction_prefix: instruction_prefix.clone(),
+            ata_setup_instructions: ata_setup_instructions.clone(),
+            liquidation_ix: liquidation_ix.clone(),
+            max_tx_size_bytes,
+            full_refresh_context,
+        })?;
         let build_ms = build_started_at.elapsed().as_millis();
 
         let send_started_at = Instant::now();
@@ -3643,30 +2852,23 @@ where
                         started_at.elapsed().as_millis(),
                     )
                 );
-                trace_logger.log(HunterTraceEvent {
-                    timestamp: crate::utils::utc_now(),
-                    protocol: "kamino",
-                    stage: "bundle_sent",
-                    signature: sig.clone(),
-                    obligation: Some(obligation_str.to_string()),
-                    repay_mint: Some(repay_mint_str.to_string()),
-                    repay_symbol: Some(repay_token.symbol.clone()),
-                    reason: None,
-                    detail: Some(format!(
-                        "source={} {}",
-                        source.as_str(),
-                        bundle_detail.clone()
-                    )),
-                    ws_received_at_ms: Some(ws_received_at_ms),
-                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                    bundle_id: Some(bundle_id.clone()),
-                    shortlist_hit,
-                    shortlist_state: shortlist_state.clone(),
-                    shortlist_age_ms,
-                    prepared_context_used: Some(prepared_context_used),
-                    candidate_score: None,
-                    refresh_reason: refresh_reason.clone(),
-                });
+                trace_logger.log(
+                    HunterTraceEvent::new("kamino", "bundle_sent", sig.clone())
+                        .with_obligation(obligation_str.to_string())
+                        .with_repay_mint(repay_mint_str.to_string())
+                        .with_repay_symbol(repay_token.symbol.clone())
+                        .with_detail(format!("source={} {}", source.as_str(), bundle_detail.clone()))
+                        .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                        .with_optional_bundle_id(Some(bundle_id.clone()))
+                        .with_shortlist_context(
+                            shortlist_hit,
+                            shortlist_state.clone(),
+                            shortlist_age_ms,
+                            Some(prepared_context_used),
+                            None,
+                            refresh_reason.clone(),
+                        ),
+                );
                 let _ = log_hunter_observation(
                     &logger,
                     "Kamino",
@@ -3719,30 +2921,27 @@ where
                 );
 
                 if attempt < max_send_attempts && is_retryable_jito_error(&error_message) {
-                    trace_logger.log(HunterTraceEvent {
-                        timestamp: crate::utils::utc_now(),
-                        protocol: "kamino",
-                        stage: "bundle_retry",
-                        signature: sig.clone(),
-                        obligation: Some(obligation_str.to_string()),
-                        repay_mint: Some(repay_mint_str.to_string()),
-                        repay_symbol: Some(repay_token.symbol.clone()),
-                        reason: Some(if is_expired_blockhash_error(&error_message) {
-                            "expired_blockhash_retry".to_string()
-                        } else {
-                            "retryable_bundle_send_error".to_string()
-                        }),
-                        detail: Some(format!("source={} {}", source.as_str(), bundle_detail)),
-                        ws_received_at_ms: Some(ws_received_at_ms),
-                        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                        bundle_id: None,
-                        shortlist_hit,
-                        shortlist_state: shortlist_state.clone(),
-                        shortlist_age_ms,
-                        prepared_context_used: Some(prepared_context_used),
-                        candidate_score: None,
-                        refresh_reason: refresh_reason.clone(),
-                    });
+                    trace_logger.log(
+                        HunterTraceEvent::new("kamino", "bundle_retry", sig.clone())
+                            .with_obligation(obligation_str.to_string())
+                            .with_repay_mint(repay_mint_str.to_string())
+                            .with_repay_symbol(repay_token.symbol.clone())
+                            .with_reason(if is_expired_blockhash_error(&error_message) {
+                                "expired_blockhash_retry"
+                            } else {
+                                "retryable_bundle_send_error"
+                            })
+                            .with_detail(format!("source={} {}", source.as_str(), bundle_detail))
+                            .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                            .with_shortlist_context(
+                                shortlist_hit,
+                                shortlist_state.clone(),
+                                shortlist_age_ms,
+                                Some(prepared_context_used),
+                                None,
+                                refresh_reason.clone(),
+                            ),
+                    );
                     let backoff_ms = retry_backoff_ms(attempt);
                     if backoff_ms > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
@@ -3750,30 +2949,23 @@ where
                     continue;
                 }
 
-                trace_logger.log(HunterTraceEvent {
-                    timestamp: crate::utils::utc_now(),
-                    protocol: "kamino",
-                    stage: "error",
-                    signature: sig.clone(),
-                    obligation: Some(obligation_str.to_string()),
-                    repay_mint: Some(repay_mint_str.to_string()),
-                    repay_symbol: Some(repay_token.symbol.clone()),
-                    reason: Some("bundle_send_failed".to_string()),
-                    detail: Some(format!(
-                        "source={} {}",
-                        source.as_str(),
-                        bundle_detail.clone()
-                    )),
-                    ws_received_at_ms: Some(ws_received_at_ms),
-                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                    bundle_id: None,
-                    shortlist_hit,
-                    shortlist_state: shortlist_state.clone(),
-                    shortlist_age_ms,
-                    prepared_context_used: Some(prepared_context_used),
-                    candidate_score: None,
-                    refresh_reason: refresh_reason.clone(),
-                });
+                trace_logger.log(
+                    HunterTraceEvent::new("kamino", "error", sig.clone())
+                        .with_obligation(obligation_str.to_string())
+                        .with_repay_mint(repay_mint_str.to_string())
+                        .with_repay_symbol(repay_token.symbol.clone())
+                        .with_reason("bundle_send_failed")
+                        .with_detail(format!("source={} {}", source.as_str(), bundle_detail.clone()))
+                        .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                        .with_shortlist_context(
+                            shortlist_hit,
+                            shortlist_state.clone(),
+                            shortlist_age_ms,
+                            Some(prepared_context_used),
+                            None,
+                            refresh_reason.clone(),
+                        ),
+                );
                 let _ = log_hunter_observation(
                     &logger,
                     "Kamino",
@@ -3801,670 +2993,18 @@ where
     Ok(KaminoExecutionOutcome::BundleFailed)
 }
 
-// ── Solend opportunity execution (free function for tokio::spawn) ────────────
-//
-// Strategy: copy the competitor's tx instructions verbatim, replacing only
-// the user-specific accounts (source/destination ATAs, signer) with ours.
-// This means we don't need to know the Solend instruction discriminator or
-// account layout — we just mirror the competitor's logic with our identity.
-//
-// For the liquidity_amount parameter (bytes 8-15 of Anchor instruction data),
-// we substitute our max_repay_native so we never over-commit capital.
-//
-// Optimistic: the tx includes RefreshObligation copied from the competitor.
-// If the obligation is already healthy, it fails cheaply.
-async fn execute_solend_opportunity<R, JI>(
-    sig: String,
-    ws_received_at_ms: u64,
-    rpc: R,
-    jito: JI,
-    keypair: Arc<Keypair>,
-    wallet_index: Arc<HashMap<String, WalletTokenRuntime>>,
-    cached_blockhash: Arc<tokio::sync::RwLock<solana_sdk::hash::Hash>>,
-    cached_tip: Arc<std::sync::atomic::AtomicU64>,
-    dedup: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
-    tx_fetch: HunterTxFetchConfig,
-    trace_logger: HunterTraceLogger,
-    logger: impl LiquidationLogger,
-) -> anyhow::Result<()>
-where
-    R: RpcClient,
-    JI: JitoPort,
-{
-    let started_at = Instant::now();
-
-    // ── 1. getTransaction — bounded retry window ─────────────────────────────
-    let tx_fetch_started_at = Instant::now();
-    let tx_info = match tokio::time::timeout(
-        tokio::time::Duration::from_millis(tx_fetch.timeout_ms),
-        rpc.get_transaction_with_retries(&sig, tx_fetch.attempts, tx_fetch.retry_delay_ms),
-    )
-    .await
-    {
-        Ok(Ok(tx_info)) => tx_info,
-        Ok(Err(e)) => {
-            let status = rpc.get_signature_status(&sig).await.ok().flatten();
-            anyhow::bail!(
-                "getTransaction failed after {}ms: {} | {}",
-                tx_fetch_started_at.elapsed().as_millis(),
-                e,
-                format_signature_status(status.as_ref())
-            );
-        }
-        Err(_) => {
-            let status = rpc.get_signature_status(&sig).await.ok().flatten();
-            anyhow::bail!(
-                "getTransaction timeout after {}ms | {}",
-                tx_fetch_started_at.elapsed().as_millis(),
-                format_signature_status(status.as_ref())
-            );
-        }
-    };
-    let tx_fetch_ms = tx_fetch_started_at.elapsed().as_millis();
-
-    // ── 2. Find Solend liquidate instruction (most accounts) ─────────────────
-    let resolve_started_at = Instant::now();
-    let liq_ix_idx = tx_info
-        .instruction_programs
-        .iter()
-        .enumerate()
-        .filter(|(_, &prog_idx)| {
-            tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) == Some(SOLEND_PROGRAM)
-        })
-        .max_by_key(|(ix_idx, _)| {
-            tx_info
-                .instruction_accounts
-                .get(*ix_idx)
-                .map(|a| a.len())
-                .unwrap_or(0)
-        })
-        .map(|(ix_idx, _)| ix_idx)
-        .ok_or_else(|| anyhow::anyhow!("no Solend liquidate instruction found"))?;
-
-    let liq_accs = &tx_info.instruction_accounts[liq_ix_idx];
-    let liq_data = &tx_info.instruction_data[liq_ix_idx];
-
-    if liq_accs.len() < 9 || liq_data.len() < 16 {
-        anyhow::bail!(
-            "Solend liquidate instruction malformed (accs={} data={})",
-            liq_accs.len(),
-            liq_data.len()
-        );
-    }
-
-    // ── 3. Competitor's wallet = account_keys[0] (fee payer / signer) ────────
-    let competitor = tx_info
-        .account_keys
-        .get(0)
-        .ok_or_else(|| anyhow::anyhow!("empty account_keys"))?
-        .clone();
-
-    // ── 4. Build: account_index → (mint, owner) from token balances ──────────
-    // This lets us identify competitor ATAs and derive our equivalent ATAs.
-    let balance_map: HashMap<usize, (String, String)> = tx_info
-        .post_token_balances
-        .iter()
-        .chain(tx_info.pre_token_balances.iter())
-        .map(|b| (b.account_index, (b.mint.clone(), b.owner.clone())))
-        .collect();
-
-    // ── 5. Find repay token: competitor ATA that decreased (owned by competitor)
-    // We look for a wallet_token whose mint appears in the balances for an
-    // account owned by the competitor. That's the token they repaid with.
-    let repay_mint_str = balance_map
-        .values()
-        .find(|(_, owner)| owner == &competitor)
-        .map(|(mint, _)| mint.clone())
-        .ok_or_else(|| anyhow::anyhow!("could not identify repay mint for this liquidation"))?;
-
-    let Some(repay_mint) = wallet_index.get(&repay_mint_str) else {
-        trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "solend",
-            stage: "skip",
-            signature: sig.clone(),
-            obligation: None,
-            repay_mint: Some(repay_mint_str.clone()),
-            repay_symbol: None,
-            reason: Some("token_not_whitelisted".to_string()),
-            detail: Some("token not whitelisted".to_string()),
-            ws_received_at_ms: Some(ws_received_at_ms),
-            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-            bundle_id: None,
-            shortlist_hit: None,
-            shortlist_state: None,
-            shortlist_age_ms: None,
-            prepared_context_used: None,
-            candidate_score: None,
-            refresh_reason: None,
-        });
-        log_stderr(format!(
-            "[hunter-solend] skip: token not whitelisted | repay_mint={}",
-            repay_mint_str
-        ));
-        return Ok(());
-    };
-
-    // ── 6. Dedup: skip if we fired on this obligation recently ───────────────
-    // Obligation is at accounts[5] for LiquidateWithoutReceivingCtokens
-    // (observer confirmed: accounts[5] = obligation, accounts[8] = liquidator).
-    // We also fall back to checking a few positions to be safe.
-    let obligation_key_idx = liq_accs
-        .get(5)
-        .and_then(|&i| tx_info.account_keys.get(i))
-        .cloned()
-        .unwrap_or_default();
-    let resolve_ms = resolve_started_at.elapsed().as_millis();
-
-    if obligation_key_idx.is_empty() {
-        anyhow::bail!("could not extract obligation pubkey from Solend tx");
-    }
-
-    {
-        let mut map = dedup.lock().unwrap();
-        map.retain(|_, t| t.elapsed().as_millis() < DEFAULT_OBLIGATION_DEDUP_MS);
-        if map.contains_key(&obligation_key_idx) {
-            trace_logger.log(HunterTraceEvent {
-                timestamp: crate::utils::utc_now(),
-                protocol: "solend",
-                stage: "skip",
-                signature: sig.clone(),
-                obligation: Some(obligation_key_idx.clone()),
-                repay_mint: Some(repay_mint.mint.clone()),
-                repay_symbol: Some(repay_mint.symbol.clone()),
-                reason: Some("dedup".to_string()),
-                detail: None,
-                ws_received_at_ms: Some(ws_received_at_ms),
-                elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                bundle_id: None,
-                shortlist_hit: None,
-                shortlist_state: None,
-                shortlist_age_ms: None,
-                prepared_context_used: None,
-                candidate_score: None,
-                refresh_reason: None,
-            });
-            return Ok(());
-        }
-        map.insert(obligation_key_idx.clone(), std::time::Instant::now());
-    }
-    if repay_mint.max_repay_native == 0 {
-        trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "solend",
-            stage: "skip",
-            signature: sig.clone(),
-            obligation: Some(obligation_key_idx.clone()),
-            repay_mint: Some(repay_mint.mint.clone()),
-            repay_symbol: Some(repay_mint.symbol.clone()),
-            reason: Some("wallet_token_zero_cap".to_string()),
-            detail: None,
-            ws_received_at_ms: Some(ws_received_at_ms),
-            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-            bundle_id: None,
-            shortlist_hit: None,
-            shortlist_state: None,
-            shortlist_age_ms: None,
-            prepared_context_used: None,
-            candidate_score: None,
-            refresh_reason: None,
-        });
-        return Ok(());
-    }
-
-    // ── 7. Build instruction list ────────────────────────────────────────────
-    // ComputeBudget: 350k CU (sufficient for refresh x2 + liquidate without flash loan)
-    let compute_unit_limit = std::env::var("SOLEND_COMPUTE_UNIT_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(400_000);
-    let compute_unit_price = std::env::var("SOLEND_CU_PRICE_MICROLAMPORTS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5_000);
-
-    let mut instructions: Vec<Instruction> = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
-        ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
-    ];
-
-    // Copy all Solend non-liquidate instructions (RefreshReserve, RefreshObligation)
-    // verbatim — they contain no user-specific accounts.
-    let solend_pk = Pubkey::from_str(SOLEND_PROGRAM).unwrap();
-    for (idx, (&prog_idx, accs)) in tx_info
-        .instruction_programs
-        .iter()
-        .zip(tx_info.instruction_accounts.iter())
-        .enumerate()
-    {
-        let prog_key = match tx_info.account_keys.get(prog_idx) {
-            Some(k) => k.as_str(),
-            None => continue,
-        };
-        if prog_key != SOLEND_PROGRAM {
-            continue;
-        }
-        if idx == liq_ix_idx {
-            continue;
-        } // skip liquidate — we rebuild it below
-
-        // Resolve account metas: assume all non-signer / non-writable for refresh
-        let acc_metas: Vec<AccountMeta> = accs
-            .iter()
-            .filter_map(|&ai| {
-                tx_info
-                    .account_keys
-                    .get(ai)
-                    .and_then(|k| Pubkey::from_str(k).ok())
-                    .map(|pk| AccountMeta::new_readonly(pk, false))
-            })
-            .collect();
-
-        let data = tx_info
-            .instruction_data
-            .get(idx)
-            .cloned()
-            .unwrap_or_default();
-        instructions.push(Instruction {
-            program_id: solend_pk,
-            accounts: acc_metas,
-            data,
-        });
-    }
-
-    // Rebuild the liquidate instruction, replacing competitor accounts with ours.
-    {
-        let liquidator = keypair.pubkey();
-
-        let acc_metas: Vec<AccountMeta> = liq_accs
-            .iter()
-            .enumerate()
-            .map(|(pos, &ai)| {
-                let key_str = tx_info
-                    .account_keys
-                    .get(ai)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                let pk = Pubkey::from_str(key_str).unwrap_or_default();
-
-                // Determine if this is a competitor-owned ATA → replace with ours
-                if let Some((mint_str, owner)) = balance_map.get(&ai) {
-                    if owner == &competitor {
-                        // It's the competitor's token account — use our ATA for the same mint
-                        if let Some(runtime) = wallet_index.get(mint_str) {
-                            return AccountMeta::new(runtime.source_ata, false);
-                        }
-                        if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
-                            return AccountMeta::new(get_ata(&liquidator, &mint_pk), false);
-                        }
-                    }
-                }
-
-                // It's the competitor's wallet (signer) — use our keypair
-                if key_str == competitor {
-                    return AccountMeta::new_readonly(liquidator, true);
-                }
-
-                // All other accounts (reserves, obligation, market, programs) are kept as-is.
-                // Mark writable if it was writable in the original tx.
-                // Heuristic: assume writable unless it's a program, sysvar, or readonly constant.
-                let is_program_or_sysvar = pk == solana_sdk::system_program::id()
-                    || pk == Pubkey::from_str(TOKEN_PROGRAM).unwrap_or_default()
-                    || pk == sysvar::instructions::id()
-                    || pk == solana_sdk::sysvar::clock::id()
-                    || pk == solana_sdk::sysvar::rent::id()
-                    || prog_idx_is_program(&tx_info, ai);
-
-                // Readonly marker positions (lending market, lending market authority, token program)
-                // are typically the last 3-4 accounts in Solend's liquidate instruction.
-                let is_likely_readonly =
-                    is_program_or_sysvar || pos >= liq_accs.len().saturating_sub(4);
-
-                if is_likely_readonly {
-                    AccountMeta::new_readonly(pk, false)
-                } else {
-                    AccountMeta::new(pk, false)
-                }
-            })
-            .collect();
-
-        // Copy instruction data, replacing liquidity_amount (bytes 8-15) with our cap.
-        let mut data = liq_data.clone();
-        let amount = repay_mint.max_repay_native;
-        data[8..16].copy_from_slice(&amount.to_le_bytes());
-
-        instructions.push(Instruction {
-            program_id: solend_pk,
-            accounts: acc_metas,
-            data,
-        });
-    }
-
-    // Jito tip
-    let base_tip_lamports = cached_tip.load(Ordering::Relaxed);
-    let tip_account = select_jito_tip_account(&sig)?;
-    instructions.push(solana_sdk::system_instruction::transfer(
-        &keypair.pubkey(),
-        &tip_account,
-        base_tip_lamports,
-    ));
-    let liquidator = keypair.pubkey();
-    let tip_instruction_idx = instructions.len() - 1;
-    let max_send_attempts = jito_send_max_attempts();
-    let initial_timing_detail = format_stage_timings(
-        tx_fetch_ms,
-        resolve_ms,
-        0,
-        0,
-        None,
-        started_at.elapsed().as_millis(),
-    );
-
-    // ── 9. Send bundle ───────────────────────────────────────────────────────
-    trace_logger.log(HunterTraceEvent {
-        timestamp: crate::utils::utc_now(),
-        protocol: "solend",
-        stage: "firing",
-        signature: sig.clone(),
-        obligation: Some(obligation_key_idx.clone()),
-        repay_mint: Some(repay_mint.mint.clone()),
-        repay_symbol: Some(repay_mint.symbol.clone()),
-        reason: None,
-        detail: Some(format!(
-            "tip={} tip_account={} cu_price={} max_send_attempts={} {}",
-            base_tip_lamports,
-            tip_account,
-            compute_unit_price,
-            max_send_attempts,
-            initial_timing_detail
-        )),
-        ws_received_at_ms: Some(ws_received_at_ms),
-        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-        bundle_id: None,
-        shortlist_hit: None,
-        shortlist_state: None,
-        shortlist_age_ms: None,
-        prepared_context_used: None,
-        candidate_score: None,
-        refresh_reason: None,
-    });
-    let _ = log_hunter_observation(
-        &logger,
-        "Solend",
-        "HUNTER_FIRING",
-        &sig,
-        Some(obligation_key_idx.clone()),
-        Some(liquidator.to_string()),
-        Some(repay_mint),
-        Some(format!(
-            "tip={} tip_account={} cu_price={} max_send_attempts={} {}",
-            base_tip_lamports,
-            tip_account,
-            compute_unit_price,
-            max_send_attempts,
-            initial_timing_detail
-        )),
-        Some(elapsed_ms_since(ws_received_at_ms)),
-    )
-    .await;
-    log_stderr(format!(
-        "[hunter-solend] FIRING | obligation={} repay={} tip={} max_attempts={}",
-        &obligation_key_idx[..8.min(obligation_key_idx.len())],
-        repay_mint.symbol,
-        base_tip_lamports,
-        max_send_attempts,
-    ));
-
-    if hunter_dry_run_enabled() {
-        let dry_run_blockhash = *cached_blockhash.read().await;
-        let build_started_at = Instant::now();
-        let message = Message::try_compile(&liquidator, &instructions, &[], dry_run_blockhash)
-            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
-        let build_ms = build_started_at.elapsed().as_millis();
-        let tx_bytes = bincode::serialize(&tx)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
-        trace_logger.log(HunterTraceEvent {
-            timestamp: crate::utils::utc_now(),
-            protocol: "solend",
-            stage: "dry_run",
-            signature: sig.clone(),
-            obligation: Some(obligation_key_idx.clone()),
-            repay_mint: Some(repay_mint.mint.clone()),
-            repay_symbol: Some(repay_mint.symbol.clone()),
-            reason: Some("dry_run_enabled".to_string()),
-            detail: Some(format!(
-                "tx_size_bytes={} tip={} cu_price={} attempt=1/{} {}",
-                tx_bytes,
-                base_tip_lamports,
-                compute_unit_price,
-                max_send_attempts,
-                format_stage_timings(
-                    tx_fetch_ms,
-                    resolve_ms,
-                    0,
-                    build_ms,
-                    None,
-                    started_at.elapsed().as_millis(),
-                )
-            )),
-            ws_received_at_ms: Some(ws_received_at_ms),
-            elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-            bundle_id: None,
-            shortlist_hit: None,
-            shortlist_state: None,
-            shortlist_age_ms: None,
-            prepared_context_used: None,
-            candidate_score: None,
-            refresh_reason: None,
-        });
-        log_stderr(format!(
-            "[hunter-solend] DRY RUN | obligation={} repay={} tx_size={}",
-            &obligation_key_idx[..8.min(obligation_key_idx.len())],
-            repay_mint.symbol,
-            tx_bytes
-        ));
-        return Ok(());
-    }
-
-    for attempt in 1..=max_send_attempts {
-        let tip_lamports = retry_tip_lamports(base_tip_lamports, attempt);
-        instructions[tip_instruction_idx] =
-            solana_sdk::system_instruction::transfer(&liquidator, &tip_account, tip_lamports);
-
-        let blockhash = if attempt == 1 {
-            *cached_blockhash.read().await
-        } else {
-            match rpc.get_latest_blockhash().await {
-                Ok(latest_blockhash) => {
-                    *cached_blockhash.write().await = latest_blockhash;
-                    latest_blockhash
-                }
-                Err(_) => *cached_blockhash.read().await,
-            }
-        };
-
-        let build_started_at = Instant::now();
-        let message = Message::try_compile(&liquidator, &instructions, &[], blockhash)
-            .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*keypair])
-            .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
-        let build_ms = build_started_at.elapsed().as_millis();
-
-        let send_started_at = Instant::now();
-        match jito.send_bundle(vec![tx]).await {
-            Ok(bundle_id) => {
-                let send_bundle_ms = send_started_at.elapsed().as_millis();
-                let bundle_detail = format!(
-                    "attempt={}/{} tip={} {}",
-                    attempt,
-                    max_send_attempts,
-                    tip_lamports,
-                    format_stage_timings(
-                        tx_fetch_ms,
-                        resolve_ms,
-                        0,
-                        build_ms,
-                        Some(send_bundle_ms),
-                        started_at.elapsed().as_millis(),
-                    )
-                );
-                trace_logger.log(HunterTraceEvent {
-                    timestamp: crate::utils::utc_now(),
-                    protocol: "solend",
-                    stage: "bundle_sent",
-                    signature: sig.clone(),
-                    obligation: Some(obligation_key_idx.clone()),
-                    repay_mint: Some(repay_mint.mint.clone()),
-                    repay_symbol: Some(repay_mint.symbol.clone()),
-                    reason: None,
-                    detail: Some(bundle_detail.clone()),
-                    ws_received_at_ms: Some(ws_received_at_ms),
-                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                    bundle_id: Some(bundle_id.clone()),
-                    shortlist_hit: None,
-                    shortlist_state: None,
-                    shortlist_age_ms: None,
-                    prepared_context_used: None,
-                    candidate_score: None,
-                    refresh_reason: None,
-                });
-                let _ = log_hunter_observation(
-                    &logger,
-                    "Solend",
-                    "HUNTER_BUNDLE_SENT",
-                    &sig,
-                    Some(obligation_key_idx.clone()),
-                    Some(liquidator.to_string()),
-                    Some(repay_mint),
-                    Some(bundle_detail),
-                    Some(elapsed_ms_since(ws_received_at_ms)),
-                )
-                .await;
-                log_stderr(format!(
-                    "[hunter-solend] BUNDLE SENT | obligation={} bundle={} attempt={}/{}",
-                    &obligation_key_idx[..8.min(obligation_key_idx.len())],
-                    &bundle_id[..12.min(bundle_id.len())],
-                    attempt,
-                    max_send_attempts
-                ));
-                return Ok(());
-            }
-            Err(error) => {
-                let send_bundle_ms = send_started_at.elapsed().as_millis();
-                let error_message = error.to_string();
-                let bundle_detail = format!(
-                    "attempt={}/{} tip={} {} | {}",
-                    attempt,
-                    max_send_attempts,
-                    tip_lamports,
-                    error_message,
-                    format_stage_timings(
-                        tx_fetch_ms,
-                        resolve_ms,
-                        0,
-                        build_ms,
-                        Some(send_bundle_ms),
-                        started_at.elapsed().as_millis(),
-                    )
-                );
-
-                if attempt < max_send_attempts && is_retryable_jito_error(&error_message) {
-                    trace_logger.log(HunterTraceEvent {
-                        timestamp: crate::utils::utc_now(),
-                        protocol: "solend",
-                        stage: "bundle_retry",
-                        signature: sig.clone(),
-                        obligation: Some(obligation_key_idx.clone()),
-                        repay_mint: Some(repay_mint.mint.clone()),
-                        repay_symbol: Some(repay_mint.symbol.clone()),
-                        reason: Some(if is_expired_blockhash_error(&error_message) {
-                            "expired_blockhash_retry".to_string()
-                        } else {
-                            "retryable_bundle_send_error".to_string()
-                        }),
-                        detail: Some(bundle_detail),
-                        ws_received_at_ms: Some(ws_received_at_ms),
-                        elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                        bundle_id: None,
-                        shortlist_hit: None,
-                        shortlist_state: None,
-                        shortlist_age_ms: None,
-                        prepared_context_used: None,
-                        candidate_score: None,
-                        refresh_reason: None,
-                    });
-                    let backoff_ms = retry_backoff_ms(attempt);
-                    if backoff_ms > 0 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-                    }
-                    continue;
-                }
-
-                trace_logger.log(HunterTraceEvent {
-                    timestamp: crate::utils::utc_now(),
-                    protocol: "solend",
-                    stage: "error",
-                    signature: sig.clone(),
-                    obligation: Some(obligation_key_idx.clone()),
-                    repay_mint: Some(repay_mint.mint.clone()),
-                    repay_symbol: Some(repay_mint.symbol.clone()),
-                    reason: Some("bundle_send_failed".to_string()),
-                    detail: Some(bundle_detail.clone()),
-                    ws_received_at_ms: Some(ws_received_at_ms),
-                    elapsed_ms: Some(elapsed_ms_since(ws_received_at_ms)),
-                    bundle_id: None,
-                    shortlist_hit: None,
-                    shortlist_state: None,
-                    shortlist_age_ms: None,
-                    prepared_context_used: None,
-                    candidate_score: None,
-                    refresh_reason: None,
-                });
-                let _ = log_hunter_observation(
-                    &logger,
-                    "Solend",
-                    "HUNTER_BUNDLE_FAILED",
-                    &sig,
-                    Some(obligation_key_idx.clone()),
-                    Some(liquidator.to_string()),
-                    Some(repay_mint),
-                    Some(bundle_detail),
-                    Some(elapsed_ms_since(ws_received_at_ms)),
-                )
-                .await;
-                log_stderr(format!(
-                    "[hunter-solend] bundle send failed (attempt={}/{}): {}",
-                    attempt, max_send_attempts, error_message
-                ));
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Returns true if the given account index is used as a program id in any instruction.
-/// Used to identify program accounts (always readonly) vs data accounts.
-fn prog_idx_is_program(tx: &crate::ports::rpc::TransactionInfo, ai: usize) -> bool {
-    tx.instruction_programs.contains(&ai)
-}
-
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-fn elapsed_ms_since(ws_received_at_ms: u64) -> u64 {
+pub(crate) fn elapsed_ms_since(ws_received_at_ms: u64) -> u64 {
     now_ms().saturating_sub(ws_received_at_ms)
 }
 
-fn format_stage_timings(
+pub(crate) fn format_stage_timings(
     tx_fetch_ms: u128,
     resolve_ms: u128,
     prep_ms: u128,
@@ -4482,7 +3022,7 @@ fn format_stage_timings(
     }
 }
 
-async fn log_hunter_observation<L: LiquidationLogger>(
+pub(crate) async fn log_hunter_observation<L: LiquidationLogger>(
     logger: &L,
     protocol: &str,
     status: &str,
@@ -4521,49 +3061,6 @@ async fn log_hunter_observation<L: LiquidationLogger>(
     logger.log_observation(&event).await
 }
 
-fn kamino_liquidate_discriminators() -> [[u8; 8]; 2] {
-    [
-        discriminator("liquidate_obligation_and_redeem_reserve_collateral_v2"),
-        discriminator("liquidate_obligation_and_redeem_reserve_collateral"),
-    ]
-}
-
-fn find_kamino_liquidate_ix(tx_info: &crate::ports::rpc::TransactionInfo) -> Option<usize> {
-    let expected_discriminators = kamino_liquidate_discriminators();
-    let mut fallback_idx = None;
-
-    for (ix_idx, &prog_idx) in tx_info.instruction_programs.iter().enumerate() {
-        if tx_info.account_keys.get(prog_idx).map(|s| s.as_str()) != Some(KLEND_PROGRAM) {
-            continue;
-        }
-
-        if tx_info
-            .instruction_data
-            .get(ix_idx)
-            .map(|data| {
-                data.len() >= 8
-                    && expected_discriminators
-                        .iter()
-                        .any(|expected| data[..8] == *expected)
-            })
-            .unwrap_or(false)
-        {
-            return Some(ix_idx);
-        }
-
-        let account_len = tx_info
-            .instruction_accounts
-            .get(ix_idx)
-            .map(|accounts| accounts.len())
-            .unwrap_or(0);
-        if account_len >= 13 {
-            fallback_idx = Some(ix_idx);
-        }
-    }
-
-    fallback_idx
-}
-
 // ── Solend log helpers ────────────────────────────────────────────────────────
 
 fn extract_obligation_pda_from_logs(logs: &[String]) -> Option<String> {
@@ -4597,27 +3094,7 @@ mod tests {
     use super::*;
     use crate::ports::rpc::TransactionInfo;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Mutex, OnceLock};
     use tokio::sync::{mpsc, Barrier};
-
-    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env mutex poisoned")
-    }
-
-    #[test]
-    fn parse_toml_u64_supports_underscores_and_comments() {
-        assert_eq!(
-            parse_toml_u64(
-                "max_repay_native = 1_500_000_000  # 1.5 SOL",
-                "max_repay_native"
-            ),
-            Some(1_500_000_000)
-        );
-    }
 
     #[test]
     fn finds_kamino_liquidate_instruction_by_discriminator() {
@@ -4625,7 +3102,7 @@ mod tests {
         liquidate_data.extend_from_slice(&[0; 24]);
 
         let tx = TransactionInfo {
-            account_keys: vec![KLEND_PROGRAM.to_string(), "Other111".to_string()],
+            account_keys: vec![KAMINO_PROGRAM_ID.to_string(), "Other111".to_string()],
             instruction_accounts: vec![vec![0, 1, 2], vec![0, 1, 2, 3, 4, 5]],
             instruction_programs: vec![0, 0],
             instruction_data: vec![vec![1, 2, 3], liquidate_data],
@@ -4640,7 +3117,7 @@ mod tests {
     #[test]
     fn falls_back_to_large_klend_instruction_when_discriminator_is_missing() {
         let tx = TransactionInfo {
-            account_keys: vec![KLEND_PROGRAM.to_string(), "Other111".to_string()],
+            account_keys: vec![KAMINO_PROGRAM_ID.to_string(), "Other111".to_string()],
             instruction_accounts: vec![vec![0, 1, 2], (0..13).collect()],
             instruction_programs: vec![0, 0],
             instruction_data: vec![vec![1, 2, 3], vec![9, 9, 9]],
@@ -4676,26 +3153,14 @@ mod tests {
             writer: Some(Arc::new(std::sync::Mutex::new(file))),
         };
 
-        logger.log(HunterTraceEvent {
-            timestamp: "2026-04-18T00:00:00Z".to_string(),
-            protocol: "kamino",
-            stage: "skip",
-            signature: "sig".to_string(),
-            obligation: Some("obl".to_string()),
-            repay_mint: Some("mint".to_string()),
-            repay_symbol: Some("USDC".to_string()),
-            reason: Some("dedup".to_string()),
-            detail: None,
-            ws_received_at_ms: Some(1),
-            elapsed_ms: Some(2),
-            bundle_id: None,
-            shortlist_hit: None,
-            shortlist_state: None,
-            shortlist_age_ms: None,
-            prepared_context_used: None,
-            candidate_score: None,
-            refresh_reason: None,
-        });
+        logger.log(
+            HunterTraceEvent::new("kamino", "skip", "sig")
+                .with_obligation("obl")
+                .with_repay_mint("mint")
+                .with_repay_symbol("USDC")
+                .with_reason("dedup")
+                .with_timing(1, 2),
+        );
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"stage\":\"skip\""));
@@ -4859,11 +3324,9 @@ mod tests {
             LockState::Firing {
                 winner_source,
                 acquired_at_ms,
-                firing_started_at_ms,
             } => {
                 assert_eq!(*winner_source, HunterSignalSource::PrimaryRpc);
                 assert_eq!(*acquired_at_ms, 100);
-                assert_eq!(*firing_started_at_ms, 102);
             }
             other => panic!("unexpected state: {other:?}"),
         }
@@ -4908,14 +3371,10 @@ mod tests {
             LockState::Fired {
                 winner_source,
                 acquired_at_ms,
-                firing_started_at_ms,
-                fired_at_ms,
                 outcome,
             } => {
                 assert_eq!(*winner_source, HunterSignalSource::PrimaryRpc);
                 assert_eq!(*acquired_at_ms, 100);
-                assert_eq!(*firing_started_at_ms, 102);
-                assert_eq!(*fired_at_ms, 104);
                 assert!(matches!(outcome, FireOutcome::BundleSent));
             }
             other => panic!("unexpected state: {other:?}"),
@@ -5034,44 +3493,6 @@ mod tests {
             summaries.push(summary);
         }
         assert_eq!(summaries.len(), 1, "expected exactly one summary emission");
-    }
-
-    #[test]
-    fn source_toggles_are_read_independently() {
-        let _guard = env_test_guard();
-        unsafe {
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRIMARY", "false");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_SECONDARY", "true");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED", "true");
-        }
-        let cfg = read_kamino_signal_source_config(true);
-        assert!(!cfg.primary_rpc_enabled);
-        assert!(cfg.secondary_rpc_enabled);
-        assert!(cfg.price_feed_enabled);
-        unsafe {
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRIMARY");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_SECONDARY");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED");
-        }
-    }
-
-    #[test]
-    fn primary_only_mode_disables_secondary_and_price_feed_effectively() {
-        let _guard = env_test_guard();
-        unsafe {
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRIMARY", "true");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_SECONDARY", "false");
-            std::env::set_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED", "false");
-        }
-        let cfg = read_kamino_signal_source_config(true);
-        assert!(cfg.primary_rpc_enabled);
-        assert!(!cfg.secondary_rpc_enabled);
-        assert!(!cfg.price_feed_enabled);
-        unsafe {
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRIMARY");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_SECONDARY");
-            std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED");
-        }
     }
 
     #[test]

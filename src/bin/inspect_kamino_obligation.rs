@@ -16,7 +16,6 @@ use solana_sdk::{
     signature::{read_keypair_file, Keypair, Signer},
     transaction::Transaction,
 };
-use std::collections::BTreeSet;
 use std::str::FromStr;
 
 const KLEND_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
@@ -374,6 +373,30 @@ fn print_metrics(label: &str, obligation: &Obligation) {
     println!("Liquidatable         : {}", obligation.is_liquidatable());
 }
 
+fn active_reserve_pubkeys_in_refresh_order(obligation: &Obligation) -> Vec<Pubkey> {
+    let mut reserve_pks = Vec::new();
+
+    for deposit in &obligation.deposits {
+        if deposit.deposited_amount > 0 || deposit.market_value_sf > 0 {
+            let reserve_pk = Pubkey::new_from_array(deposit.deposit_reserve);
+            if !reserve_pks.contains(&reserve_pk) {
+                reserve_pks.push(reserve_pk);
+            }
+        }
+    }
+
+    for borrow in &obligation.borrows {
+        if borrow.borrowed_amount_sf > 0 || borrow.market_value_sf > 0 {
+            let reserve_pk = Pubkey::new_from_array(borrow.borrow_reserve);
+            if !reserve_pks.contains(&reserve_pk) {
+                reserve_pks.push(reserve_pk);
+            }
+        }
+    }
+
+    reserve_pks
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
@@ -399,21 +422,9 @@ async fn main() -> Result<()> {
     let obligation = decode_anchor_account::<Obligation>(&account.data)?;
     print_metrics("Snapshot RPC brut", &obligation);
 
-    let mut reserve_pks = BTreeSet::new();
-    for deposit in &obligation.deposits {
-        if deposit.deposited_amount > 0 || deposit.market_value_sf > 0 {
-            reserve_pks.insert(Pubkey::new_from_array(deposit.deposit_reserve));
-        }
-    }
-    for borrow in &obligation.borrows {
-        if borrow.borrowed_amount_sf > 0 || borrow.market_value_sf > 0 {
-            reserve_pks.insert(Pubkey::new_from_array(borrow.borrow_reserve));
-        }
-    }
-
     let klend = Pubkey::from_str(KLEND_PROGRAM)?;
     let market = Pubkey::new_from_array(obligation.lending_market);
-    let reserve_pks: Vec<Pubkey> = reserve_pks.into_iter().collect();
+    let reserve_pks = active_reserve_pubkeys_in_refresh_order(&obligation);
 
     println!("\n--- Réserves à refresh ---");
     let mut refresh_ixs = Vec::new();

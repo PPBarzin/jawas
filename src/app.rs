@@ -1,11 +1,15 @@
 use crate::application::heartbeat::HeartbeatService;
 use crate::application::hunter::{
-    load_wallet_tokens, HunterService, WalletToken, DEFAULT_KAMINO_REPLAY_SIGNATURE,
+    HunterService, DEFAULT_KAMINO_REPLAY_SIGNATURE,
 };
-use crate::application::observer::{ObserverService, Protocol};
+use crate::application::observer::ObserverService;
 use crate::config::AppConfig;
+use crate::config::wallet::{load_wallet_tokens, WalletToken};
+use crate::domain::protocol::Protocol;
 use crate::infrastructure::{
-    airtable::AirtableAdapter, helius::HeliusAdapter, jito::JitoAdapter, jupiter::JupiterAdapter,
+    airtable::AirtableLoggerAdapter,
+    helius::HeliusAdapter,
+    jito::JitoAdapter,
     oracle::SimplePriceOracle,
 };
 use crate::logging::{log_error, log_info, log_runtime};
@@ -34,14 +38,14 @@ pub async fn run() -> anyhow::Result<()> {
         HeliusAdapter::with_tx_commitment(&rpc.rpc_url, &rpc.ws_url, &rpc.tx_commitment)
     });
 
-    let logger = AirtableAdapter::new(
+    let (logger, logger_worker) = AirtableLoggerAdapter::new(
         config.airtable.token.clone(),
         config.airtable.base_id.clone(),
         config.airtable.watch_table.clone(),
     );
+    tokio::spawn(async move { logger_worker.run().await });
     let oracle = SimplePriceOracle::new(Some(&config.hunter.jupiter_base_url));
     let jito = JitoAdapter::new(&config.hunter.jito_url);
-    let jupiter = JupiterAdapter::new(Some(&config.hunter.jupiter_base_url));
 
     let protocol = config.runtime.protocol();
     let hunter_service = build_hunter_service(
@@ -49,9 +53,7 @@ pub async fn run() -> anyhow::Result<()> {
         hunter_rpc.clone(),
         hunter_signal_secondary_rpc.clone(),
         logger.clone(),
-        oracle.clone(),
         jito,
-        jupiter,
     )?;
 
     if config.runtime.enable_hunter {
@@ -66,7 +68,7 @@ pub async fn run() -> anyhow::Result<()> {
     send_boot_ping(&logger, protocol).await?;
 
     if let Some(hunter) = hunter_service {
-        let wallet_tokens = load_wallet_tokens(&config.hunter.wallet_toml_path);
+        let wallet_tokens = load_wallet_tokens(&config.hunter.wallet_toml_path)?;
         if config.hunter.replay_enabled || config.hunter.replay_signature.is_some() {
             run_hunter_replay(
                 &hunter,
@@ -98,16 +100,14 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 type JawasHunter =
-    HunterService<HeliusAdapter, JitoAdapter, JupiterAdapter, SimplePriceOracle, AirtableAdapter>;
+    HunterService<HeliusAdapter, JitoAdapter, AirtableLoggerAdapter>;
 
 fn build_hunter_service(
     config: &AppConfig,
     hunter_rpc: HeliusAdapter,
     hunter_signal_secondary_rpc: Option<HeliusAdapter>,
-    logger: AirtableAdapter,
-    oracle: SimplePriceOracle,
+    logger: AirtableLoggerAdapter,
     jito: JitoAdapter,
-    jupiter: JupiterAdapter,
 ) -> anyhow::Result<Option<JawasHunter>> {
     if !config.runtime.enable_hunter {
         return Ok(None);
@@ -143,8 +143,6 @@ fn build_hunter_service(
         hunter_rpc,
         hunter_signal_secondary_rpc,
         jito,
-        jupiter,
-        oracle,
         logger,
         keypair,
         config.hunter.max_repay_usd,
@@ -169,7 +167,7 @@ async fn log_rpc_healthcheck(label: &str, rpc: &HeliusAdapter) {
     }
 }
 
-async fn send_boot_ping(logger: &AirtableAdapter, protocol: Protocol) -> anyhow::Result<()> {
+async fn send_boot_ping(logger: &AirtableLoggerAdapter, protocol: Protocol) -> anyhow::Result<()> {
     let ping_event = ObservationEvent {
         timestamp: crate::utils::utc_now(),
         signature: format!("Jawas {} is alive", protocol.name()),
@@ -231,6 +229,7 @@ fn spawn_hunter(protocol: Protocol, hunter: JawasHunter, wallet_tokens: Vec<Wall
         Protocol::Kamino => {
             tokio::spawn(async move {
                 loop {
+                    // Restarting the hunter loop also reloads HunterRuntimeConfig from env.
                     if let Err(error) = hunter.run_kamino(wallet_tokens.clone()).await {
                         log_error(
                             "hunter-kamino",
@@ -244,6 +243,7 @@ fn spawn_hunter(protocol: Protocol, hunter: JawasHunter, wallet_tokens: Vec<Wall
         Protocol::Solend => {
             tokio::spawn(async move {
                 loop {
+                    // Restarting the hunter loop also reloads HunterRuntimeConfig from env.
                     if let Err(error) = hunter.run_solend(wallet_tokens.clone()).await {
                         log_error(
                             "hunter-solend",
@@ -260,7 +260,7 @@ fn spawn_hunter(protocol: Protocol, hunter: JawasHunter, wallet_tokens: Vec<Wall
 fn spawn_observer(
     protocol: Protocol,
     rpc: HeliusAdapter,
-    logger: AirtableAdapter,
+    logger: AirtableLoggerAdapter,
     oracle: SimplePriceOracle,
 ) {
     tokio::spawn(async move {
@@ -288,7 +288,7 @@ fn spawn_observer(
     });
 }
 
-fn spawn_heartbeat(logger: AirtableAdapter) {
+fn spawn_heartbeat(logger: AirtableLoggerAdapter) {
     tokio::spawn(async move {
         let heartbeat = HeartbeatService::new(logger);
         heartbeat

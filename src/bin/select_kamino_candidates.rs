@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use borsh::BorshDeserialize;
-use jawas::application::hunter::load_wallet_tokens;
+use jawas::config::wallet::load_wallet_tokens;
 use jawas::domain::kamino::Obligation;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
@@ -255,8 +255,8 @@ fn load_candidates(path: &PathBuf) -> Result<Vec<Candidate>> {
     Ok(candidates)
 }
 
-fn filter_candidates(cli: &Cli, candidates: Vec<Candidate>) -> Vec<FilteredCandidate> {
-    let wallet_tokens = load_wallet_tokens(&cli.wallet_toml_path);
+fn filter_candidates(cli: &Cli, candidates: Vec<Candidate>) -> Result<Vec<FilteredCandidate>> {
+    let wallet_tokens = load_wallet_tokens(&cli.wallet_toml_path)?;
     let wallet_symbols = wallet_tokens
         .into_iter()
         .filter(|token| token.max_repay_native > 0)
@@ -338,7 +338,7 @@ fn filter_candidates(cli: &Cli, candidates: Vec<Candidate>) -> Vec<FilteredCandi
             })
     });
 
-    filtered
+    Ok(filtered)
 }
 
 fn resolve_rpc_url(cli: &Cli) -> Result<String> {
@@ -406,8 +406,8 @@ fn annotate_onchain(cli: &Cli, filtered: Vec<FilteredCandidate>) -> Result<Vec<F
     Ok(annotated)
 }
 
-fn print_wallet_summary(path: &str) {
-    let wallet_tokens = load_wallet_tokens(path);
+fn print_wallet_summary(path: &str) -> Result<()> {
+    let wallet_tokens = load_wallet_tokens(path)?;
     println!("Wallet coverage:");
     println!("  wallet_toml       : {path}");
     for token in wallet_tokens.iter().filter(|token| token.max_repay_native > 0) {
@@ -418,13 +418,14 @@ fn print_wallet_summary(path: &str) {
             token.max_repay_native
         );
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = parse_cli()?;
-    print_wallet_summary(&cli.wallet_toml_path);
+    print_wallet_summary(&cli.wallet_toml_path)?;
     let candidates = load_candidates(&cli.csv_path)?;
-    let filtered = annotate_onchain(&cli, filter_candidates(&cli, candidates))?;
+    let filtered = annotate_onchain(&cli, filter_candidates(&cli, candidates)?)?;
 
     println!("Scan:");
     println!("  csv               : {}", cli.csv_path.display());

@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client as HttpClient;
 use serde_json::json;
-use solana_client::rpc_client::RpcClient as SolanaRpcClient;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -13,11 +12,8 @@ use crate::ports::rpc::{
 use crate::utils::log_stderr;
 use bs58;
 
-use std::sync::Arc;
-
 #[derive(Clone)]
 pub struct HeliusAdapter {
-    client: Arc<SolanaRpcClient>,
     ws_url: String,
     rpc_url: String,
     http_client: HttpClient,
@@ -35,7 +31,6 @@ impl HeliusAdapter {
         let url = rpc_url.trim_end_matches('/').to_string();
         let ws = ws_url.trim_end_matches('/').to_string();
         Self {
-            client: Arc::new(SolanaRpcClient::new(url.clone())),
             ws_url: ws,
             rpc_url: url,
             http_client: HttpClient::new(),
@@ -143,11 +138,30 @@ fn endpoint_host_label(raw: &str) -> String {
 
 impl RpcClient for HeliusAdapter {
     async fn get_version(&self) -> Result<String> {
-        let version = self
-            .client
-            .get_version()
-            .context("Failed to reach Solana RPC — check RPC_URL")?;
-        Ok(version.solana_core)
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getVersion",
+            "params": []
+        });
+
+        let resp = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("getVersion HTTP request failed ({})", self.rpc_url))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("getVersion response parse failed ({})", self.rpc_url))?;
+
+        body["result"]["solana-core"]
+            .as_str()
+            .map(str::to_string)
+            .context("getVersion: missing solana-core field")
     }
 
     async fn get_transaction(&self, signature: &str) -> Result<TransactionInfo> {

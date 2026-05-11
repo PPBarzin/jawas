@@ -1,4 +1,7 @@
-use crate::application::observer::Protocol;
+pub mod hunter;
+pub mod wallet;
+
+use crate::domain::protocol::Protocol;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
