@@ -21,6 +21,8 @@ pub struct HunterRuntimeConfig {
     pub shortlist_refresh_debounce_ms: u64,
     pub shortlist_cooling_down_ms: u64,
     pub shortlist_candidate_history_limit: usize,
+    pub hermes_armed_stale_ms: u64,
+    pub hermes_cooling_down_ms: u64,
     pub verbose: bool,
 }
 
@@ -131,12 +133,11 @@ impl HunterRuntimeConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1_500);
 
-        let shortlist_cooling_down_ms =
-            std::env::var(format!("{prefix}_SHORTLIST_COOLDOWN_MS"))
-                .ok()
-                .or_else(|| std::env::var("HUNTER_SHORTLIST_COOLDOWN_MS").ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20_000);
+        let shortlist_cooling_down_ms = std::env::var(format!("{prefix}_SHORTLIST_COOLDOWN_MS"))
+            .ok()
+            .or_else(|| std::env::var("HUNTER_SHORTLIST_COOLDOWN_MS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20_000);
 
         let shortlist_candidate_history_limit =
             std::env::var(format!("{prefix}_SHORTLIST_CANDIDATE_HISTORY_LIMIT"))
@@ -145,6 +146,16 @@ impl HunterRuntimeConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .map(|v| v.max(shortlist_max_obligations))
                 .unwrap_or(64);
+
+        let hermes_armed_stale_ms = std::env::var("HERMES_ARMED_STALE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(shortlist_refresh_secs.saturating_mul(1_000));
+
+        let hermes_cooling_down_ms = std::env::var("HERMES_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20_000);
 
         Self {
             signal_commitment,
@@ -158,6 +169,8 @@ impl HunterRuntimeConfig {
             shortlist_refresh_debounce_ms,
             shortlist_cooling_down_ms,
             shortlist_candidate_history_limit,
+            hermes_armed_stale_ms,
+            hermes_cooling_down_ms,
             verbose,
         }
     }

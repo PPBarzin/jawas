@@ -93,6 +93,8 @@ Important variables:
 - `HUNTER_SIGNAL_SECONDARY_RPC_URL`, `HUNTER_SIGNAL_SECONDARY_WS_URL`
 - `ENABLE_HUNTER_SIGNAL_PRIMARY`, `ENABLE_HUNTER_SIGNAL_SECONDARY`
 - `ENABLE_HUNTER_SIGNAL_PRICE_FEED`, `SIGNAL_FEED_WS_URL`
+- `HERMES_SHORTLIST_SIZE`, `HERMES_REFRESH_SECS`, `HERMES_TRIGGER_BUFFER_BPS`
+- `HERMES_ARMED_STALE_MS`, `HERMES_COOLDOWN_MS`
 - `HUNTER_SHORTLIST_ENABLED`, `HUNTER_SHORTLIST_MAX_OBLIGATIONS`
 - `HUNTER_SHORTLIST_REFRESH_SECS`, `HUNTER_SHORTLIST_REFRESH_DEBOUNCE_MS`
 - `AIRTABLE_TOKEN`, `AIRTABLE_BASE_ID`
@@ -110,6 +112,7 @@ Recent runtime notes:
 - hunter traces and signal metrics can be converted into a dated Markdown report for longitudinal comparison
 - RPC variable names are role-based: observer variables configure the observer, hunter variables configure the hunter, and optional hunter secondary signal variables configure only the hunter comparison path
 - the Kamino hunter can maintain a wallet-constrained shortlist seeded by observed liquidation signals, with event-driven refresh plus a safety refresh interval
+- Hermes v1 is passive-only: it pre-arms a bounded Kamino shortlist from Pyth/Hermes price updates, but final firing still requires the normal reactive Kamino signal
 
 ## Install
 

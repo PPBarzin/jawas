@@ -1,32 +1,31 @@
+use crate::application::hermes_shortlist::{
+    decode_kamino_obligation, spawn_price_feed_signal_source, HermesRuntimeConfig,
+    HermesShortlistRuntime,
+};
 use crate::application::kamino_shortlist::{
-    KaminoShortlistRefreshRequest, KaminoShortlistRuntime, PreparedExecutionContext,
-    ShortlistCandidate, ShortlistEntry, ShortlistState, enforce_candidate_history_limit,
-    select_shortlist,
+    enforce_candidate_history_limit, select_shortlist, KaminoShortlistRefreshRequest,
+    KaminoShortlistRuntime, PreparedExecutionContext, ShortlistCandidate, ShortlistEntry,
+    ShortlistState,
 };
 use crate::application::kamino_tx::{
-    KaminoBuildRequest, KaminoBuiltAttempt, KaminoReserveMeta, KaminoResolvedAccounts,
-    build_create_ata_idempotent_ix, build_kamino_attempt_tx, decode_kamino_reserve,
-    discriminator, find_kamino_liquidate_ix, get_or_fetch_kamino_reserve_meta,
-    get_ata, get_ata_with_program, ix_refresh_obligation, ix_refresh_reserve,
-    kamino_destination_ata_setup_enabled, optional_pubkey,
-    resolve_kamino_accounts_from_tx_info,
+    build_create_ata_idempotent_ix, build_kamino_attempt_tx, discriminator,
+    find_kamino_liquidate_ix, get_ata, get_ata_with_program, get_or_fetch_kamino_reserve_meta,
+    ix_refresh_obligation, ix_refresh_reserve, kamino_destination_ata_setup_enabled,
+    resolve_kamino_accounts_from_tx_info, KaminoBuildRequest, KaminoBuiltAttempt,
+    KaminoReserveMeta, KaminoResolvedAccounts,
 };
 use crate::application::solend_hunter::execute_solend_opportunity;
 use crate::config::hunter::{
-    HunterRuntimeConfig, HunterTxFetchConfig, read_kamino_signal_source_config,
+    read_kamino_signal_source_config, HunterRuntimeConfig, HunterTxFetchConfig,
 };
 use crate::config::wallet::WalletToken;
 use crate::domain::protocol::{KAMINO_PROGRAM_ID, SOLEND_PROGRAM_ID};
 use crate::ports::jito::JitoPort;
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
-use crate::ports::rpc::{
-    ProgramAccount, RpcClient, SignatureStatusInfo, StreamingRpcClient,
-};
+use crate::ports::rpc::{RpcClient, SignatureStatusInfo, StreamingRpcClient};
 use crate::utils::log_stderr;
-use borsh::BorshDeserialize;
 use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::DashMap;
-use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
@@ -178,6 +177,13 @@ pub(crate) struct HunterTraceEvent {
     pub(crate) prepared_context_used: Option<bool>,
     pub(crate) candidate_score: Option<f64>,
     pub(crate) refresh_reason: Option<String>,
+    pub(crate) hermes_hit: Option<bool>,
+    pub(crate) hermes_state: Option<String>,
+    pub(crate) hermes_feed_match_count: Option<usize>,
+    pub(crate) hermes_signal_received_at_ms: Option<u64>,
+    pub(crate) hermes_to_reactive_delta_ms: Option<u64>,
+    pub(crate) prepared_context_source: Option<String>,
+    pub(crate) fast_lane_used: Option<bool>,
 }
 
 impl HunterTraceEvent {
@@ -205,6 +211,13 @@ impl HunterTraceEvent {
             prepared_context_used: None,
             candidate_score: None,
             refresh_reason: None,
+            hermes_hit: None,
+            hermes_state: None,
+            hermes_feed_match_count: None,
+            hermes_signal_received_at_ms: None,
+            hermes_to_reactive_delta_ms: None,
+            prepared_context_source: None,
+            fast_lane_used: None,
         }
     }
 
@@ -276,6 +289,26 @@ impl HunterTraceEvent {
         self.refresh_reason = refresh_reason;
         self
     }
+
+    pub(crate) fn with_hermes_context(
+        mut self,
+        hermes_hit: Option<bool>,
+        hermes_state: Option<String>,
+        hermes_feed_match_count: Option<usize>,
+        hermes_signal_received_at_ms: Option<u64>,
+        hermes_to_reactive_delta_ms: Option<u64>,
+        prepared_context_source: Option<String>,
+        fast_lane_used: Option<bool>,
+    ) -> Self {
+        self.hermes_hit = hermes_hit;
+        self.hermes_state = hermes_state;
+        self.hermes_feed_match_count = hermes_feed_match_count;
+        self.hermes_signal_received_at_ms = hermes_signal_received_at_ms;
+        self.hermes_to_reactive_delta_ms = hermes_to_reactive_delta_ms;
+        self.prepared_context_source = prepared_context_source;
+        self.fast_lane_used = fast_lane_used;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -340,7 +373,7 @@ impl HunterSignalSource {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HunterSignalKind {
     KaminoLogLiquidation,
     PriceFeedPredictedLiquidable,
@@ -672,11 +705,7 @@ fn build_wallet_token_index(
     Ok(index)
 }
 
-pub struct HunterService<
-    R: RpcClient,
-    JI: JitoPort,
-    L: LiquidationLogger + Clone,
-> {
+pub struct HunterService<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone> {
     hunter_rpc: R,
     signal_secondary_rpc: Option<R>,
     jito: JI,
@@ -686,12 +715,7 @@ pub struct HunterService<
     trace_logger: HunterTraceLogger,
 }
 
-impl<
-        R: RpcClient,
-        JI: JitoPort,
-        L: LiquidationLogger + Clone + 'static,
-    > HunterService<R, JI, L>
-{
+impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterService<R, JI, L> {
     pub fn new(
         hunter_rpc: R,
         signal_secondary_rpc: Option<R>,
@@ -730,6 +754,7 @@ impl<
         JI: Clone + Send + Sync + 'static,
     {
         let runtime = HunterRuntimeConfig::from_env("KAMINO");
+        let hermes_config = HermesRuntimeConfig::from_env();
         log_stderr("[hunter-kamino] runtime config reloaded from env at loop start".to_string());
         let wallet_index = Arc::new(build_wallet_token_index(
             &self.keypair.pubkey(),
@@ -738,11 +763,12 @@ impl<
         let reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let shortlist_runtime = Arc::new(tokio::sync::RwLock::new(KaminoShortlistRuntime::new()));
+        let hermes_runtime = Arc::new(tokio::sync::RwLock::new(HermesShortlistRuntime::new()));
         let (shortlist_refresh_tx, mut shortlist_refresh_rx) =
             mpsc::channel::<KaminoShortlistRefreshRequest>(64);
 
         log_stderr(format!(
-            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | tokens: {}",
+            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | hermes_shortlist_size={} | hermes_refresh_secs={} | tokens: {}",
             self.keypair.pubkey(),
             self.max_repay_usd,
             runtime.signal_commitment,
@@ -750,6 +776,8 @@ impl<
             runtime.shortlist_enabled,
             runtime.shortlist_max_obligations,
             runtime.shortlist_refresh_secs,
+            hermes_config.shortlist_size,
+            hermes_config.refresh_secs,
             wallet_tokens.iter().map(|t| t.symbol.as_str()).collect::<Vec<_>>().join(", ")
         ));
 
@@ -861,9 +889,35 @@ impl<
             spawn_price_feed_signal_source(
                 self.hunter_rpc.clone(),
                 wallet_tokens.clone(),
-                signal_tx.clone(),
-                self.trace_logger.clone(),
-            );
+                hermes_runtime.clone(),
+                hermes_config.clone(),
+                {
+                    let signal_tx = signal_tx.clone();
+                    move |signal| {
+                        let signal_tx = signal_tx.clone();
+                        async move {
+                            signal_tx
+                                .send(HunterSignalEvent {
+                                    source: HunterSignalSource::PriceFeed,
+                                    protocol: "kamino",
+                                    signal_kind: HunterSignalKind::PriceFeedPredictedLiquidable,
+                                    received_at_ms: signal.signal_received_at_ms,
+                                    signature: None,
+                                    obligation_pubkey: signal.obligation_pubkey,
+                                    repay_mint: Some(signal.repay_mint),
+                                    detail: Some(format!(
+                                        "{} repay_symbol={} matched_feeds={}",
+                                        signal.detail, signal.repay_symbol, signal.feed_match_count
+                                    )),
+                                    tx_info: None,
+                                })
+                                .await
+                                .is_ok()
+                        }
+                    }
+                },
+            )
+            .await;
         }
 
         if runtime.shortlist_enabled {
@@ -888,9 +942,9 @@ impl<
                                 HunterTraceEvent::new(
                                     "kamino",
                                     "shortlist_refresh",
-                                    request.prioritize_obligation.unwrap_or_else(|| {
-                                        format!("shortlist:{}", request.reason)
-                                    }),
+                                    request
+                                        .prioritize_obligation
+                                        .unwrap_or_else(|| format!("shortlist:{}", request.reason)),
                                 )
                                 .with_detail(format!(
                                     "reason={} active={}",
@@ -951,6 +1005,50 @@ impl<
         }
 
         while let Some(signal) = signal_rx.recv().await {
+            let hermes_fast_lane_context = if price_feed_enabled
+                && signal.signal_kind == HunterSignalKind::KaminoLogLiquidation
+            {
+                let state = hermes_runtime.read().await;
+                state.fast_lane_context(
+                    &signal.obligation_pubkey,
+                    signal.received_at_ms,
+                    &hermes_config,
+                )
+            } else {
+                None
+            };
+            let (
+                hermes_hit,
+                hermes_state_value,
+                hermes_feed_match_count,
+                hermes_signal_received_at_ms,
+                hermes_to_reactive_delta_ms,
+            ) = hermes_trace_fields(hermes_fast_lane_context.as_ref(), signal.received_at_ms);
+
+            if signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable {
+                self.trace_logger.log(
+                    HunterTraceEvent::new(
+                        "kamino",
+                        "hermes_signal_received",
+                        format!("hermes:{}", signal.obligation_pubkey),
+                    )
+                    .with_obligation(signal.obligation_pubkey.clone())
+                    .with_optional_repay_mint(signal.repay_mint.clone())
+                    .with_optional_detail(signal.detail.clone())
+                    .with_timing(signal.received_at_ms, 0)
+                    .with_hermes_context(
+                        Some(true),
+                        Some(ShortlistState::Armed.as_str().to_string()),
+                        hermes_feed_match_count,
+                        hermes_signal_received_at_ms,
+                        None,
+                        Some("hermes_shortlist".to_string()),
+                        Some(false),
+                    ),
+                );
+                continue;
+            }
+
             if runtime.shortlist_enabled {
                 if let (Some(repay_mint), Some(tx_info)) =
                     (signal.repay_mint.as_ref(), signal.tx_info.as_ref())
@@ -1054,6 +1152,21 @@ impl<
                     Some(false),
                     shortlist_score,
                     shortlist_refresh_reason.clone(),
+                )
+                .with_hermes_context(
+                    hermes_hit,
+                    hermes_state_value.clone(),
+                    hermes_feed_match_count,
+                    hermes_signal_received_at_ms,
+                    hermes_to_reactive_delta_ms,
+                    Some(
+                        hermes_fast_lane_context
+                            .as_ref()
+                            .map(|_| "hermes_shortlist")
+                            .unwrap_or("reactive_path")
+                            .to_string(),
+                    ),
+                    Some(false),
                 ),
             );
 
@@ -1065,9 +1178,8 @@ impl<
                 {
                     let mut state = shortlist_runtime.write().await;
                     if let Some(candidate) = state.candidates.get_mut(&signal.obligation_pubkey) {
-                        candidate.cooldown(
-                            now_ms().saturating_add(runtime.shortlist_cooling_down_ms),
-                        );
+                        candidate
+                            .cooldown(now_ms().saturating_add(runtime.shortlist_cooling_down_ms));
                     }
                 }
                 request_shortlist_refresh(
@@ -1079,7 +1191,6 @@ impl<
                 )
                 .await;
             }
-
             let keypair = self.keypair.clone();
             let jito = self.jito.clone();
             let bh = cached_blockhash.clone();
@@ -1093,7 +1204,13 @@ impl<
             let airtable_logger = self.logger.clone();
             let hunter_wallet = hunter_wallet.clone();
             let signal_locks = signal_locks.clone();
+            let hermes_runtime = hermes_runtime.clone();
+            let hermes_cfg = hermes_config.clone();
             let shortlist_context = shortlist_entry.map(|entry| entry.context);
+            let prepared_context = hermes_fast_lane_context
+                .as_ref()
+                .map(|context| context.prepared_context.clone())
+                .or(shortlist_context);
             let sig_for_error = signal.signature.clone().unwrap_or_else(|| {
                 format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
             });
@@ -1127,7 +1244,8 @@ impl<
                     signal.tx_info,
                     Some(signal.obligation_pubkey.clone()),
                     signal.repay_mint.clone(),
-                    shortlist_context,
+                    prepared_context,
+                    hermes_fast_lane_context.clone(),
                 )
                 .await;
 
@@ -1138,6 +1256,13 @@ impl<
                     Ok(KaminoExecutionOutcome::Skipped) => FireOutcome::Skipped,
                     Err(_) => FireOutcome::OpportunityError,
                 };
+                if hermes_fast_lane_context.is_some()
+                    && !matches!(outcome, FireOutcome::OpportunityError)
+                {
+                    let mut state = hermes_runtime.write().await;
+                    let _ =
+                        state.note_reactive_hit(&signal.obligation_pubkey, now_ms(), &hermes_cfg);
+                }
                 mark_lock_fired(
                     &signal_locks,
                     &fingerprint,
@@ -1233,6 +1358,7 @@ impl<
             self.trace_logger.clone(),
             self.logger.clone(),
             HunterSignalSource::PrimaryRpc,
+            None,
             None,
             None,
             None,
@@ -1598,7 +1724,15 @@ fn remove_expired_signal_fingerprints(
     }
 }
 
-fn shortlist_trace_fields(entry: Option<&ShortlistEntry>) -> (Option<bool>, Option<String>, Option<u64>, Option<f64>, Option<String>) {
+fn shortlist_trace_fields(
+    entry: Option<&ShortlistEntry>,
+) -> (
+    Option<bool>,
+    Option<String>,
+    Option<u64>,
+    Option<f64>,
+    Option<String>,
+) {
     match entry {
         Some(entry) => (
             Some(true),
@@ -1606,6 +1740,28 @@ fn shortlist_trace_fields(entry: Option<&ShortlistEntry>) -> (Option<bool>, Opti
             Some(entry.shortlist_age_ms),
             Some(entry.distance_to_liq),
             Some(entry.refresh_reason.clone()),
+        ),
+        None => (Some(false), None, None, None, None),
+    }
+}
+
+fn hermes_trace_fields(
+    context: Option<&crate::application::hermes_shortlist::HermesFastLaneContext>,
+    reactive_received_at_ms: u64,
+) -> (
+    Option<bool>,
+    Option<String>,
+    Option<usize>,
+    Option<u64>,
+    Option<u64>,
+) {
+    match context {
+        Some(context) => (
+            Some(true),
+            Some(context.state.as_str().to_string()),
+            Some(context.feed_match_count),
+            Some(context.last_price_signal_at_ms),
+            Some(reactive_received_at_ms.saturating_sub(context.last_price_signal_at_ms)),
         ),
         None => (Some(false), None, None, None, None),
     }
@@ -1629,9 +1785,7 @@ fn prepared_context_from_resolved_accounts(
     }
 }
 
-fn active_kamino_reserve_pubkeys(
-    obligation: &crate::domain::kamino::Obligation,
-) -> Vec<String> {
+fn active_kamino_reserve_pubkeys(obligation: &crate::domain::kamino::Obligation) -> Vec<String> {
     let mut reserve_pubkeys = Vec::new();
 
     for deposit in obligation.deposits.iter() {
@@ -1698,16 +1852,12 @@ async fn refresh_kamino_shortlist<R: RpcClient>(
                             refreshed_at_ms,
                             reason,
                         );
-                        let repay_reserve_pk =
-                            Pubkey::from_str(&candidate.context.repay_reserve)?;
+                        let repay_reserve_pk = Pubkey::from_str(&candidate.context.repay_reserve)?;
                         let withdraw_reserve_pk =
                             Pubkey::from_str(&candidate.context.withdraw_reserve)?;
-                        let _ = get_or_fetch_kamino_reserve_meta(
-                            rpc,
-                            reserve_cache,
-                            &repay_reserve_pk,
-                        )
-                        .await?;
+                        let _ =
+                            get_or_fetch_kamino_reserve_meta(rpc, reserve_cache, &repay_reserve_pk)
+                                .await?;
                         let _ = get_or_fetch_kamino_reserve_meta(
                             rpc,
                             reserve_cache,
@@ -1910,13 +2060,11 @@ fn spawn_kamino_log_signal_source<R, L>(
                     ),
                 );
 
-                let mut event = HunterTraceEvent::new("kamino", "ws_received", entry.signature.clone())
-                    .with_optional_repay_mint(extract_log_field(
-                        &entry.logs,
-                        "repay_reserve:",
-                    ))
-                    .with_detail(format!("source={} {}", source.as_str(), detail))
-                    .with_timing(entry.received_at_ms, 0);
+                let mut event =
+                    HunterTraceEvent::new("kamino", "ws_received", entry.signature.clone())
+                        .with_optional_repay_mint(extract_log_field(&entry.logs, "repay_reserve:"))
+                        .with_detail(format!("source={} {}", source.as_str(), detail))
+                        .with_timing(entry.received_at_ms, 0);
                 if let Some(obligation) = extract_obligation_pda_from_logs(&entry.logs) {
                     event = event.with_obligation(obligation);
                 }
@@ -1966,290 +2114,6 @@ fn spawn_kamino_log_signal_source<R, L>(
     });
 }
 
-#[derive(Clone)]
-struct HermesShortlistEntry {
-    obligation_pubkey: String,
-    repay_mint: String,
-    tracked_feed_ids: Vec<String>,
-    distance_to_liq: f64,
-}
-
-#[derive(Debug, Clone)]
-struct HermesReserveInfo {
-    mint: String,
-    pyth_feed_id: Option<String>,
-}
-
-fn decode_kamino_obligation(data: &[u8]) -> Option<crate::domain::kamino::Obligation> {
-    if data.len() < 8 {
-        return None;
-    }
-    let mut cursor = &data[8..];
-    crate::domain::kamino::Obligation::deserialize(&mut cursor).ok()
-}
-
-fn hermes_feed_id_from_pubkey(pk: Pubkey) -> String {
-    format!("0x{}", hex_encode_lower(&pk.to_bytes()))
-}
-
-fn hex_encode_lower(bytes: &[u8]) -> String {
-    const LUT: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(LUT[(b >> 4) as usize] as char);
-        out.push(LUT[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn build_hermes_shortlist(
-    wallet_tokens: &[WalletToken],
-    program_accounts: Vec<ProgramAccount>,
-) -> Vec<HermesShortlistEntry> {
-    let mut reserve_infos: HashMap<[u8; 32], HermesReserveInfo> = HashMap::new();
-    let mut obligations = Vec::new();
-    for account in &program_accounts {
-        if let Ok(reserve) = decode_kamino_reserve(&account.data) {
-            let mint = Pubkey::new_from_array(reserve.liquidity.mint_pubkey).to_string();
-            let pyth_feed_id = optional_pubkey(reserve.config.token_info.pyth_configuration.price)
-                .map(hermes_feed_id_from_pubkey);
-            reserve_infos.insert(
-                reserve.liquidity.mint_pubkey,
-                HermesReserveInfo { mint, pyth_feed_id },
-            );
-        }
-        if let Some(obligation) = decode_kamino_obligation(&account.data) {
-            obligations.push((account.pubkey.clone(), obligation));
-        }
-    }
-
-    build_hermes_shortlist_from_decoded(wallet_tokens, obligations, &reserve_infos)
-}
-
-fn build_hermes_shortlist_from_decoded(
-    wallet_tokens: &[WalletToken],
-    obligations: Vec<(String, crate::domain::kamino::Obligation)>,
-    reserve_infos: &HashMap<[u8; 32], HermesReserveInfo>,
-) -> Vec<HermesShortlistEntry> {
-    let whitelist: HashMap<String, &WalletToken> =
-        wallet_tokens.iter().map(|t| (t.mint.clone(), t)).collect();
-    let mut shortlist = Vec::new();
-    for (account_pubkey, obligation) in obligations {
-        if obligation.has_debt == 0 || obligation.borrowed_assets_market_value_sf == 0 {
-            continue;
-        }
-        let mut repay_mint = None;
-        let mut tracked_feed_ids = Vec::new();
-        for borrow in obligation.borrows.iter() {
-            if borrow.borrowed_amount_sf == 0 && borrow.market_value_sf == 0 {
-                continue;
-            }
-            if let Some(reserve) = reserve_infos.get(&borrow.borrow_reserve) {
-                if whitelist.contains_key(&reserve.mint) && repay_mint.is_none() {
-                    repay_mint = Some(reserve.mint.clone());
-                }
-                if let Some(feed_id) = &reserve.pyth_feed_id {
-                    tracked_feed_ids.push(feed_id.clone());
-                }
-            }
-        }
-
-        if let Some(repay_mint) = repay_mint {
-            shortlist.push(HermesShortlistEntry {
-                obligation_pubkey: account_pubkey,
-                repay_mint,
-                tracked_feed_ids,
-                distance_to_liq: obligation.dist_to_liq(),
-            });
-        }
-    }
-
-    shortlist.sort_by(|a, b| {
-        a.distance_to_liq
-            .partial_cmp(&b.distance_to_liq)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    shortlist
-}
-
-fn parse_hermes_changed_feed_ids(payload: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return ids;
-    };
-    if let Some(parsed) = value["parsed"].as_array() {
-        for item in parsed {
-            if let Some(id) = item["id"].as_str() {
-                ids.push(format!("0x{}", id.trim_start_matches("0x")));
-            }
-        }
-    }
-    ids
-}
-
-fn build_hermes_signals_from_changed_feeds(
-    current: &[HermesShortlistEntry],
-    changed: &[String],
-    trigger_buffer_bps: f64,
-    received_at_ms: u64,
-) -> Vec<HunterSignalEvent> {
-    current
-        .iter()
-        .filter(|entry| {
-            entry.tracked_feed_ids.iter().any(|id| changed.contains(id))
-                && entry.distance_to_liq <= trigger_buffer_bps
-        })
-        .map(|entry| HunterSignalEvent {
-            source: HunterSignalSource::PriceFeed,
-            protocol: "kamino",
-            signal_kind: HunterSignalKind::PriceFeedPredictedLiquidable,
-            received_at_ms,
-            signature: None,
-            obligation_pubkey: entry.obligation_pubkey.clone(),
-            repay_mint: Some(entry.repay_mint.clone()),
-            detail: Some(format!(
-                "hermes_feed_update distance_to_liq={:.8} chunk_received_at_ms={}",
-                entry.distance_to_liq, received_at_ms
-            )),
-            tx_info: None,
-        })
-        .collect()
-}
-
-fn spawn_price_feed_signal_source<R>(
-    rpc: R,
-    wallet_tokens: Vec<WalletToken>,
-    signal_tx: mpsc::Sender<HunterSignalEvent>,
-    trace_logger: HunterTraceLogger,
-) where
-    R: RpcClient + Clone + Send + Sync + 'static,
-{
-    tokio::spawn(async move {
-        let hermes_url = std::env::var("SIGNAL_FEED_WS_URL")
-            .or_else(|_| std::env::var("HERMES_WS_URL"))
-            .unwrap_or_else(|_| "https://hermes.pyth.network".to_string())
-            .trim_end_matches('/')
-            .to_string();
-        let refresh_secs = std::env::var("HERMES_REFRESH_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10);
-        let shortlist_size = std::env::var("HERMES_SHORTLIST_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(200);
-        let trigger_buffer_bps = std::env::var("HERMES_TRIGGER_BUFFER_BPS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(25) as f64
-            / 10_000.0;
-
-        let shortlist = Arc::new(tokio::sync::RwLock::new(Vec::<HermesShortlistEntry>::new()));
-        {
-            let rpc = rpc.clone();
-            let wallet_tokens = wallet_tokens.clone();
-            let shortlist = shortlist.clone();
-            tokio::spawn(async move {
-                loop {
-                    match rpc.get_program_accounts(KAMINO_PROGRAM_ID).await {
-                        Ok(accounts) => {
-                            let mut entries = build_hermes_shortlist(&wallet_tokens, accounts);
-                            entries.truncate(shortlist_size);
-                            *shortlist.write().await = entries;
-                        }
-                        Err(e) => {
-                            log_stderr(format!(
-                                "[hunter-kamino] hermes shortlist refresh failed: {}",
-                                e
-                            ));
-                        }
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
-                }
-            });
-        }
-
-        loop {
-            let current = shortlist.read().await.clone();
-            if current.is_empty() {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                continue;
-            }
-
-            let mut feed_ids = current
-                .iter()
-                .flat_map(|entry| entry.tracked_feed_ids.iter().cloned())
-                .collect::<Vec<_>>();
-            feed_ids.sort();
-            feed_ids.dedup();
-
-            let mut url = format!("{}/v2/updates/price/stream", hermes_url);
-            if !feed_ids.is_empty() {
-                let query = feed_ids
-                    .iter()
-                    .map(|id| format!("ids[]={}", id))
-                    .collect::<Vec<_>>()
-                    .join("&");
-                url.push('?');
-                url.push_str(&query);
-            }
-
-            let client = reqwest::Client::new();
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    let mut stream = resp.bytes_stream();
-                    let mut buffer = String::new();
-                    while let Some(item) = stream.next().await {
-                        let chunk_received_at_ms = now_ms();
-                        let Ok(chunk) = item else {
-                            break;
-                        };
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
-                        while let Some(idx) = buffer.find("\n\n") {
-                            let raw_event = buffer[..idx].to_string();
-                            buffer = buffer[idx + 2..].to_string();
-                            for line in raw_event.lines() {
-                                if let Some(payload) = line.strip_prefix("data:") {
-                                    let changed = parse_hermes_changed_feed_ids(payload.trim());
-                                    if changed.is_empty() {
-                                        continue;
-                                    }
-                                    for signal in build_hermes_signals_from_changed_feeds(
-                                        &current,
-                                        &changed,
-                                        trigger_buffer_bps,
-                                        chunk_received_at_ms,
-                                    ) {
-                                        trace_logger.log(
-                                            HunterTraceEvent::new(
-                                                "kamino",
-                                                "signal_received",
-                                                format!("hermes:{}", signal.obligation_pubkey),
-                                            )
-                                            .with_obligation(signal.obligation_pubkey.clone())
-                                            .with_optional_repay_mint(signal.repay_mint.clone())
-                                            .with_optional_detail(signal.detail.clone())
-                                            .with_timing(chunk_received_at_ms, 0),
-                                        );
-                                        if signal_tx.send(signal).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log_stderr(format!("[hunter-kamino] hermes stream error: {}", e));
-                }
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-    });
-}
-
 // ── Kamino opportunity execution (free function for tokio::spawn) ────────────
 //
 // Runs in its own task. Uses pre-cached blockhash and tip.
@@ -2279,6 +2143,7 @@ async fn execute_kamino_opportunity<R, JI>(
     known_obligation: Option<String>,
     known_repay_mint: Option<String>,
     prepared_context: Option<PreparedExecutionContext>,
+    hermes_fast_lane_context: Option<crate::application::hermes_shortlist::HermesFastLaneContext>,
 ) -> anyhow::Result<KaminoExecutionOutcome>
 where
     R: RpcClient,
@@ -2391,6 +2256,9 @@ where
     let prepared_context_used = prepared_context
         .as_ref()
         .is_some_and(|context| context.obligation_pubkey == obligation_str);
+    let fast_lane_used = hermes_fast_lane_context
+        .as_ref()
+        .is_some_and(|context| context.prepared_context.obligation_pubkey == obligation_str);
     let shortlist_hit = Some(prepared_context.is_some());
     let shortlist_state = prepared_context
         .as_ref()
@@ -2399,6 +2267,20 @@ where
     let refresh_reason = prepared_context
         .as_ref()
         .map(|context| context.inclusion_reason.clone());
+    let (
+        hermes_hit,
+        hermes_state,
+        hermes_feed_match_count,
+        hermes_signal_received_at_ms,
+        hermes_to_reactive_delta_ms,
+    ) = hermes_trace_fields(hermes_fast_lane_context.as_ref(), ws_received_at_ms);
+    let prepared_context_source = if fast_lane_used {
+        Some("hermes_shortlist".to_string())
+    } else if prepared_context_used {
+        Some("reactive_shortlist".to_string())
+    } else {
+        Some("none".to_string())
+    };
 
     // ── 4. Check we hold the repay token ────────────────────────────────────
     let Some(repay_token) = wallet_index.get(repay_mint_str) else {
@@ -2427,6 +2309,15 @@ where
                     Some(prepared_context_used),
                     None,
                     refresh_reason.clone(),
+                )
+                .with_hermes_context(
+                    hermes_hit,
+                    hermes_state.clone(),
+                    hermes_feed_match_count,
+                    hermes_signal_received_at_ms,
+                    hermes_to_reactive_delta_ms,
+                    prepared_context_source.clone(),
+                    Some(fast_lane_used),
                 ),
         );
         if should_log {
@@ -2463,6 +2354,15 @@ where
                     Some(prepared_context_used),
                     None,
                     refresh_reason.clone(),
+                )
+                .with_hermes_context(
+                    hermes_hit,
+                    hermes_state.clone(),
+                    hermes_feed_match_count,
+                    hermes_signal_received_at_ms,
+                    hermes_to_reactive_delta_ms,
+                    prepared_context_source.clone(),
+                    Some(fast_lane_used),
                 ),
         );
         return Ok(KaminoExecutionOutcome::Skipped);
@@ -2486,8 +2386,7 @@ where
     let wdr_liq_sup_pk = Pubkey::from_str(wdr_liq_sup_str)?;
     let wdr_fee_pk = Pubkey::from_str(wdr_fee_str)?;
 
-    let klend_pk =
-        Pubkey::from_str(KAMINO_PROGRAM_ID).expect("static constant KAMINO_PROGRAM_ID");
+    let klend_pk = Pubkey::from_str(KAMINO_PROGRAM_ID).expect("static constant KAMINO_PROGRAM_ID");
     let farms_pk = Pubkey::from_str(FARMS_PROGRAM).expect("static constant FARMS_PROGRAM");
     let tip_account = select_jito_tip_account(&sig)?;
 
@@ -2496,22 +2395,18 @@ where
         .as_ref()
         .map(|context| context.active_reserve_pubkeys.clone())
         .filter(|pubkeys| !pubkeys.is_empty())
-        .unwrap_or_else(|| {
-            vec![
-                repay_reserve_pk.to_string(),
-                wdr_reserve_pk.to_string(),
-            ]
-        });
+        .unwrap_or_else(|| vec![repay_reserve_pk.to_string(), wdr_reserve_pk.to_string()]);
     let active_reserve_pks = active_reserve_pubkeys
         .iter()
         .map(|value| Pubkey::from_str(value))
         .collect::<Result<Vec<_>, _>>()?;
-    let full_refresh_context = !active_reserve_pubkeys.is_empty()
-        && active_reserve_pubkeys.len() > 2;
+    let full_refresh_context =
+        !active_reserve_pubkeys.is_empty() && active_reserve_pubkeys.len() > 2;
     let reserve_meta_started_at = Instant::now();
     let mut reserve_refresh_order = Vec::with_capacity(active_reserve_pks.len());
     for reserve_pk in &active_reserve_pks {
-        let reserve_meta = get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, reserve_pk).await?;
+        let reserve_meta =
+            get_or_fetch_kamino_reserve_meta(&rpc, &reserve_cache, reserve_pk).await?;
         reserve_refresh_order.push((*reserve_pk, reserve_meta));
     }
     let reserve_meta_ms = reserve_meta_started_at.elapsed().as_millis();
@@ -2553,8 +2448,11 @@ where
         &obligation_pk,
         &refresh_obligation_reserve_refs,
     ));
-    let user_src =
-        get_ata_with_program(&liquidator, &repay_mint_pk, &repay_reserve_meta.token_program);
+    let user_src = get_ata_with_program(
+        &liquidator,
+        &repay_mint_pk,
+        &repay_reserve_meta.token_program,
+    );
     let user_dst_col = get_ata_with_program(
         &liquidator,
         &wdr_col_mint_pk,
@@ -2687,6 +2585,15 @@ where
                 Some(prepared_context_used),
                 None,
                 refresh_reason.clone(),
+            )
+            .with_hermes_context(
+                hermes_hit,
+                hermes_state.clone(),
+                hermes_feed_match_count,
+                hermes_signal_received_at_ms,
+                hermes_to_reactive_delta_ms,
+                prepared_context_source.clone(),
+                Some(fast_lane_used),
             ),
     );
     let _ = log_hunter_observation(
@@ -2779,6 +2686,15 @@ where
                     Some(prepared_context_used),
                     None,
                     refresh_reason.clone(),
+                )
+                .with_hermes_context(
+                    hermes_hit,
+                    hermes_state.clone(),
+                    hermes_feed_match_count,
+                    hermes_signal_received_at_ms,
+                    hermes_to_reactive_delta_ms,
+                    prepared_context_source.clone(),
+                    Some(fast_lane_used),
                 ),
         );
         log_stderr(format!(
@@ -2857,7 +2773,11 @@ where
                         .with_obligation(obligation_str.to_string())
                         .with_repay_mint(repay_mint_str.to_string())
                         .with_repay_symbol(repay_token.symbol.clone())
-                        .with_detail(format!("source={} {}", source.as_str(), bundle_detail.clone()))
+                        .with_detail(format!(
+                            "source={} {}",
+                            source.as_str(),
+                            bundle_detail.clone()
+                        ))
                         .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
                         .with_optional_bundle_id(Some(bundle_id.clone()))
                         .with_shortlist_context(
@@ -2867,6 +2787,15 @@ where
                             Some(prepared_context_used),
                             None,
                             refresh_reason.clone(),
+                        )
+                        .with_hermes_context(
+                            hermes_hit,
+                            hermes_state.clone(),
+                            hermes_feed_match_count,
+                            hermes_signal_received_at_ms,
+                            hermes_to_reactive_delta_ms,
+                            prepared_context_source.clone(),
+                            Some(fast_lane_used),
                         ),
                 );
                 let _ = log_hunter_observation(
@@ -2940,6 +2869,15 @@ where
                                 Some(prepared_context_used),
                                 None,
                                 refresh_reason.clone(),
+                            )
+                            .with_hermes_context(
+                                hermes_hit,
+                                hermes_state.clone(),
+                                hermes_feed_match_count,
+                                hermes_signal_received_at_ms,
+                                hermes_to_reactive_delta_ms,
+                                prepared_context_source.clone(),
+                                Some(fast_lane_used),
                             ),
                     );
                     let backoff_ms = retry_backoff_ms(attempt);
@@ -2955,7 +2893,11 @@ where
                         .with_repay_mint(repay_mint_str.to_string())
                         .with_repay_symbol(repay_token.symbol.clone())
                         .with_reason("bundle_send_failed")
-                        .with_detail(format!("source={} {}", source.as_str(), bundle_detail.clone()))
+                        .with_detail(format!(
+                            "source={} {}",
+                            source.as_str(),
+                            bundle_detail.clone()
+                        ))
                         .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
                         .with_shortlist_context(
                             shortlist_hit,
@@ -2964,6 +2906,15 @@ where
                             Some(prepared_context_used),
                             None,
                             refresh_reason.clone(),
+                        )
+                        .with_hermes_context(
+                            hermes_hit,
+                            hermes_state.clone(),
+                            hermes_feed_match_count,
+                            hermes_signal_received_at_ms,
+                            hermes_to_reactive_delta_ms,
+                            prepared_context_source.clone(),
+                            Some(fast_lane_used),
                         ),
                 );
                 let _ = log_hunter_observation(
@@ -3092,6 +3043,7 @@ fn extract_log_field(logs: &[String], key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::kamino_tx::kamino_liquidate_discriminators;
     use crate::ports::rpc::TransactionInfo;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::{mpsc, Barrier};
@@ -3200,35 +3152,6 @@ mod tests {
             detail: None,
             tx_info: None,
         }
-    }
-
-    fn test_wallet_token(mint: &str) -> WalletToken {
-        WalletToken {
-            symbol: "TEST".to_string(),
-            mint: mint.to_string(),
-            decimals: 6,
-            max_repay_native: 1_000_000,
-        }
-    }
-
-    fn test_obligation_with_borrow(
-        borrow_reserve: [u8; 32],
-        borrowed_amount_sf: u128,
-        market_value_sf: u128,
-        unhealthy_borrow_value_sf: u128,
-        borrow_factor_adjusted_debt_value_sf: u128,
-        deposited_value_sf: u128,
-    ) -> crate::domain::kamino::Obligation {
-        let mut obligation: crate::domain::kamino::Obligation = unsafe { std::mem::zeroed() };
-        obligation.has_debt = 1;
-        obligation.borrowed_assets_market_value_sf = market_value_sf;
-        obligation.unhealthy_borrow_value_sf = unhealthy_borrow_value_sf;
-        obligation.borrow_factor_adjusted_debt_value_sf = borrow_factor_adjusted_debt_value_sf;
-        obligation.deposited_value_sf = deposited_value_sf;
-        obligation.borrows[0].borrow_reserve = borrow_reserve;
-        obligation.borrows[0].borrowed_amount_sf = borrowed_amount_sf;
-        obligation.borrows[0].market_value_sf = market_value_sf;
-        obligation
     }
 
     #[test]
@@ -3493,96 +3416,6 @@ mod tests {
             summaries.push(summary);
         }
         assert_eq!(summaries.len(), 1, "expected exactly one summary emission");
-    }
-
-    #[test]
-    fn hermes_shortlist_filters_non_whitelisted_repay_assets() {
-        let whitelisted_mint = Pubkey::new_unique();
-        let non_whitelisted_mint = Pubkey::new_unique();
-        let feed = "0xfeed".to_string();
-
-        let mut reserve_infos = HashMap::new();
-        reserve_infos.insert(
-            whitelisted_mint.to_bytes(),
-            HermesReserveInfo {
-                mint: whitelisted_mint.to_string(),
-                pyth_feed_id: Some(feed.clone()),
-            },
-        );
-        reserve_infos.insert(
-            non_whitelisted_mint.to_bytes(),
-            HermesReserveInfo {
-                mint: non_whitelisted_mint.to_string(),
-                pyth_feed_id: Some("0xnope".to_string()),
-            },
-        );
-
-        let obligations = vec![
-            (
-                "allowed".to_string(),
-                test_obligation_with_borrow(whitelisted_mint.to_bytes(), 1, 10, 20, 15, 100),
-            ),
-            (
-                "blocked".to_string(),
-                test_obligation_with_borrow(non_whitelisted_mint.to_bytes(), 1, 10, 20, 15, 100),
-            ),
-        ];
-
-        let shortlist = build_hermes_shortlist_from_decoded(
-            &[test_wallet_token(&whitelisted_mint.to_string())],
-            obligations,
-            &reserve_infos,
-        );
-
-        assert_eq!(shortlist.len(), 1);
-        assert_eq!(shortlist[0].obligation_pubkey, "allowed");
-        assert_eq!(shortlist[0].repay_mint, whitelisted_mint.to_string());
-        assert_eq!(shortlist[0].tracked_feed_ids, vec![feed]);
-    }
-
-    #[test]
-    fn hermes_predictive_trigger_emits_only_for_matching_feed_and_buffer() {
-        let shortlist = vec![
-            HermesShortlistEntry {
-                obligation_pubkey: "inside".to_string(),
-                repay_mint: "mint1".to_string(),
-                tracked_feed_ids: vec!["0xfeed-a".to_string()],
-                distance_to_liq: 0.0010,
-            },
-            HermesShortlistEntry {
-                obligation_pubkey: "outside".to_string(),
-                repay_mint: "mint2".to_string(),
-                tracked_feed_ids: vec!["0xfeed-b".to_string()],
-                distance_to_liq: 0.0050,
-            },
-        ];
-
-        let signals = build_hermes_signals_from_changed_feeds(
-            &shortlist,
-            &["0xfeed-a".to_string(), "0xother".to_string()],
-            0.0025,
-            1234,
-        );
-
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].obligation_pubkey, "inside");
-        assert_eq!(signals[0].received_at_ms, 1234);
-        assert!(matches!(
-            signals[0].signal_kind,
-            HunterSignalKind::PriceFeedPredictedLiquidable
-        ));
-    }
-
-    #[test]
-    #[ignore = "Hermes phase 2 validation gate is not implemented yet"]
-    fn hermes_validation_gate_requires_backtest_thresholds() {
-        panic!("stub: implement Hermes validation gate when phase 2 starts");
-    }
-
-    #[test]
-    #[ignore = "Hermes historical backtest harness is deferred to phase 2"]
-    fn hermes_backtest_methodology_replays_historical_liquidations() {
-        panic!("stub: implement historical liquidation backtest harness in phase 2");
     }
 
     #[test]
