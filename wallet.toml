@@ -24,7 +24,7 @@ max_repay_native = 0   # 0.0 JitoSOL
 symbol   = "mSOL"
 mint     = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
 decimals = 9
-max_repay_native = 270_000_000   # 0.27 mSOL
+max_repay_native = 130_000_000   # 0.13 mSOL
 
 [[tokens]]
 symbol   = "USDT"
