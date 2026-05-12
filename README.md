@@ -97,6 +97,7 @@ Important variables:
 - `HERMES_ARMED_STALE_MS`, `HERMES_COOLDOWN_MS`
 - `HUNTER_SHORTLIST_ENABLED`, `HUNTER_SHORTLIST_MAX_OBLIGATIONS`
 - `HUNTER_SHORTLIST_REFRESH_SECS`, `HUNTER_SHORTLIST_REFRESH_DEBOUNCE_MS`
+- `JITO_MIN_SEND_INTERVAL_MS`, `JITO_SEND_WAIT_BUDGET_MS`
 - `AIRTABLE_TOKEN`, `AIRTABLE_BASE_ID`
 - `TARGET_PROTOCOL`
 - `ENABLE_OBSERVER`, `ENABLE_HUNTER`
@@ -108,7 +109,7 @@ Important variables:
 Recent runtime notes:
 
 - the price oracle is now `Jupiter`-first with a static fallback, to improve research accuracy without introducing heavy infrastructure
-- the Jito send path includes a bounded retry on clearly recoverable failures such as congestion or expired blockhash
+- the Jito send path includes a bounded retry on clearly recoverable failures such as congestion or expired blockhash, plus a local send gate to avoid self-inflicted bursts
 - hunter traces and signal metrics can be converted into a dated Markdown report for longitudinal comparison
 - RPC variable names are role-based: observer variables configure the observer, hunter variables configure the hunter, and optional hunter secondary signal variables configure only the hunter comparison path
 - the Kamino hunter can maintain a wallet-constrained shortlist seeded by observed liquidation signals, with event-driven refresh plus a safety refresh interval

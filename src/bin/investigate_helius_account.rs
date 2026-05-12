@@ -79,7 +79,11 @@ async fn main() -> Result<()> {
                         format!("{account_idx}:{key}")
                     })
                     .collect::<Vec<_>>();
-                let program_idx = tx.instruction_programs.get(idx).copied().unwrap_or_default();
+                let program_idx = tx
+                    .instruction_programs
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_default();
                 let program = tx
                     .account_keys
                     .get(program_idx)

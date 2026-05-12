@@ -1,15 +1,11 @@
 use crate::application::heartbeat::HeartbeatService;
-use crate::application::hunter::{
-    HunterService, DEFAULT_KAMINO_REPLAY_SIGNATURE,
-};
+use crate::application::hunter::{HunterService, DEFAULT_KAMINO_REPLAY_SIGNATURE};
 use crate::application::observer::ObserverService;
-use crate::config::AppConfig;
 use crate::config::wallet::{load_wallet_tokens, WalletToken};
+use crate::config::AppConfig;
 use crate::domain::protocol::Protocol;
 use crate::infrastructure::{
-    airtable::AirtableLoggerAdapter,
-    helius::HeliusAdapter,
-    jito::JitoAdapter,
+    airtable::AirtableLoggerAdapter, helius::HeliusAdapter, jito::JitoAdapter,
     oracle::SimplePriceOracle,
 };
 use crate::logging::{log_error, log_info, log_runtime};
@@ -99,8 +95,7 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-type JawasHunter =
-    HunterService<HeliusAdapter, JitoAdapter, AirtableLoggerAdapter>;
+type JawasHunter = HunterService<HeliusAdapter, JitoAdapter, AirtableLoggerAdapter>;
 
 fn build_hunter_service(
     config: &AppConfig,

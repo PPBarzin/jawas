@@ -20,8 +20,8 @@ struct WalletConfig {
 pub fn load_wallet_tokens(path: &str) -> Result<Vec<WalletToken>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read wallet.toml at {}", path))?;
-    let config: WalletConfig =
-        toml::from_str(&content).with_context(|| format!("failed to parse wallet.toml at {}", path))?;
+    let config: WalletConfig = toml::from_str(&content)
+        .with_context(|| format!("failed to parse wallet.toml at {}", path))?;
     Ok(config.tokens)
 }
 

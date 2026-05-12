@@ -1,8 +1,8 @@
 use crate::application::hunter::{
-    HunterTraceEvent, HunterTraceLogger, WalletTokenRuntime, elapsed_ms_since,
-    format_signature_status, format_stage_timings, hunter_dry_run_enabled,
+    elapsed_ms_since, format_signature_status, format_stage_timings, hunter_dry_run_enabled,
     is_expired_blockhash_error, is_retryable_jito_error, jito_send_max_attempts,
     log_hunter_observation, retry_backoff_ms, retry_tip_lamports, select_jito_tip_account,
+    HunterTraceEvent, HunterTraceLogger, WalletTokenRuntime,
 };
 use crate::config::hunter::HunterTxFetchConfig;
 use crate::domain::protocol::SOLEND_PROGRAM_ID;
@@ -191,8 +191,7 @@ where
         ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price),
     ];
 
-    let solend_pk =
-        Pubkey::from_str(SOLEND_PROGRAM_ID).expect("static constant SOLEND_PROGRAM_ID");
+    let solend_pk = Pubkey::from_str(SOLEND_PROGRAM_ID).expect("static constant SOLEND_PROGRAM_ID");
     for (idx, (&prog_idx, accs)) in tx_info
         .instruction_programs
         .iter()

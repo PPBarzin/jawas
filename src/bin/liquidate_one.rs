@@ -1,14 +1,13 @@
 use anyhow::{bail, Context, Result};
 use borsh::BorshDeserialize;
-use jawas::config::wallet::{WalletToken, load_wallet_tokens};
+use jawas::config::wallet::{load_wallet_tokens, WalletToken};
 use jawas::domain::protocol::KAMINO_PROGRAM_ID;
 use jawas::domain::{kamino::Obligation, token::token_info};
 use jawas::infrastructure::jito::JitoAdapter;
 use jawas::ports::jito::JitoPort;
 use sha2::{Digest, Sha256};
 use solana_client::{
-    rpc_client::RpcClient,
-    rpc_config::RpcSendTransactionConfig,
+    rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
     rpc_response::RpcSimulateTransactionResult,
 };
 use solana_sdk::{
@@ -606,11 +605,21 @@ fn build_transaction(
         &klend_pk,
     ));
 
-    let user_src = get_ata(liquidator, &repay_info.liquidity_mint, &repay_info.token_program);
-    let user_dst_col =
-        get_ata(liquidator, &withdraw_info.collateral_mint, &withdraw_info.token_program);
-    let user_dst_liq =
-        get_ata(liquidator, &withdraw_info.liquidity_mint, &withdraw_info.token_program);
+    let user_src = get_ata(
+        liquidator,
+        &repay_info.liquidity_mint,
+        &repay_info.token_program,
+    );
+    let user_dst_col = get_ata(
+        liquidator,
+        &withdraw_info.collateral_mint,
+        &withdraw_info.token_program,
+    );
+    let user_dst_liq = get_ata(
+        liquidator,
+        &withdraw_info.liquidity_mint,
+        &withdraw_info.token_program,
+    );
 
     instructions.push(build_create_ata_idempotent_ix(
         liquidator,
@@ -674,9 +683,8 @@ fn build_transaction(
 
     let message = Message::try_compile(liquidator, &instructions, &[], blockhash)
         .context("failed to compile versioned message")?;
-    let transaction =
-        VersionedTransaction::try_new(VersionedMessage::V0(message), &[keypair])
-            .context("failed to sign versioned transaction")?;
+    let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &[keypair])
+        .context("failed to sign versioned transaction")?;
 
     Ok(TransactionPlan {
         tx: transaction,
@@ -688,9 +696,15 @@ fn build_transaction(
 }
 
 fn print_obligation_summary(obligation: &Obligation) {
-    println!("  owner             : {}", Pubkey::new_from_array(obligation.owner));
+    println!(
+        "  owner             : {}",
+        Pubkey::new_from_array(obligation.owner)
+    );
     println!("Snapshot:");
-    println!("  collateral_usd    : {:.6}", obligation.deposited_value_usd());
+    println!(
+        "  collateral_usd    : {:.6}",
+        obligation.deposited_value_usd()
+    );
     println!("  debt_usd          : {:.6}", obligation.debt_value_usd());
     println!("  current_ltv       : {:.6}", obligation.current_ltv());
     println!("  unhealthy_ltv     : {:.6}", obligation.unhealthy_ltv());
@@ -752,7 +766,8 @@ fn load_obligation(rpc: &RpcClient, obligation_pk: &Pubkey) -> Result<Obligation
         .get_account(obligation_pk)
         .with_context(|| format!("failed to fetch obligation {obligation_pk}"))?;
     let mut cursor = &account.data[8..];
-    Obligation::deserialize(&mut cursor).map_err(|error| anyhow::anyhow!("borsh decode failed: {error}"))
+    Obligation::deserialize(&mut cursor)
+        .map_err(|error| anyhow::anyhow!("borsh decode failed: {error}"))
 }
 
 #[tokio::main]
@@ -798,7 +813,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    let blockhash = rpc.get_latest_blockhash().context("failed to fetch latest blockhash")?;
+    let blockhash = rpc
+        .get_latest_blockhash()
+        .context("failed to fetch latest blockhash")?;
     let transaction_plan = match build_transaction(
         &cli,
         &obligation,
@@ -817,16 +834,31 @@ async fn main() -> Result<()> {
     let tx = transaction_plan.tx.clone();
 
     println!("Wallet coverage:");
-    println!("  repay_symbol      : {}", transaction_plan.repay_token_symbol);
-    println!("  repay_mint        : {}", transaction_plan.repay_token_mint);
-    println!("  repay_decimals    : {}", wallet_tokens
-        .iter()
-        .find(|token| token.mint == transaction_plan.repay_token_mint)
-        .map(|token| token.decimals)
-        .or_else(|| token_info(&transaction_plan.repay_token_mint).map(|info| info.decimals))
-        .unwrap_or(0));
-    println!("  wallet_max_repay  : {}", transaction_plan.wallet_max_repay_native);
-    println!("  effective_repay   : {}", transaction_plan.effective_repay_native);
+    println!(
+        "  repay_symbol      : {}",
+        transaction_plan.repay_token_symbol
+    );
+    println!(
+        "  repay_mint        : {}",
+        transaction_plan.repay_token_mint
+    );
+    println!(
+        "  repay_decimals    : {}",
+        wallet_tokens
+            .iter()
+            .find(|token| token.mint == transaction_plan.repay_token_mint)
+            .map(|token| token.decimals)
+            .or_else(|| token_info(&transaction_plan.repay_token_mint).map(|info| info.decimals))
+            .unwrap_or(0)
+    );
+    println!(
+        "  wallet_max_repay  : {}",
+        transaction_plan.wallet_max_repay_native
+    );
+    println!(
+        "  effective_repay   : {}",
+        transaction_plan.effective_repay_native
+    );
 
     let tx_size = bincode::serialize(&tx)
         .map(|bytes| bytes.len())
@@ -845,7 +877,8 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|logs| {
                 logs.iter().any(|line| {
-                    line.contains("ObligationHealthy") || line.contains("healthy or not liquidatable")
+                    line.contains("ObligationHealthy")
+                        || line.contains("healthy or not liquidatable")
                 })
             })
             .unwrap_or(false)

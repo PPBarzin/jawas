@@ -18,7 +18,7 @@ max_repay_native = 1_500_000_000  # 1.5 SOL
 symbol   = "JitoSOL"
 mint     = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
 decimals = 9
-max_repay_native = 000_000_000   # 0.0 JitoSOL
+max_repay_native = 0   # 0.0 JitoSOL
 
 [[tokens]]
 symbol   = "mSOL"

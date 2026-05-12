@@ -194,7 +194,11 @@ pub fn select_shortlist(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.observed_count.cmp(&a.observed_count))
             .then_with(|| b.last_observed_at_ms.cmp(&a.last_observed_at_ms))
-            .then_with(|| a.context.obligation_pubkey.cmp(&b.context.obligation_pubkey))
+            .then_with(|| {
+                a.context
+                    .obligation_pubkey
+                    .cmp(&b.context.obligation_pubkey)
+            })
     });
 
     eligible
@@ -207,12 +211,16 @@ pub fn select_shortlist(
 #[cfg(test)]
 mod tests {
     use super::{
-        PreparedExecutionContext, ShortlistCandidate, ShortlistState,
-        enforce_candidate_history_limit, select_shortlist,
+        enforce_candidate_history_limit, select_shortlist, PreparedExecutionContext,
+        ShortlistCandidate, ShortlistState,
     };
     use std::collections::HashMap;
 
-    fn context(obligation: &str, repay_mint: &str, wallet_eligible: bool) -> PreparedExecutionContext {
+    fn context(
+        obligation: &str,
+        repay_mint: &str,
+        wallet_eligible: bool,
+    ) -> PreparedExecutionContext {
         PreparedExecutionContext {
             obligation_pubkey: obligation.to_string(),
             repay_mint: repay_mint.to_string(),

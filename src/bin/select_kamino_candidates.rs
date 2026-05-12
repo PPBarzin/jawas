@@ -281,7 +281,11 @@ fn filter_candidates(cli: &Cli, candidates: Vec<Candidate>) -> Result<Vec<Filter
             }
 
             if let Some(symbol) = &cli.borrow_symbol {
-                if !candidate.borrow_tokens.iter().any(|borrow| borrow == symbol) {
+                if !candidate
+                    .borrow_tokens
+                    .iter()
+                    .any(|borrow| borrow == symbol)
+                {
                     return None;
                 }
             }
@@ -410,7 +414,10 @@ fn print_wallet_summary(path: &str) -> Result<()> {
     let wallet_tokens = load_wallet_tokens(path)?;
     println!("Wallet coverage:");
     println!("  wallet_toml       : {path}");
-    for token in wallet_tokens.iter().filter(|token| token.max_repay_native > 0) {
+    for token in wallet_tokens
+        .iter()
+        .filter(|token| token.max_repay_native > 0)
+    {
         println!(
             "  {}               mint={} max_repay_native={}",
             normalize_symbol(&token.symbol),
@@ -429,7 +436,10 @@ fn main() -> Result<()> {
 
     println!("Scan:");
     println!("  csv               : {}", cli.csv_path.display());
-    println!("  borrow_symbol     : {}", cli.borrow_symbol.as_deref().unwrap_or("ANY"));
+    println!(
+        "  borrow_symbol     : {}",
+        cli.borrow_symbol.as_deref().unwrap_or("ANY")
+    );
     println!("  single_borrow     : {}", cli.single_borrow_only);
     println!("  all_covered       : {}", cli.all_borrows_covered);
     println!("  check_rpc         : {}", cli.check_rpc);
@@ -464,10 +474,7 @@ fn main() -> Result<()> {
             "  wallet_match      : {}",
             candidate.matched_wallet_symbols.join(",")
         );
-        println!(
-            "  all_borrows_covered: {}",
-            candidate.all_borrows_covered
-        );
+        println!("  all_borrows_covered: {}", candidate.all_borrows_covered);
         if cli.check_rpc {
             println!(
                 "  onchain_exists    : {}",

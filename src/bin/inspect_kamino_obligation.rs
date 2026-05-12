@@ -221,10 +221,7 @@ fn ix_refresh_reserve(
     reserve_pk: &Pubkey,
     reserve: &Reserve,
 ) -> Instruction {
-    let pyth = optional_or_placeholder(
-        &reserve.config.token_info.pyth_configuration.price,
-        klend,
-    );
+    let pyth = optional_or_placeholder(&reserve.config.token_info.pyth_configuration.price, klend);
     let sb_price = optional_or_placeholder(
         &reserve
             .config

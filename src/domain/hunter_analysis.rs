@@ -1,4 +1,4 @@
-use crate::config::wallet::{WalletToken, load_wallet_tokens};
+use crate::config::wallet::{load_wallet_tokens, WalletToken};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

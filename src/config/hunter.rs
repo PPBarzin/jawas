@@ -9,9 +9,16 @@ pub struct HunterTxFetchConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct JitoSendGateConfig {
+    pub min_send_interval_ms: u64,
+    pub wait_budget_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct HunterRuntimeConfig {
     pub signal_commitment: RpcCommitment,
     pub tx_fetch: HunterTxFetchConfig,
+    pub jito_send_gate: JitoSendGateConfig,
     pub non_whitelist_cooldown_ms: u128,
     pub ws_idle_timeout_secs: u64,
     pub signal_lock_ms: u64,
@@ -81,6 +88,17 @@ impl HunterRuntimeConfig {
                 .or_else(|| std::env::var("HUNTER_NON_WHITELIST_COOLDOWN_MS").ok())
                 .and_then(|v| v.parse::<u128>().ok())
                 .unwrap_or(30_000);
+        let jito_min_send_interval_ms =
+            std::env::var(format!("{prefix}_JITO_MIN_SEND_INTERVAL_MS"))
+                .ok()
+                .or_else(|| std::env::var("JITO_MIN_SEND_INTERVAL_MS").ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1_100);
+        let jito_send_wait_budget_ms = std::env::var(format!("{prefix}_JITO_SEND_WAIT_BUDGET_MS"))
+            .ok()
+            .or_else(|| std::env::var("JITO_SEND_WAIT_BUDGET_MS").ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(150);
 
         let ws_idle_timeout_secs = std::env::var(format!("{prefix}_WS_IDLE_TIMEOUT_SECS"))
             .ok()
@@ -117,7 +135,7 @@ impl HunterRuntimeConfig {
                 .ok()
                 .or_else(|| std::env::var("HUNTER_SHORTLIST_MAX_OBLIGATIONS").ok())
                 .and_then(|v| v.parse::<usize>().ok())
-                .map(|v| v.clamp(1, 10))
+                .map(|v| v.clamp(1, 512))
                 .unwrap_or(10);
 
         let shortlist_refresh_secs = std::env::var(format!("{prefix}_SHORTLIST_REFRESH_SECS"))
@@ -160,6 +178,10 @@ impl HunterRuntimeConfig {
         Self {
             signal_commitment,
             tx_fetch: HunterTxFetchConfig::from_env(prefix),
+            jito_send_gate: JitoSendGateConfig {
+                min_send_interval_ms: jito_min_send_interval_ms,
+                wait_budget_ms: jito_send_wait_budget_ms,
+            },
             non_whitelist_cooldown_ms,
             ws_idle_timeout_secs,
             signal_lock_ms,
@@ -266,6 +288,24 @@ mod tests {
             std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRIMARY");
             std::env::remove_var("ENABLE_HUNTER_SIGNAL_SECONDARY");
             std::env::remove_var("ENABLE_HUNTER_SIGNAL_PRICE_FEED");
+        }
+    }
+
+    #[test]
+    fn hunter_runtime_reads_jito_gate_env() {
+        let _guard = env_test_guard();
+        unsafe {
+            std::env::set_var("KAMINO_JITO_MIN_SEND_INTERVAL_MS", "1234");
+            std::env::set_var("KAMINO_JITO_SEND_WAIT_BUDGET_MS", "321");
+        }
+
+        let cfg = super::HunterRuntimeConfig::from_env("KAMINO");
+        assert_eq!(cfg.jito_send_gate.min_send_interval_ms, 1_234);
+        assert_eq!(cfg.jito_send_gate.wait_budget_ms, 321);
+
+        unsafe {
+            std::env::remove_var("KAMINO_JITO_MIN_SEND_INTERVAL_MS");
+            std::env::remove_var("KAMINO_JITO_SEND_WAIT_BUDGET_MS");
         }
     }
 }

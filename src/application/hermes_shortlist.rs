@@ -84,7 +84,7 @@ impl HermesRuntimeConfig {
         let shortlist_size = std::env::var("HERMES_SHORTLIST_SIZE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(1, 10))
+            .map(|v| v.clamp(1, 512))
             .unwrap_or(10);
         let trigger_buffer_bps = std::env::var("HERMES_TRIGGER_BUFFER_BPS")
             .ok()
@@ -662,10 +662,12 @@ mod tests {
         let non_whitelisted_mint = Pubkey::new_unique();
         let feed = hermes_feed_id_from_pubkey(Pubkey::new_unique());
         let deposit_reserve = Pubkey::new_unique().to_bytes();
+        let repay_reserve = Pubkey::new_unique().to_bytes();
+        let blocked_reserve = Pubkey::new_unique().to_bytes();
 
         let mut reserve_infos = HashMap::new();
         reserve_infos.insert(
-            Pubkey::new_unique().to_bytes(),
+            repay_reserve,
             HermesReserveInfo {
                 reserve_pubkey: Pubkey::new_unique().to_string(),
                 mint: whitelisted_mint.to_string(),
@@ -673,7 +675,7 @@ mod tests {
             },
         );
         reserve_infos.insert(
-            Pubkey::new_unique().to_bytes(),
+            blocked_reserve,
             HermesReserveInfo {
                 reserve_pubkey: Pubkey::new_unique().to_string(),
                 mint: non_whitelisted_mint.to_string(),
@@ -689,15 +691,10 @@ mod tests {
             },
         );
 
-        let allowed_obligation = obligation_with_positions(
-            *reserve_infos.keys().next().unwrap(),
-            1,
-            deposit_reserve,
-            1,
-            1_000_000_000_000_000,
-        );
+        let allowed_obligation =
+            obligation_with_positions(repay_reserve, 1, deposit_reserve, 1, 1_000_000_000_000_000);
         let blocked_obligation = obligation_with_positions(
-            reserve_infos.keys().nth(1).copied().unwrap(),
+            blocked_reserve,
             1,
             deposit_reserve,
             1,

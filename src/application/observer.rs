@@ -1,6 +1,6 @@
 // Phase 1: Observes liquidations executed by other bots on Kamino.
 
-use crate::domain::protocol::{KAMINO_PROGRAM_ID, Protocol, SOLEND_PROGRAM_ID};
+use crate::domain::protocol::{Protocol, KAMINO_PROGRAM_ID, SOLEND_PROGRAM_ID};
 use crate::domain::token::{native_to_human, token_info, token_mint_by_symbol};
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;

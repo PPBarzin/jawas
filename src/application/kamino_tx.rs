@@ -204,9 +204,7 @@ pub struct KaminoBuildRequest {
     pub full_refresh_context: bool,
 }
 
-pub fn build_kamino_attempt_tx(
-    request: KaminoBuildRequest,
-) -> anyhow::Result<KaminoBuiltAttempt> {
+pub fn build_kamino_attempt_tx(request: KaminoBuildRequest) -> anyhow::Result<KaminoBuiltAttempt> {
     let ata_setup_instruction_count = request.ata_setup_instructions.len();
     let instruction_prefix = request.instruction_prefix;
     let ata_setup_instructions = request.ata_setup_instructions;
@@ -223,11 +221,8 @@ pub fn build_kamino_attempt_tx(
 
     let message = Message::try_compile(&request.liquidator, &instructions, &[], request.blockhash)
         .map_err(|e| anyhow::anyhow!("message compile: {}", e))?;
-    let mut tx = VersionedTransaction::try_new(
-        VersionedMessage::V0(message),
-        &[&*request.keypair],
-    )
-    .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
+    let mut tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&*request.keypair])
+        .map_err(|e| anyhow::anyhow!("sign: {}", e))?;
     let mut tx_size_bytes = bincode::serialize(&tx)
         .map(|bytes| bytes.len())
         .unwrap_or_default();

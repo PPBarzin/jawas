@@ -16,7 +16,7 @@ use crate::application::kamino_tx::{
 };
 use crate::application::solend_hunter::execute_solend_opportunity;
 use crate::config::hunter::{
-    read_kamino_signal_source_config, HunterRuntimeConfig, HunterTxFetchConfig,
+    read_kamino_signal_source_config, HunterRuntimeConfig, HunterTxFetchConfig, JitoSendGateConfig,
 };
 use crate::config::wallet::WalletToken;
 use crate::domain::protocol::{KAMINO_PROGRAM_ID, SOLEND_PROGRAM_ID};
@@ -39,6 +39,7 @@ use std::io::Write;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -127,6 +128,97 @@ pub(crate) fn retry_backoff_ms(attempt: usize) -> u64 {
         3 => 100,
         _ => 200,
     }
+}
+
+#[derive(Debug, Default)]
+struct JitoRateGateState {
+    last_send_started_at_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct JitoRateGatePermit {
+    _guard: tokio::sync::OwnedMutexGuard<JitoRateGateState>,
+    waited_for_lock_ms: u64,
+    enforced_interval_wait_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JitoRateGateBusyKind {
+    InFlight,
+    MinInterval,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JitoRateGateBusy {
+    kind: JitoRateGateBusyKind,
+    waited_for_lock_ms: u64,
+    required_wait_ms: u64,
+    wait_budget_ms: u64,
+    min_send_interval_ms: u64,
+    last_send_started_at_ms: Option<u64>,
+}
+
+fn jito_rate_gate() -> Arc<tokio::sync::Mutex<JitoRateGateState>> {
+    static GATE: OnceLock<Arc<tokio::sync::Mutex<JitoRateGateState>>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Mutex::new(JitoRateGateState::default())))
+        .clone()
+}
+
+async fn acquire_jito_rate_gate(
+    config: JitoSendGateConfig,
+) -> Result<JitoRateGatePermit, JitoRateGateBusy> {
+    let gate = jito_rate_gate();
+    let lock_wait_started_at = Instant::now();
+    let mut guard = match tokio::time::timeout(
+        tokio::time::Duration::from_millis(config.wait_budget_ms),
+        gate.lock_owned(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(JitoRateGateBusy {
+                kind: JitoRateGateBusyKind::InFlight,
+                waited_for_lock_ms: config.wait_budget_ms,
+                required_wait_ms: 0,
+                wait_budget_ms: config.wait_budget_ms,
+                min_send_interval_ms: config.min_send_interval_ms,
+                last_send_started_at_ms: None,
+            });
+        }
+    };
+
+    let waited_for_lock_ms = lock_wait_started_at.elapsed().as_millis() as u64;
+    let now = now_ms();
+    let last_send_started_at_ms = guard.last_send_started_at_ms;
+    let earliest_next_send_ms = last_send_started_at_ms
+        .map(|last| last.saturating_add(config.min_send_interval_ms))
+        .unwrap_or(now);
+    let required_wait_ms = earliest_next_send_ms.saturating_sub(now);
+    let remaining_budget_ms = config.wait_budget_ms.saturating_sub(waited_for_lock_ms);
+
+    if required_wait_ms > remaining_budget_ms {
+        return Err(JitoRateGateBusy {
+            kind: JitoRateGateBusyKind::MinInterval,
+            waited_for_lock_ms,
+            required_wait_ms,
+            wait_budget_ms: config.wait_budget_ms,
+            min_send_interval_ms: config.min_send_interval_ms,
+            last_send_started_at_ms,
+        });
+    }
+
+    if required_wait_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(required_wait_ms)).await;
+    }
+
+    guard.last_send_started_at_ms = Some(now_ms());
+
+    Ok(JitoRateGatePermit {
+        _guard: guard,
+        waited_for_lock_ms,
+        enforced_interval_wait_ms: required_wait_ms,
+    })
 }
 
 fn kamino_logs_look_like_liquidation(logs: &[String]) -> bool {
@@ -768,7 +860,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             mpsc::channel::<KaminoShortlistRefreshRequest>(64);
 
         log_stderr(format!(
-            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | hermes_shortlist_size={} | hermes_refresh_secs={} | tokens: {}",
+            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | shortlist_refresh_debounce_ms={} | hermes_shortlist_size={} | hermes_refresh_secs={} | jito_min_send_interval_ms={} | jito_send_wait_budget_ms={} | tokens: {}",
             self.keypair.pubkey(),
             self.max_repay_usd,
             runtime.signal_commitment,
@@ -776,8 +868,11 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             runtime.shortlist_enabled,
             runtime.shortlist_max_obligations,
             runtime.shortlist_refresh_secs,
+            runtime.shortlist_refresh_debounce_ms,
             hermes_config.shortlist_size,
             hermes_config.refresh_secs,
+            runtime.jito_send_gate.min_send_interval_ms,
+            runtime.jito_send_gate.wait_budget_ms,
             wallet_tokens.iter().map(|t| t.symbol.as_str()).collect::<Vec<_>>().join(", ")
         ));
 
@@ -934,6 +1029,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                         &reserve_cache,
                         refresh_runtime,
                         &request.reason,
+                        request.prioritize_obligation.as_deref(),
                     )
                     .await
                     {
@@ -1815,8 +1911,9 @@ async fn refresh_kamino_shortlist<R: RpcClient>(
     reserve_cache: &tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>,
     config: HunterRuntimeConfig,
     reason: &str,
+    prioritize_obligation: Option<&str>,
 ) -> anyhow::Result<usize> {
-    let candidate_snapshot = {
+    let mut candidate_snapshot = {
         let state = runtime.read().await;
         state
             .candidates
@@ -1824,6 +1921,16 @@ async fn refresh_kamino_shortlist<R: RpcClient>(
             .map(|(obligation, candidate)| (obligation.clone(), candidate.clone()))
             .collect::<Vec<_>>()
     };
+
+    if let Some(prioritized) = prioritize_obligation {
+        candidate_snapshot.sort_by(|(left, _), (right, _)| {
+            let left_priority = left == prioritized;
+            let right_priority = right == prioritized;
+            right_priority
+                .cmp(&left_priority)
+                .then_with(|| left.cmp(right))
+        });
+    }
 
     if candidate_snapshot.is_empty() {
         let mut state = runtime.write().await;
@@ -1897,11 +2004,13 @@ async fn request_shortlist_refresh(
     prioritize_obligation: Option<String>,
 ) {
     let now = now_ms();
+    let bypass_debounce = prioritize_obligation.is_some();
     {
         let state = runtime.read().await;
-        if state
-            .last_refresh_requested_at_ms
-            .is_some_and(|last| now.saturating_sub(last) < debounce_ms)
+        if !bypass_debounce
+            && state
+                .last_refresh_requested_at_ms
+                .is_some_and(|last| now.saturating_sub(last) < debounce_ms)
         {
             return;
         }
@@ -2745,12 +2854,18 @@ where
         })?;
         let build_ms = build_started_at.elapsed().as_millis();
 
-        let send_started_at = Instant::now();
-        match jito.send_bundle(vec![tx]).await {
-            Ok(bundle_id) => {
-                let send_bundle_ms = send_started_at.elapsed().as_millis();
+        let gate_permit = match acquire_jito_rate_gate(runtime.jito_send_gate).await {
+            Ok(permit) => permit,
+            Err(gate_busy) => {
+                let gate_reason = match gate_busy.kind {
+                    JitoRateGateBusyKind::InFlight => "gate_locked_by_in_flight_send".to_string(),
+                    JitoRateGateBusyKind::MinInterval => {
+                        "gate_min_interval_budget_exceeded".to_string()
+                    }
+                };
                 let bundle_detail = format!(
-                    "attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {}",
+                    "source={} attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} gate_reason={} gate_waited_for_lock_ms={} gate_required_wait_ms={} gate_wait_budget_ms={} gate_min_send_interval_ms={} gate_last_send_started_at_ms={} {}",
+                    source.as_str(),
                     attempt,
                     max_send_attempts,
                     tip_lamports,
@@ -2759,6 +2874,92 @@ where
                     full_refresh_context,
                     ata_setup_instruction_count,
                     ata_setup_dropped_for_size,
+                    gate_reason,
+                    gate_busy.waited_for_lock_ms,
+                    gate_busy.required_wait_ms,
+                    gate_busy.wait_budget_ms,
+                    gate_busy.min_send_interval_ms,
+                    gate_busy
+                        .last_send_started_at_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    format_stage_timings(
+                        tx_fetch_ms,
+                        resolve_ms,
+                        reserve_meta_ms,
+                        build_ms,
+                        None,
+                        started_at.elapsed().as_millis(),
+                    )
+                );
+                trace_logger.log(
+                    HunterTraceEvent::new("kamino", "skip", sig.clone())
+                        .with_obligation(obligation_str.to_string())
+                        .with_repay_mint(repay_mint_str.to_string())
+                        .with_repay_symbol(repay_token.symbol.clone())
+                        .with_reason("jito_rate_gate_busy")
+                        .with_detail(bundle_detail.clone())
+                        .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                        .with_shortlist_context(
+                            shortlist_hit,
+                            shortlist_state.clone(),
+                            shortlist_age_ms,
+                            Some(prepared_context_used),
+                            None,
+                            refresh_reason.clone(),
+                        )
+                        .with_hermes_context(
+                            hermes_hit,
+                            hermes_state.clone(),
+                            hermes_feed_match_count,
+                            hermes_signal_received_at_ms,
+                            hermes_to_reactive_delta_ms,
+                            prepared_context_source.clone(),
+                            Some(fast_lane_used),
+                        ),
+                );
+                let _ = log_hunter_observation(
+                    &logger,
+                    "Kamino",
+                    "HUNTER_BUNDLE_FAILED",
+                    &sig,
+                    Some(obligation_str.to_string()),
+                    Some(liquidator.to_string()),
+                    Some(repay_token),
+                    Some(bundle_detail),
+                    Some(elapsed_ms_since(ws_received_at_ms)),
+                )
+                .await;
+                log_stderr(format!(
+                    "[hunter-kamino] skip Jito send by rate gate (source={}, attempt={}/{}): reason={} waited_lock_ms={} required_wait_ms={} budget_ms={}",
+                    source.as_str(),
+                    attempt,
+                    max_send_attempts,
+                    gate_reason,
+                    gate_busy.waited_for_lock_ms,
+                    gate_busy.required_wait_ms,
+                    gate_busy.wait_budget_ms
+                ));
+                return Ok(KaminoExecutionOutcome::Skipped);
+            }
+        };
+
+        let send_started_at = Instant::now();
+        match jito.send_bundle(vec![tx]).await {
+            Ok(bundle_id) => {
+                let send_bundle_ms = send_started_at.elapsed().as_millis();
+                let bundle_detail = format!(
+                    "attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} gate_waited_for_lock_ms={} gate_interval_wait_ms={} {}",
+                    attempt,
+                    max_send_attempts,
+                    tip_lamports,
+                    tx_bytes,
+                    active_reserve_pks.len(),
+                    full_refresh_context,
+                    ata_setup_instruction_count,
+                    ata_setup_dropped_for_size,
+                    gate_permit.waited_for_lock_ms,
+                    gate_permit.enforced_interval_wait_ms,
                     format_stage_timings(
                         tx_fetch_ms,
                         resolve_ms,
@@ -2829,7 +3030,7 @@ where
                 let send_bundle_ms = send_started_at.elapsed().as_millis();
                 let error_message = error.to_string();
                 let bundle_detail = format!(
-                    "attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} {} | {}",
+                    "attempt={}/{} tip={} tx_size_bytes={} active_reserve_count={} full_refresh_context={} ata_setup_instruction_count={} ata_setup_dropped_for_size={} gate_waited_for_lock_ms={} gate_interval_wait_ms={} {} | {}",
                     attempt,
                     max_send_attempts,
                     tip_lamports,
@@ -2838,6 +3039,8 @@ where
                     full_refresh_context,
                     ata_setup_instruction_count,
                     ata_setup_dropped_for_size,
+                    gate_permit.waited_for_lock_ms,
+                    gate_permit.enforced_interval_wait_ms,
                     error_message,
                     format_stage_timings(
                         tx_fetch_ms,
@@ -3046,6 +3249,7 @@ mod tests {
     use crate::application::kamino_tx::kamino_liquidate_discriminators;
     use crate::ports::rpc::TransactionInfo;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Mutex, OnceLock};
     use tokio::sync::{mpsc, Barrier};
 
     #[test]
@@ -3090,6 +3294,46 @@ mod tests {
             "bundle contains an expired blockhash"
         ));
         assert!(!is_retryable_jito_error("custom program error: 0x1"));
+    }
+
+    fn jito_gate_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GATE_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        GATE_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("gate test mutex poisoned")
+    }
+
+    #[tokio::test]
+    async fn jito_rate_gate_respects_min_interval_budget() {
+        let _guard = jito_gate_test_guard();
+        let config = JitoSendGateConfig {
+            min_send_interval_ms: 40,
+            wait_budget_ms: 5,
+        };
+
+        let first = acquire_jito_rate_gate(config).await.unwrap();
+        assert_eq!(first.enforced_interval_wait_ms, 0);
+        drop(first);
+
+        let second = acquire_jito_rate_gate(config).await.unwrap_err();
+        assert_eq!(second.kind, JitoRateGateBusyKind::MinInterval);
+        assert!(second.required_wait_ms > second.wait_budget_ms);
+    }
+
+    #[tokio::test]
+    async fn jito_rate_gate_times_out_while_another_send_is_in_flight() {
+        let _guard = jito_gate_test_guard();
+        let config = JitoSendGateConfig {
+            min_send_interval_ms: 0,
+            wait_budget_ms: 10,
+        };
+        let first = acquire_jito_rate_gate(config).await.unwrap();
+
+        let second = acquire_jito_rate_gate(config).await.unwrap_err();
+        assert_eq!(second.kind, JitoRateGateBusyKind::InFlight);
+
+        drop(first);
     }
 
     #[test]

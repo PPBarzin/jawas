@@ -1,11 +1,10 @@
-use time::{OffsetDateTime, format_description};
+use time::{format_description, OffsetDateTime};
 
 /// Returns the current UTC time as an ISO 8601 string.
 pub fn utc_now() -> String {
-    let format = format_description::parse_borrowed::<2>(
-        "[year]-[month]-[day]T[hour]:[minute]:[second]Z",
-    )
-    .expect("static UTC timestamp format");
+    let format =
+        format_description::parse_borrowed::<2>("[year]-[month]-[day]T[hour]:[minute]:[second]Z")
+            .expect("static UTC timestamp format");
     OffsetDateTime::now_utc()
         .format(&format)
         .expect("formatting current UTC timestamp")
