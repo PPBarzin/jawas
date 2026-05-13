@@ -1,5 +1,6 @@
 use crate::application::hermes_shortlist::{
-    decode_kamino_obligation, spawn_price_feed_signal_source, HermesRuntimeConfig,
+    decode_kamino_obligation, spawn_price_feed_signal_source, HermesExecutionMode,
+    HermesRuntimeConfig,
     HermesShortlistRuntime,
 };
 use crate::application::kamino_shortlist::{
@@ -860,7 +861,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             mpsc::channel::<KaminoShortlistRefreshRequest>(64);
 
         log_stderr(format!(
-            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | shortlist_refresh_debounce_ms={} | hermes_shortlist_size={} | hermes_refresh_secs={} | jito_min_send_interval_ms={} | jito_send_wait_budget_ms={} | tokens: {}",
+            "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | shortlist_refresh_debounce_ms={} | hermes_shortlist_size={} | hermes_refresh_secs={} | hermes_execution_mode={} | hermes_fire_enabled={} | jito_min_send_interval_ms={} | jito_send_wait_budget_ms={} | tokens: {}",
             self.keypair.pubkey(),
             self.max_repay_usd,
             runtime.signal_commitment,
@@ -871,6 +872,8 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             runtime.shortlist_refresh_debounce_ms,
             hermes_config.shortlist_size,
             hermes_config.refresh_secs,
+            hermes_config.execution_mode.as_str(),
+            hermes_config.fire_enabled,
             runtime.jito_send_gate.min_send_interval_ms,
             runtime.jito_send_gate.wait_budget_ms,
             wallet_tokens.iter().map(|t| t.symbol.as_str()).collect::<Vec<_>>().join(", ")
@@ -1101,9 +1104,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
         }
 
         while let Some(signal) = signal_rx.recv().await {
-            let hermes_fast_lane_context = if price_feed_enabled
-                && signal.signal_kind == HunterSignalKind::KaminoLogLiquidation
-            {
+            let hermes_fast_lane_context = if price_feed_enabled {
                 let state = hermes_runtime.read().await;
                 state.fast_lane_context(
                     &signal.obligation_pubkey,
@@ -1139,6 +1140,37 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                         hermes_signal_received_at_ms,
                         None,
                         Some("hermes_shortlist".to_string()),
+                        Some(false),
+                    ),
+                );
+            }
+
+            if signal.signal_kind == HunterSignalKind::KaminoLogLiquidation
+                && !matches!(hermes_config.execution_mode, HermesExecutionMode::Prepare)
+            {
+                self.trace_logger.log(
+                    HunterTraceEvent::new(
+                        "kamino",
+                        "reactive_observe_only",
+                        signal.signature.clone().unwrap_or_else(|| {
+                            format!("{}:{}", signal.source.as_str(), signal.obligation_pubkey)
+                        }),
+                    )
+                    .with_obligation(signal.obligation_pubkey.clone())
+                    .with_optional_repay_mint(signal.repay_mint.clone())
+                    .with_detail(format!(
+                        "source={} kind={} hermes_mode=hybrid",
+                        signal.source.as_str(),
+                        signal.signal_kind.as_str()
+                    ))
+                    .with_timing(signal.received_at_ms, 0)
+                    .with_hermes_context(
+                        hermes_hit,
+                        hermes_state_value.clone(),
+                        hermes_feed_match_count,
+                        hermes_signal_received_at_ms,
+                        hermes_to_reactive_delta_ms,
+                        Some("reactive_observe_only".to_string()),
                         Some(false),
                     ),
                 );
@@ -1270,6 +1302,80 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 continue;
             }
 
+            let is_hermes_pricefeed_signal =
+                signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable;
+            if is_hermes_pricefeed_signal
+                && (!hermes_config.execution_mode.allows_hermes_firing()
+                    || !hermes_config.fire_enabled)
+            {
+                self.trace_logger.log(
+                    HunterTraceEvent::new(
+                        "kamino",
+                        "hermes_firing_skipped",
+                        format!("hermes:{}", signal.obligation_pubkey),
+                    )
+                    .with_obligation(signal.obligation_pubkey.clone())
+                    .with_optional_repay_mint(signal.repay_mint.clone())
+                    .with_reason("hermes_firing_disabled")
+                    .with_detail(format!(
+                        "mode={} fire_enabled={}",
+                        hermes_config.execution_mode.as_str(),
+                        hermes_config.fire_enabled
+                    ))
+                    .with_timing(signal.received_at_ms, 0)
+                    .with_hermes_context(
+                        hermes_hit,
+                        hermes_state_value.clone(),
+                        hermes_feed_match_count,
+                        hermes_signal_received_at_ms,
+                        hermes_to_reactive_delta_ms,
+                        Some("hermes_shortlist".to_string()),
+                        Some(false),
+                    ),
+                );
+                mark_lock_firing(&signal_locks, &fingerprint, signal.source, now_ms());
+                mark_lock_fired(
+                    &signal_locks,
+                    &fingerprint,
+                    signal.source,
+                    now_ms(),
+                    FireOutcome::Skipped,
+                );
+                continue;
+            }
+
+            if is_hermes_pricefeed_signal && hermes_fast_lane_context.is_none() {
+                self.trace_logger.log(
+                    HunterTraceEvent::new(
+                        "kamino",
+                        "hermes_firing_skipped",
+                        format!("hermes:{}", signal.obligation_pubkey),
+                    )
+                    .with_obligation(signal.obligation_pubkey.clone())
+                    .with_optional_repay_mint(signal.repay_mint.clone())
+                    .with_reason("hermes_missing_prepared_context")
+                    .with_timing(signal.received_at_ms, 0)
+                    .with_hermes_context(
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("hermes_shortlist".to_string()),
+                        Some(false),
+                    ),
+                );
+                mark_lock_firing(&signal_locks, &fingerprint, signal.source, now_ms());
+                mark_lock_fired(
+                    &signal_locks,
+                    &fingerprint,
+                    signal.source,
+                    now_ms(),
+                    FireOutcome::Skipped,
+                );
+                continue;
+            }
+
             if runtime.shortlist_enabled && shortlist_entry.is_some() {
                 {
                     let mut state = shortlist_runtime.write().await;
@@ -1321,6 +1427,126 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
 
             tokio::spawn(async move {
                 mark_lock_firing(&signal_locks, &fingerprint, signal.source, now_ms());
+                if signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable {
+                    trace_logger.log(
+                        HunterTraceEvent::new(
+                            "kamino",
+                            "hermes_firing_candidate",
+                            format!("hermes:{}", signal.obligation_pubkey),
+                        )
+                        .with_obligation(signal.obligation_pubkey.clone())
+                        .with_optional_repay_mint(signal.repay_mint.clone())
+                        .with_detail(format!(
+                            "confirmation_window_ms={} require_persistence={} min_feed_match_count={}",
+                            hermes_cfg.fire_confirmation_window_ms,
+                            hermes_cfg.fire_require_persistence,
+                            hermes_cfg.fire_min_feed_match_count
+                        ))
+                        .with_timing(signal.received_at_ms, 0)
+                        .with_hermes_context(
+                            hermes_hit,
+                            hermes_state_value.clone(),
+                            hermes_feed_match_count,
+                            hermes_signal_received_at_ms,
+                            hermes_to_reactive_delta_ms,
+                            Some("hermes_shortlist".to_string()),
+                            Some(false),
+                        ),
+                    );
+
+                    if hermes_cfg.fire_confirmation_window_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            hermes_cfg.fire_confirmation_window_ms,
+                        ))
+                        .await;
+                    }
+
+                    let post_confirmation_context = {
+                        let state = hermes_runtime.read().await;
+                        state.fast_lane_context(&signal.obligation_pubkey, now_ms(), &hermes_cfg)
+                    };
+
+                    let Some(confirmed_context) = post_confirmation_context else {
+                        trace_logger.log(
+                            HunterTraceEvent::new(
+                                "kamino",
+                                "hermes_firing_skipped",
+                                format!("hermes:{}", signal.obligation_pubkey),
+                            )
+                            .with_obligation(signal.obligation_pubkey.clone())
+                            .with_optional_repay_mint(signal.repay_mint.clone())
+                            .with_reason("hermes_not_armed_anymore")
+                            .with_timing(signal.received_at_ms, 0),
+                        );
+                        mark_lock_fired(
+                            &signal_locks,
+                            &fingerprint,
+                            signal.source,
+                            now_ms(),
+                            FireOutcome::Skipped,
+                        );
+                        return;
+                    };
+
+                    if hermes_cfg.fire_require_persistence
+                        && now_ms().saturating_sub(confirmed_context.last_price_signal_at_ms)
+                            > hermes_cfg.fire_max_context_age_ms
+                    {
+                        trace_logger.log(
+                            HunterTraceEvent::new(
+                                "kamino",
+                                "hermes_firing_skipped",
+                                format!("hermes:{}", signal.obligation_pubkey),
+                            )
+                            .with_obligation(signal.obligation_pubkey.clone())
+                            .with_optional_repay_mint(signal.repay_mint.clone())
+                            .with_reason("hermes_context_stale")
+                            .with_detail(format!(
+                                "context_age_ms={} max_context_age_ms={}",
+                                now_ms()
+                                    .saturating_sub(confirmed_context.last_price_signal_at_ms),
+                                hermes_cfg.fire_max_context_age_ms
+                            ))
+                            .with_timing(signal.received_at_ms, 0),
+                        );
+                        mark_lock_fired(
+                            &signal_locks,
+                            &fingerprint,
+                            signal.source,
+                            now_ms(),
+                            FireOutcome::Skipped,
+                        );
+                        return;
+                    }
+
+                    if confirmed_context.feed_match_count < hermes_cfg.fire_min_feed_match_count {
+                        trace_logger.log(
+                            HunterTraceEvent::new(
+                                "kamino",
+                                "hermes_firing_skipped",
+                                format!("hermes:{}", signal.obligation_pubkey),
+                            )
+                            .with_obligation(signal.obligation_pubkey.clone())
+                            .with_optional_repay_mint(signal.repay_mint.clone())
+                            .with_reason("hermes_feed_match_insufficient")
+                            .with_detail(format!(
+                                "feed_match_count={} min_feed_match_count={}",
+                                confirmed_context.feed_match_count,
+                                hermes_cfg.fire_min_feed_match_count
+                            ))
+                            .with_timing(signal.received_at_ms, 0),
+                        );
+                        mark_lock_fired(
+                            &signal_locks,
+                            &fingerprint,
+                            signal.source,
+                            now_ms(),
+                            FireOutcome::Skipped,
+                        );
+                        return;
+                    }
+                }
+
                 let result = execute_kamino_opportunity(
                     sig_for_error.clone(),
                     signal.received_at_ms,
@@ -1356,8 +1582,13 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     && !matches!(outcome, FireOutcome::OpportunityError)
                 {
                     let mut state = hermes_runtime.write().await;
-                    let _ =
-                        state.note_reactive_hit(&signal.obligation_pubkey, now_ms(), &hermes_cfg);
+                    if signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable {
+                        let _ =
+                            state.note_hermes_fire(&signal.obligation_pubkey, now_ms(), &hermes_cfg);
+                    } else {
+                        let _ = state
+                            .note_reactive_hit(&signal.obligation_pubkey, now_ms(), &hermes_cfg);
+                    }
                 }
                 mark_lock_fired(
                     &signal_locks,
@@ -1873,9 +2104,16 @@ fn prepared_context_from_resolved_accounts(
         repay_mint: resolved.repay_mint.clone(),
         repay_symbol,
         wallet_eligible: true,
+        lending_market: resolved.lending_market.clone(),
+        lending_market_authority: resolved.lending_market_authority.clone(),
         repay_reserve: resolved.repay_reserve.clone(),
+        repay_supply: resolved.repay_supply.clone(),
         withdraw_reserve: resolved.withdraw_reserve.clone(),
         withdraw_mint: resolved.withdraw_liquidity_mint.clone(),
+        withdraw_collateral_mint: resolved.withdraw_collateral_mint.clone(),
+        withdraw_collateral_supply: resolved.withdraw_collateral_supply.clone(),
+        withdraw_liquidity_supply: resolved.withdraw_liquidity_supply.clone(),
+        withdraw_liquidity_fee_receiver: resolved.withdraw_liquidity_fee_receiver.clone(),
         active_reserve_pubkeys: vec![],
         inclusion_reason,
     }
@@ -2260,107 +2498,136 @@ where
 {
     let started_at = Instant::now();
 
-    // ── 1. getTransaction — bounded retry window ─────────────────────────────
+    // ── 1. getTransaction — bounded retry window (reactive path only) ──────
     let tx_fetch_started_at = Instant::now();
-    let tx_info = match preloaded_tx_info {
-        Some(tx_info) => tx_info,
-        None => match tokio::time::timeout(
-            tokio::time::Duration::from_millis(runtime.tx_fetch.timeout_ms),
-            rpc.get_transaction_with_retries(
-                &sig,
-                runtime.tx_fetch.attempts,
-                runtime.tx_fetch.retry_delay_ms,
-            ),
+    let tx_info = if let Some(tx_info) = preloaded_tx_info {
+        Some(tx_info)
+    } else if prepared_context.is_none() {
+        Some(
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(runtime.tx_fetch.timeout_ms),
+                rpc.get_transaction_with_retries(
+                    &sig,
+                    runtime.tx_fetch.attempts,
+                    runtime.tx_fetch.retry_delay_ms,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(tx_info)) => tx_info,
+                Ok(Err(e)) => {
+                    let status = rpc.get_signature_status(&sig).await.ok().flatten();
+                    anyhow::bail!(
+                        "getTransaction failed after {}ms: {} | {}",
+                        tx_fetch_started_at.elapsed().as_millis(),
+                        e,
+                        format_signature_status(status.as_ref())
+                    );
+                }
+                Err(_) => {
+                    let status = rpc.get_signature_status(&sig).await.ok().flatten();
+                    anyhow::bail!(
+                        "getTransaction timeout after {}ms | {}",
+                        tx_fetch_started_at.elapsed().as_millis(),
+                        format_signature_status(status.as_ref())
+                    );
+                }
+            },
         )
-        .await
-        {
-            Ok(Ok(tx_info)) => tx_info,
-            Ok(Err(e)) => {
-                let status = rpc.get_signature_status(&sig).await.ok().flatten();
-                anyhow::bail!(
-                    "getTransaction failed after {}ms: {} | {}",
-                    tx_fetch_started_at.elapsed().as_millis(),
-                    e,
-                    format_signature_status(status.as_ref())
-                );
-            }
-            Err(_) => {
-                let status = rpc.get_signature_status(&sig).await.ok().flatten();
-                anyhow::bail!(
-                    "getTransaction timeout after {}ms | {}",
-                    tx_fetch_started_at.elapsed().as_millis(),
-                    format_signature_status(status.as_ref())
-                );
-            }
-        },
+    } else {
+        None
     };
-    let tx_fetch_ms = tx_fetch_started_at.elapsed().as_millis();
+    let tx_fetch_ms = if tx_info.is_some() {
+        tx_fetch_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
 
     // ── 2. Find the liquidate instruction ────────────────────────────────────
-    let liquidate_ix_idx = find_kamino_liquidate_ix(&tx_info);
-
-    let ix_idx =
-        liquidate_ix_idx.ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
-
-    let ix_accs = &tx_info.instruction_accounts[ix_idx];
-    if ix_accs.len() < 13 {
-        anyhow::bail!(
-            "liquidate instruction has too few accounts ({})",
-            ix_accs.len()
-        );
-    }
-
-    // ── 3. Resolve account pubkeys from the competitor's instruction ─────────
-    // Account layout of LiquidateObligationAndRedeemReserveCollateralV2:
-    //   0  liquidator (competitor's, we replace with ours)
-    //   1  obligation PDA
-    //   2  lending_market
-    //   3  lending_market_authority
-    //   4  repay_reserve
-    //   5  repay_liquidity_mint
-    //   6  repay_liquidity_supply
-    //   7  withdraw_reserve
-    //   8  withdraw_liquidity_mint
-    //   9  withdraw_collateral_mint
-    //   10 withdraw_collateral_supply
-    //   11 withdraw_liquidity_supply
-    //   12 withdraw_liquidity_fee_receiver
-    macro_rules! resolve {
-        ($i:expr) => {
-            tx_info.account_keys
-                .get(ix_accs[$i])
-                .map(|s| s.as_str())
-                .ok_or_else(|| anyhow::anyhow!(
-                    "missing account at position {} (ix_accounts_len={} account_keys_len={} referenced_index={})",
-                    $i,
-                    ix_accs.len(),
-                    tx_info.account_keys.len(),
-                    ix_accs[$i]
-                ))?
-        }
-    }
-
+    // ── 3. Resolve account pubkeys from signal tx or prepared context ────────
     let resolve_started_at = Instant::now();
-    let obligation_owned = match known_obligation {
-        Some(value) => value,
-        None => resolve!(1).to_string(),
+    let (
+        obligation_owned,
+        market_owned,
+        market_auth_owned,
+        repay_reserve_owned,
+        repay_mint_owned,
+        repay_supply_owned,
+        wdr_reserve_owned,
+        wdr_liq_mint_owned,
+        wdr_col_mint_owned,
+        wdr_col_sup_owned,
+        wdr_liq_sup_owned,
+        wdr_fee_owned,
+    ) = if let Some(tx_info) = tx_info.as_ref() {
+        let liquidate_ix_idx = find_kamino_liquidate_ix(tx_info)
+            .ok_or_else(|| anyhow::anyhow!("no KLEND liquidate instruction found"))?;
+        let ix_accs = &tx_info.instruction_accounts[liquidate_ix_idx];
+        if ix_accs.len() < 13 {
+            anyhow::bail!(
+                "liquidate instruction has too few accounts ({})",
+                ix_accs.len()
+            );
+        }
+        let resolve = |index: usize| -> anyhow::Result<String> {
+            tx_info
+                .account_keys
+                .get(*ix_accs.get(index).ok_or_else(|| {
+                    anyhow::anyhow!("missing liquidate account index {}", index)
+                })?)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing account key for {}", index))
+        };
+
+        (
+            known_obligation
+                .map(|value| value.to_string())
+                .unwrap_or(resolve(1)?),
+            resolve(2)?,
+            resolve(3)?,
+            resolve(4)?,
+            known_repay_mint
+                .map(|value| value.to_string())
+                .unwrap_or(resolve(5)?),
+            resolve(6)?,
+            resolve(7)?,
+            resolve(8)?,
+            resolve(9)?,
+            resolve(10)?,
+            resolve(11)?,
+            resolve(12)?,
+        )
+    } else {
+        let prepared = prepared_context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing prepared context for hermes firing"))?;
+        (
+            prepared.obligation_pubkey.clone(),
+            prepared.lending_market.clone(),
+            prepared.lending_market_authority.clone(),
+            prepared.repay_reserve.clone(),
+            prepared.repay_mint.clone(),
+            prepared.repay_supply.clone(),
+            prepared.withdraw_reserve.clone(),
+            prepared.withdraw_mint.clone(),
+            prepared.withdraw_collateral_mint.clone(),
+            prepared.withdraw_collateral_supply.clone(),
+            prepared.withdraw_liquidity_supply.clone(),
+            prepared.withdraw_liquidity_fee_receiver.clone(),
+        )
     };
     let obligation_str = obligation_owned.as_str();
-    let market_str = resolve!(2);
-    let market_auth_str = resolve!(3);
-    let repay_reserve_str = resolve!(4);
-    let repay_mint_owned = match known_repay_mint {
-        Some(value) => value,
-        None => resolve!(5).to_string(),
-    };
+    let market_str = market_owned.as_str();
+    let market_auth_str = market_auth_owned.as_str();
+    let repay_reserve_str = repay_reserve_owned.as_str();
     let repay_mint_str = repay_mint_owned.as_str();
-    let repay_supply_str = resolve!(6);
-    let wdr_reserve_str = resolve!(7);
-    let wdr_liq_mint_str = resolve!(8);
-    let wdr_col_mint_str = resolve!(9);
-    let wdr_col_sup_str = resolve!(10);
-    let wdr_liq_sup_str = resolve!(11);
-    let wdr_fee_str = resolve!(12);
+    let repay_supply_str = repay_supply_owned.as_str();
+    let wdr_reserve_str = wdr_reserve_owned.as_str();
+    let wdr_liq_mint_str = wdr_liq_mint_owned.as_str();
+    let wdr_col_mint_str = wdr_col_mint_owned.as_str();
+    let wdr_col_sup_str = wdr_col_sup_owned.as_str();
+    let wdr_liq_sup_str = wdr_liq_sup_owned.as_str();
+    let wdr_fee_str = wdr_fee_owned.as_str();
     let resolve_ms = resolve_started_at.elapsed().as_millis();
     let prepared_context_used = prepared_context
         .as_ref()
@@ -2622,25 +2889,29 @@ where
         AccountMeta::new_readonly(withdraw_reserve_meta.token_program, false),
         AccountMeta::new_readonly(sysvar::instructions::id(), false),
     ];
-    if ix_accs.len() >= 25 {
-        for &account_idx in &ix_accs[20..24] {
-            let pk = Pubkey::from_str(
-                tx_info
-                    .account_keys
-                    .get(account_idx)
-                    .ok_or_else(|| anyhow::anyhow!("missing farm account"))?,
-            )?;
-            liquidation_accounts.push(AccountMeta::new(pk, false));
+    let farm_extra_accounts = tx_info
+        .as_ref()
+        .and_then(find_kamino_liquidate_ix)
+        .and_then(|ix_idx| {
+            let tx = tx_info.as_ref()?;
+            let ix_accs = tx.instruction_accounts.get(ix_idx)?;
+            if ix_accs.len() < 25 {
+                return None;
+            }
+            let mut farm_accounts = Vec::new();
+            for &account_idx in &ix_accs[20..24] {
+                let account = tx.account_keys.get(account_idx)?;
+                let pk = Pubkey::from_str(account).ok()?;
+                farm_accounts.push(pk);
+            }
+            let farms_program_idx = *ix_accs.get(24)?;
+            let farms_program_pk = Pubkey::from_str(tx.account_keys.get(farms_program_idx)?).ok()?;
+            Some((farm_accounts, farms_program_pk))
+        });
+    if let Some((farm_accounts, farms_program_pk)) = farm_extra_accounts {
+        for account in farm_accounts {
+            liquidation_accounts.push(AccountMeta::new(account, false));
         }
-        let farms_program_idx = *ix_accs
-            .get(24)
-            .ok_or_else(|| anyhow::anyhow!("missing farms program"))?;
-        let farms_program_pk = Pubkey::from_str(
-            tx_info
-                .account_keys
-                .get(farms_program_idx)
-                .ok_or_else(|| anyhow::anyhow!("missing farms program key"))?,
-        )?;
         liquidation_accounts.push(AccountMeta::new_readonly(farms_program_pk, false));
     } else {
         liquidation_accounts.push(AccountMeta::new(klend_pk, false));

@@ -12,6 +12,46 @@ use std::future::Future;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_KAMINO_MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HermesExecutionMode {
+    Prepare,
+    Hybrid,
+    Only,
+}
+
+impl HermesExecutionMode {
+    pub fn from_env() -> Self {
+        match std::env::var("HERMES_EXECUTION_MODE")
+            .unwrap_or_else(|_| "prepare".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hybrid" => Self::Hybrid,
+            "only" => Self::Only,
+            _ => Self::Prepare,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Hybrid => "hybrid",
+            Self::Only => "only",
+        }
+    }
+
+    pub fn allows_hermes_firing(self) -> bool {
+        matches!(self, Self::Hybrid | Self::Only)
+    }
+
+    pub fn reactive_observe_only(self) -> bool {
+        matches!(self, Self::Hybrid)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HermesRuntimeConfig {
     pub ws_url: String,
@@ -20,6 +60,13 @@ pub struct HermesRuntimeConfig {
     pub trigger_buffer_bps: f64,
     pub armed_stale_ms: u64,
     pub cooldown_ms: u64,
+    pub execution_mode: HermesExecutionMode,
+    pub fire_enabled: bool,
+    pub fire_confirmation_window_ms: u64,
+    pub fire_max_context_age_ms: u64,
+    pub fire_cooldown_ms: u64,
+    pub fire_min_feed_match_count: usize,
+    pub fire_require_persistence: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +115,11 @@ pub struct HermesReserveInfo {
     pub reserve_pubkey: String,
     pub mint: String,
     pub pyth_feed_id: Option<String>,
+    pub lending_market: String,
+    pub liquidity_supply: String,
+    pub collateral_mint: String,
+    pub collateral_supply: String,
+    pub liquidity_fee_receiver: String,
 }
 
 impl HermesRuntimeConfig {
@@ -99,6 +151,37 @@ impl HermesRuntimeConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(20_000);
+        let execution_mode = HermesExecutionMode::from_env();
+        let fire_enabled = std::env::var("HERMES_FIRE_ENABLE")
+            .ok()
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(true);
+        let fire_confirmation_window_ms = std::env::var("HERMES_FIRE_CONFIRMATION_WINDOW_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        let fire_max_context_age_ms = std::env::var("HERMES_FIRE_MAX_CONTEXT_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2_000);
+        let fire_cooldown_ms = std::env::var("HERMES_FIRE_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5_000);
+        let fire_min_feed_match_count = std::env::var("HERMES_FIRE_MIN_FEED_MATCH_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let fire_require_persistence = std::env::var("HERMES_FIRE_REQUIRE_PERSISTENCE")
+            .ok()
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(true);
 
         Self {
             ws_url,
@@ -107,6 +190,13 @@ impl HermesRuntimeConfig {
             trigger_buffer_bps,
             armed_stale_ms,
             cooldown_ms,
+            execution_mode,
+            fire_enabled,
+            fire_confirmation_window_ms,
+            fire_max_context_age_ms,
+            fire_cooldown_ms,
+            fire_min_feed_match_count,
+            fire_require_persistence,
         }
     }
 }
@@ -156,6 +246,20 @@ impl HermesShortlistRuntime {
         };
         entry.state = ShortlistState::CoolingDown;
         entry.cooldown_until_ms = Some(now_ms.saturating_add(config.cooldown_ms));
+        true
+    }
+
+    pub fn note_hermes_fire(
+        &mut self,
+        obligation: &str,
+        now_ms: u64,
+        config: &HermesRuntimeConfig,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(obligation) else {
+            return false;
+        };
+        entry.state = ShortlistState::CoolingDown;
+        entry.cooldown_until_ms = Some(now_ms.saturating_add(config.fire_cooldown_ms));
         true
     }
 
@@ -255,6 +359,16 @@ pub fn build_hermes_shortlist(
                         reserve_pubkey: account.pubkey.clone(),
                         mint,
                         pyth_feed_id,
+                        lending_market: Pubkey::new_from_array(reserve.lending_market)
+                            .to_string(),
+                        liquidity_supply: Pubkey::new_from_array(reserve.liquidity.supply_vault)
+                            .to_string(),
+                        collateral_mint: Pubkey::new_from_array(reserve.collateral.mint_pubkey)
+                            .to_string(),
+                        collateral_supply:
+                            Pubkey::new_from_array(reserve.collateral.supply_vault).to_string(),
+                        liquidity_fee_receiver:
+                            Pubkey::new_from_array(reserve.liquidity.fee_vault).to_string(),
                     },
                 );
             }
@@ -294,8 +408,8 @@ pub fn build_hermes_shortlist_from_decoded(
         let distance_to_liq = obligation.dist_to_liq();
         let mut tracked_feed_ids = Vec::new();
         let mut active_reserve_pubkeys = Vec::new();
-        let mut repay_choice: Option<(String, String, String, u128)> = None;
-        let mut withdraw_choice: Option<(String, String, u128)> = None;
+        let mut repay_choice: Option<([u8; 32], String, String, String, u128)> = None;
+        let mut withdraw_choice: Option<([u8; 32], String, String, u128)> = None;
 
         for deposit in &obligation.deposits {
             if deposit.deposited_amount == 0 && deposit.market_value_sf == 0 {
@@ -307,13 +421,14 @@ pub fn build_hermes_shortlist_from_decoded(
                     tracked_feed_ids.push(feed_id.clone());
                 }
                 let candidate = (
+                    deposit.deposit_reserve,
                     reserve.reserve_pubkey.clone(),
                     reserve.mint.clone(),
                     deposit.market_value_sf,
                 );
                 if withdraw_choice
                     .as_ref()
-                    .is_none_or(|(_, _, current)| candidate.2 > *current)
+                    .is_none_or(|(_, _, _, current)| candidate.3 > *current)
                 {
                     withdraw_choice = Some(candidate);
                 }
@@ -331,6 +446,7 @@ pub fn build_hermes_shortlist_from_decoded(
                 }
                 if let Some(token) = whitelist.get(&reserve.mint) {
                     let candidate = (
+                        borrow.borrow_reserve,
                         reserve.reserve_pubkey.clone(),
                         reserve.mint.clone(),
                         token.symbol.clone(),
@@ -338,7 +454,7 @@ pub fn build_hermes_shortlist_from_decoded(
                     );
                     if repay_choice
                         .as_ref()
-                        .is_none_or(|(_, _, _, current)| candidate.3 > *current)
+                        .is_none_or(|(_, _, _, _, current)| candidate.4 > *current)
                     {
                         repay_choice = Some(candidate);
                     }
@@ -351,10 +467,12 @@ pub fn build_hermes_shortlist_from_decoded(
         active_reserve_pubkeys.sort();
         active_reserve_pubkeys.dedup();
 
-        let Some((repay_reserve, repay_mint, repay_symbol, _)) = repay_choice else {
+        let Some((repay_reserve_key, repay_reserve, repay_mint, repay_symbol, _)) = repay_choice
+        else {
             continue;
         };
-        let Some((withdraw_reserve, withdraw_mint, _)) = withdraw_choice else {
+        let Some((withdraw_reserve_key, withdraw_reserve, withdraw_mint, _)) = withdraw_choice
+        else {
             continue;
         };
 
@@ -377,9 +495,21 @@ pub fn build_hermes_shortlist_from_decoded(
                 repay_mint,
                 repay_symbol,
                 wallet_eligible: true,
+                lending_market: reserve_infos[&repay_reserve_key].lending_market.clone(),
+                lending_market_authority: std::env::var("KAMINO_MARKET_AUTHORITY")
+                    .unwrap_or_else(|_| DEFAULT_KAMINO_MARKET_AUTHORITY.to_string()),
                 repay_reserve,
+                repay_supply: reserve_infos[&repay_reserve_key].liquidity_supply.clone(),
                 withdraw_reserve,
                 withdraw_mint,
+                withdraw_collateral_mint:
+                    reserve_infos[&withdraw_reserve_key].collateral_mint.clone(),
+                withdraw_collateral_supply:
+                    reserve_infos[&withdraw_reserve_key].collateral_supply.clone(),
+                withdraw_liquidity_supply:
+                    reserve_infos[&withdraw_reserve_key].liquidity_supply.clone(),
+                withdraw_liquidity_fee_receiver:
+                    reserve_infos[&withdraw_reserve_key].liquidity_fee_receiver.clone(),
                 active_reserve_pubkeys,
                 inclusion_reason,
             },
@@ -653,6 +783,26 @@ mod tests {
             trigger_buffer_bps: 0.0025,
             armed_stale_ms: 20_000,
             cooldown_ms: 20_000,
+            execution_mode: super::HermesExecutionMode::Prepare,
+            fire_enabled: true,
+            fire_confirmation_window_ms: 120,
+            fire_max_context_age_ms: 2_000,
+            fire_cooldown_ms: 5_000,
+            fire_min_feed_match_count: 1,
+            fire_require_persistence: true,
+        }
+    }
+
+    fn reserve_info(mint: String, pyth_feed_id: Option<String>) -> HermesReserveInfo {
+        HermesReserveInfo {
+            reserve_pubkey: Pubkey::new_unique().to_string(),
+            mint,
+            pyth_feed_id,
+            lending_market: Pubkey::new_unique().to_string(),
+            liquidity_supply: Pubkey::new_unique().to_string(),
+            collateral_mint: Pubkey::new_unique().to_string(),
+            collateral_supply: Pubkey::new_unique().to_string(),
+            liquidity_fee_receiver: Pubkey::new_unique().to_string(),
         }
     }
 
@@ -668,27 +818,21 @@ mod tests {
         let mut reserve_infos = HashMap::new();
         reserve_infos.insert(
             repay_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: whitelisted_mint.to_string(),
-                pyth_feed_id: Some(feed.clone()),
-            },
+            reserve_info(whitelisted_mint.to_string(), Some(feed.clone())),
         );
         reserve_infos.insert(
             blocked_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: non_whitelisted_mint.to_string(),
-                pyth_feed_id: Some(hermes_feed_id_from_pubkey(Pubkey::new_unique())),
-            },
+            reserve_info(
+                non_whitelisted_mint.to_string(),
+                Some(hermes_feed_id_from_pubkey(Pubkey::new_unique())),
+            ),
         );
         reserve_infos.insert(
             deposit_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: Pubkey::new_unique().to_string(),
-                pyth_feed_id: Some(hermes_feed_id_from_pubkey(Pubkey::new_unique())),
-            },
+            reserve_info(
+                Pubkey::new_unique().to_string(),
+                Some(hermes_feed_id_from_pubkey(Pubkey::new_unique())),
+            ),
         );
 
         let allowed_obligation =
@@ -734,19 +878,11 @@ mod tests {
         let mut reserve_infos = HashMap::new();
         reserve_infos.insert(
             repay_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: repay_mint.to_string(),
-                pyth_feed_id: Some(feed.clone()),
-            },
+            reserve_info(repay_mint.to_string(), Some(feed.clone())),
         );
         reserve_infos.insert(
             deposit_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: deposit_mint.to_string(),
-                pyth_feed_id: Some(deposit_feed.clone()),
-            },
+            reserve_info(deposit_mint.to_string(), Some(deposit_feed.clone())),
         );
 
         let entries = build_hermes_shortlist_from_decoded(
@@ -787,19 +923,11 @@ mod tests {
         let mut reserve_infos = HashMap::new();
         reserve_infos.insert(
             repay_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: repay_mint.to_string(),
-                pyth_feed_id: Some(feed.clone()),
-            },
+            reserve_info(repay_mint.to_string(), Some(feed.clone())),
         );
         reserve_infos.insert(
             deposit_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: deposit_mint.to_string(),
-                pyth_feed_id: None,
-            },
+            reserve_info(deposit_mint.to_string(), None),
         );
 
         let entries = build_hermes_shortlist_from_decoded(
@@ -843,19 +971,11 @@ mod tests {
         let mut reserve_infos = HashMap::new();
         reserve_infos.insert(
             repay_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: repay_mint.to_string(),
-                pyth_feed_id: Some(feed.clone()),
-            },
+            reserve_info(repay_mint.to_string(), Some(feed.clone())),
         );
         reserve_infos.insert(
             deposit_reserve,
-            HermesReserveInfo {
-                reserve_pubkey: Pubkey::new_unique().to_string(),
-                mint: deposit_mint.to_string(),
-                pyth_feed_id: None,
-            },
+            reserve_info(deposit_mint.to_string(), None),
         );
 
         let entries = build_hermes_shortlist_from_decoded(

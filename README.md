@@ -24,7 +24,7 @@ For Kamino, the current P1 direction is now explicit in the runtime:
 
 - observed liquidation signals can seed a small proactive shortlist
 - only obligations whose `repay mint` is already in the wallet are eligible
-- firing stays reactive, but preparation is moved out of the hottest part of the path where possible
+- firing can now be driven by Hermes shortlist state in `hybrid/only` runtime modes, with reactive signals kept for observability
 - the hunter now refreshes all known active reserves before firing and builds Kamino token accounts from reserve-derived token programs rather than assuming a fixed SPL layout
 
 The repository also includes analysis tooling to turn raw JSONL traces into dated research reports. This is used to quantify:
@@ -95,6 +95,10 @@ Important variables:
 - `ENABLE_HUNTER_SIGNAL_PRICE_FEED`, `SIGNAL_FEED_WS_URL`
 - `HERMES_SHORTLIST_SIZE`, `HERMES_REFRESH_SECS`, `HERMES_TRIGGER_BUFFER_BPS`
 - `HERMES_ARMED_STALE_MS`, `HERMES_COOLDOWN_MS`
+- `HERMES_EXECUTION_MODE`, `HERMES_FIRE_ENABLE`
+- `HERMES_FIRE_CONFIRMATION_WINDOW_MS`, `HERMES_FIRE_MAX_CONTEXT_AGE_MS`
+- `HERMES_FIRE_COOLDOWN_MS`, `HERMES_FIRE_MIN_FEED_MATCH_COUNT`
+- `HERMES_FIRE_REQUIRE_PERSISTENCE`
 - `HUNTER_SHORTLIST_ENABLED`, `HUNTER_SHORTLIST_MAX_OBLIGATIONS`
 - `HUNTER_SHORTLIST_REFRESH_SECS`, `HUNTER_SHORTLIST_REFRESH_DEBOUNCE_MS`
 - `JITO_MIN_SEND_INTERVAL_MS`, `JITO_SEND_WAIT_BUDGET_MS`
@@ -113,7 +117,11 @@ Recent runtime notes:
 - hunter traces and signal metrics can be converted into a dated Markdown report for longitudinal comparison
 - RPC variable names are role-based: observer variables configure the observer, hunter variables configure the hunter, and optional hunter secondary signal variables configure only the hunter comparison path
 - the Kamino hunter can maintain a wallet-constrained shortlist seeded by observed liquidation signals, with event-driven refresh plus a safety refresh interval
-- Hermes v1 is passive-only: it pre-arms a bounded Kamino shortlist from Pyth/Hermes price updates, but final firing still requires the normal reactive Kamino signal
+- Hermes runtime now supports explicit execution modes:
+  - `prepare`: shortlist/context preparation only (reactive can still fire)
+  - `hybrid`: Hermes may fire from armed shortlist context, reactive stays observe-only
+  - `only`: Hermes firing path enabled, reactive remains observation-only
+- Hermes hybrid firing is experimental and intentionally aggressive; it is used to learn whether pre-signal execution can outperform purely reactive timing
 
 ## Install
 

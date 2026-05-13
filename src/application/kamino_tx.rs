@@ -29,10 +29,17 @@ pub struct KaminoReserveMeta {
 #[derive(Debug, Clone)]
 pub struct KaminoResolvedAccounts {
     pub obligation_pubkey: String,
+    pub lending_market: String,
+    pub lending_market_authority: String,
     pub repay_reserve: String,
     pub repay_mint: String,
+    pub repay_supply: String,
     pub withdraw_reserve: String,
     pub withdraw_liquidity_mint: String,
+    pub withdraw_collateral_mint: String,
+    pub withdraw_collateral_supply: String,
+    pub withdraw_liquidity_supply: String,
+    pub withdraw_liquidity_fee_receiver: String,
 }
 
 #[derive(Debug)]
@@ -181,12 +188,19 @@ pub fn resolve_kamino_accounts_from_tx_info(
         obligation_pubkey: known_obligation
             .map(|value| value.to_string())
             .unwrap_or(resolve(1)?),
+        lending_market: resolve(2)?,
+        lending_market_authority: resolve(3)?,
         repay_reserve: resolve(4)?,
         repay_mint: known_repay_mint
             .map(|value| value.to_string())
             .unwrap_or(resolve(5)?),
+        repay_supply: resolve(6)?,
         withdraw_reserve: resolve(7)?,
         withdraw_liquidity_mint: resolve(8)?,
+        withdraw_collateral_mint: resolve(9)?,
+        withdraw_collateral_supply: resolve(10)?,
+        withdraw_liquidity_supply: resolve(11)?,
+        withdraw_liquidity_fee_receiver: resolve(12)?,
     })
 }
 
