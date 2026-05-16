@@ -41,6 +41,7 @@ The public value of the project is not "a profitable bot". The value is the inst
 - The hunter is still mostly reactive and therefore frequently second in competitive situations.
 - Some execution paths still depend on post-factum transaction reads, which is structurally slower than a pre-computed strategy.
 - The new shortlist logic does not remove the structural dependence on signal timing from Helius or comparable sources.
+- Hermes hybrid firing is still effectively constrained to the configured Kamino lending market and does not yet provide a dynamic multi-market execution path.
 - Some Kamino candidates still look liquidatable in a stale snapshot or CSV export and become healthy again once all reserves are refreshed in the actual transaction path.
 - `bundle_sent` is not equivalent to a confirmed liquidation win. It only means the Jito endpoint accepted the bundle submission.
 - Wallet coverage is intentionally narrow, so some observed opportunities are skipped by design.
@@ -93,7 +94,8 @@ Important variables:
 - `HUNTER_SIGNAL_SECONDARY_RPC_URL`, `HUNTER_SIGNAL_SECONDARY_WS_URL`
 - `ENABLE_HUNTER_SIGNAL_PRIMARY`, `ENABLE_HUNTER_SIGNAL_SECONDARY`
 - `ENABLE_HUNTER_SIGNAL_PRICE_FEED`, `SIGNAL_FEED_WS_URL`
-- `HERMES_SHORTLIST_SIZE`, `HERMES_REFRESH_SECS`, `HERMES_TRIGGER_BUFFER_BPS`
+- `HERMES_SHORTLIST_RPC_URL`
+- `HERMES_SHORTLIST_SIZE`, `HERMES_REFRESH_SECS`, `HERMES_SHORTLIST_MIN_REPAY_USD`, `HERMES_TRIGGER_BUFFER_BPS`
 - `HERMES_ARMED_STALE_MS`, `HERMES_COOLDOWN_MS`
 - `HERMES_EXECUTION_MODE`, `HERMES_FIRE_ENABLE`
 - `HERMES_FIRE_CONFIRMATION_WINDOW_MS`, `HERMES_FIRE_MAX_CONTEXT_AGE_MS`
@@ -122,6 +124,7 @@ Recent runtime notes:
   - `hybrid`: Hermes may fire from armed shortlist context, reactive stays observe-only
   - `only`: Hermes firing path enabled, reactive remains observation-only
 - Hermes hybrid firing is experimental and intentionally aggressive; it is used to learn whether pre-signal execution can outperform purely reactive timing
+- Hermes shortlist firing currently assumes a configured Kamino market authority; obligations from other lending markets are filtered out rather than executed through a dynamic authority resolution path
 
 ## Install
 
@@ -178,6 +181,8 @@ cargo run --bin liquidate_one -- <OBLIGATION_PUBKEY> --dry-run
 `liquidate_one` is an experimental single-obligation probe used to validate the transaction chain one link at a time. It is not a batch liquidator and should be used manually on one candidate obligation per run.
 
 `select_kamino_candidates` is the companion selector used to scan a Kamino Risk CSV export locally, keep only obligations whose borrow tokens are covered by `wallet.toml`, and optionally filter them against RPC so stale or already-closed obligations are discarded before the probe. It never sends a transaction.
+
+`--liquidatable-only` on the selector is intentionally weaker than a full Kamino verdict: it reflects the raw on-chain obligation snapshot, not the post-refresh decision that Kamino would make inside an actual liquidation transaction.
 
 Recommended workflow:
 

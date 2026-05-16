@@ -1,5 +1,6 @@
 use crate::config::env_flag;
 use crate::ports::rpc::RpcCommitment;
+use crate::utils::{parse_runtime_log_verbosity, RuntimeLogVerbosity};
 
 #[derive(Debug, Clone, Copy)]
 pub struct HunterTxFetchConfig {
@@ -30,7 +31,7 @@ pub struct HunterRuntimeConfig {
     pub shortlist_candidate_history_limit: usize,
     pub hermes_armed_stale_ms: u64,
     pub hermes_cooling_down_ms: u64,
-    pub verbose: bool,
+    pub log_verbosity: RuntimeLogVerbosity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,14 +113,24 @@ impl HunterRuntimeConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1_500);
 
-        let verbose = std::env::var(format!("{prefix}_VERBOSE"))
+        let log_verbosity = std::env::var(format!("{prefix}_LOG_VERBOSITY"))
             .ok()
-            .or_else(|| std::env::var("HUNTER_VERBOSE").ok())
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            .or_else(|| std::env::var("HUNTER_LOG_VERBOSITY").ok())
+            .and_then(|v| parse_runtime_log_verbosity(&v))
+            .or_else(|| {
+                std::env::var(format!("{prefix}_VERBOSE"))
+                    .ok()
+                    .or_else(|| std::env::var("HUNTER_VERBOSE").ok())
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+                            RuntimeLogVerbosity::High
+                        } else {
+                            RuntimeLogVerbosity::Low
+                        }
+                    })
             })
-            .unwrap_or(true);
+            .unwrap_or(RuntimeLogVerbosity::Low);
 
         let shortlist_enabled = std::env::var(format!("{prefix}_SHORTLIST_ENABLED"))
             .ok()
@@ -142,7 +153,7 @@ impl HunterRuntimeConfig {
             .ok()
             .or_else(|| std::env::var("HUNTER_SHORTLIST_REFRESH_SECS").ok())
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20);
+            .unwrap_or(1_200);
 
         let shortlist_refresh_debounce_ms =
             std::env::var(format!("{prefix}_SHORTLIST_REFRESH_DEBOUNCE_MS"))
@@ -193,7 +204,7 @@ impl HunterRuntimeConfig {
             shortlist_candidate_history_limit,
             hermes_armed_stale_ms,
             hermes_cooling_down_ms,
-            verbose,
+            log_verbosity,
         }
     }
 }

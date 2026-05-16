@@ -16,6 +16,9 @@ wallet.toml
 .DS_Store
 Thumbs.db
 
+# Docs
+site/
+
 # Project Specific
 .gemini/
 .claude/

@@ -129,6 +129,13 @@ fn required_env_with_fallback(primary: &str, fallback: &str) -> anyhow::Result<S
 fn optional_rpc_config(rpc_env: &str, ws_env: &str, tx_commitment_env: &str) -> Option<RpcConfig> {
     let rpc_url = std::env::var(rpc_env).ok()?;
     let ws_url = std::env::var(ws_env).ok()?;
+    if rpc_url.trim().is_empty()
+        || ws_url.trim().is_empty()
+        || rpc_url.contains(".example")
+        || ws_url.contains(".example")
+    {
+        return None;
+    }
 
     Some(RpcConfig {
         rpc_url,

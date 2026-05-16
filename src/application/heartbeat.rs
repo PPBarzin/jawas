@@ -1,5 +1,5 @@
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
-use crate::utils::{log_stderr, log_stdout, utc_now};
+use crate::utils::{log_stderr, log_stdout_at, utc_now, RuntimeLogVerbosity};
 use std::time::Duration;
 
 /// Phase 1: Periodic heartbeat to ensure the bot is alive.
@@ -46,7 +46,10 @@ impl<L: LiquidationLogger> HeartbeatService<L> {
             if let Err(e) = self.logger.log_observation(&event).await {
                 log_stderr(format!("[heartbeat] log failed: {}", e));
             } else {
-                log_stdout(format!("[heartbeat] sent at {}", event.timestamp));
+                log_stdout_at(
+                    RuntimeLogVerbosity::Medium,
+                    format!("[heartbeat] sent at {}", event.timestamp),
+                );
             }
         }
     }

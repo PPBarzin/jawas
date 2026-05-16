@@ -168,6 +168,9 @@ pub fn select_shortlist(
             if !candidate.context.wallet_eligible {
                 return None;
             }
+            if distance_to_liq <= 0.0 {
+                return None;
+            }
 
             let state = if candidate
                 .cooldown_until_ms
@@ -279,6 +282,20 @@ mod tests {
         assert!(shortlist.contains_key("two"));
         assert!(shortlist.contains_key("three"));
         assert!(!shortlist.contains_key("one"));
+    }
+
+    #[test]
+    fn shortlist_excludes_non_positive_distances() {
+        let mut candidates = HashMap::new();
+        for (obligation, distance) in [("negative", -0.01), ("zero", 0.0), ("positive", 0.01)] {
+            let mut candidate = ShortlistCandidate::new(context(obligation, obligation, true), 100);
+            candidate.update_refresh(distance, 110, "safety");
+            candidates.insert(obligation.to_string(), candidate);
+        }
+
+        let shortlist = select_shortlist(&candidates, 10, 120);
+        assert_eq!(shortlist.len(), 1);
+        assert!(shortlist.contains_key("positive"));
     }
 
     #[test]

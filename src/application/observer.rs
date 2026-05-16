@@ -1,11 +1,15 @@
 // Phase 1: Observes liquidations executed by other bots on Kamino.
 
+use crate::application::kamino_tip::{KaminoAdaptiveTipOutcome, KaminoAdaptiveTipPolicy};
+use crate::application::hunter::{HunterTraceEvent, HunterTraceLogger};
 use crate::domain::protocol::{Protocol, KAMINO_PROGRAM_ID, SOLEND_PROGRAM_ID};
 use crate::domain::token::{native_to_human, token_info, token_mint_by_symbol};
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::oracle::PriceOracle;
 use crate::ports::rpc::{RpcClient, StreamingRpcClient, TransactionInfo};
-use crate::utils::{log_stderr, log_stdout, utc_now};
+use crate::utils::{
+    log_stderr, log_stderr_at, log_stdout_at, utc_now, RuntimeLogVerbosity,
+};
 use std::collections::VecDeque;
 use std::io::Write;
 
@@ -62,6 +66,8 @@ pub struct ObserverService<R: StreamingRpcClient + RpcClient, L: LiquidationLogg
     logger: L,
     oracle: O,
     protocol: Protocol,
+    kamino_tip_policy: Option<KaminoAdaptiveTipPolicy>,
+    trace_logger: HunterTraceLogger,
 }
 
 impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
@@ -73,6 +79,25 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
             logger,
             oracle,
             protocol,
+            kamino_tip_policy: None,
+            trace_logger: HunterTraceLogger::from_env(),
+        }
+    }
+
+    pub fn with_kamino_tip_policy(
+        rpc: R,
+        logger: L,
+        oracle: O,
+        protocol: Protocol,
+        kamino_tip_policy: KaminoAdaptiveTipPolicy,
+    ) -> Self {
+        Self {
+            rpc,
+            logger,
+            oracle,
+            protocol,
+            kamino_tip_policy: Some(kamino_tip_policy),
+            trace_logger: HunterTraceLogger::from_env(),
         }
     }
 
@@ -146,12 +171,15 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
             events_received += 1;
 
             if events_received % 1000 == 0 {
-                log_stderr(format!(
-                    "[observer] {} {} events received ({} liquidations logged)",
-                    events_received,
-                    self.protocol.name(),
-                    liquidations_logged
-                ));
+                log_stdout_at(
+                    RuntimeLogVerbosity::Medium,
+                    format!(
+                        "[observer] {} {} events received ({} liquidations logged)",
+                        events_received,
+                        self.protocol.name(),
+                        liquidations_logged
+                    ),
+                );
             }
 
             let is_liquidation = entry.logs.iter().any(|log| log.contains(LIQUIDATE_FILTER));
@@ -177,7 +205,10 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
                     logs_json
                 );
                 if let Err(e) = log_file.write_all(line.as_bytes()) {
-                    log_stderr(format!("[observer] failed to write to log file: {}", e));
+                    log_stderr_at(
+                        RuntimeLogVerbosity::Medium,
+                        format!("[observer] failed to write to log file: {}", e),
+                    );
                 }
                 let _ = log_file.flush();
             }
@@ -239,7 +270,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
             // Enrich liquidated_user, liquidator, delay_ms and amounts from getTransaction.
             // delay_ms = websocket receive time − on-chain block time (Phase 1 approximation).
             // Falls back to log-parsed values if getTransaction fails or accounts are missing.
-            let (liquidated_user, liquidator, delay_ms, repay_amount, withdraw_amount) = match self
+            let (obligation_pda, liquidated_user, liquidator, delay_ms, repay_amount, withdraw_amount) = match self
                 .rpc
                 .get_transaction(&entry.signature)
                 .await
@@ -250,7 +281,7 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
                         .map(|bt| entry.received_at_ms.saturating_sub(bt * 1000))
                         .unwrap_or(0);
 
-                    let (_obligation_pda, owner, mut liq) = match self.protocol {
+                    let (obligation_pda, owner, mut liq) = match self.protocol {
                         Protocol::Kamino => {
                             extract_klend_liquidation_accounts(&tx, KAMINO_PROGRAM_ID).unwrap_or((
                                 "N/A".to_string(),
@@ -312,14 +343,18 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
                         }
                     }
 
-                    (owner, liq, delay, r_amt, w_amt)
+                    (obligation_pda, owner, liq, delay, r_amt, w_amt)
                 }
                 Err(e) => {
-                    log_stderr(format!(
-                        "[observer] get_transaction failed for liquidation {}: {}",
-                        entry.signature, e
-                    ));
+                    log_stderr_at(
+                        RuntimeLogVerbosity::Medium,
+                        format!(
+                            "[observer] get_transaction failed for liquidation {}: {}",
+                            entry.signature, e
+                        ),
+                    );
                     (
+                        "N/A".to_string(),
                         parsed.liquidated_user,
                         parsed.liquidator,
                         0u64,
@@ -352,7 +387,64 @@ impl<R: StreamingRpcClient + RpcClient, L: LiquidationLogger, O: PriceOracle>
             let withdrawn_usd = withdraw_amount * withdraw_price;
             let profit_usd = withdrawn_usd - repaid_usd;
 
-            log_stdout(format!(
+            if let (Protocol::Kamino, Some(policy)) = (&self.protocol, &self.kamino_tip_policy) {
+                if obligation_pda != "N/A" {
+                    if let Some(resolution) =
+                        policy.note_liquidation_result(&obligation_pda, &liquidator, entry.received_at_ms)
+                    {
+                        let state = policy.state_snapshot();
+                        let outcome_label = match resolution.outcome {
+                            KaminoAdaptiveTipOutcome::Win => "win",
+                            KaminoAdaptiveTipOutcome::Loss => "loss",
+                        };
+                        log_stdout_at(
+                            RuntimeLogVerbosity::Low,
+                            format!(
+                                "[observer] adaptive Kamino tip feedback | obligation={} outcome={} next_tip={} mode={:?} bundle_status={:?} expected_liquidator={} actual_liquidator={} attempted_tip={}",
+                                obligation_pda,
+                                outcome_label,
+                                state.current_tip_lamports,
+                                state.mode,
+                                resolution.bundle_status,
+                                resolution.expected_liquidator,
+                                resolution.actual_liquidator,
+                                resolution.attempted_tip_lamports,
+                            ),
+                        );
+                        self.trace_logger.log(
+                            HunterTraceEvent::new(
+                                "kamino",
+                                match resolution.outcome {
+                                    KaminoAdaptiveTipOutcome::Win => "bundle_observed_win",
+                                    KaminoAdaptiveTipOutcome::Loss => "bundle_observed_loss",
+                                },
+                                resolution
+                                    .signal_signature
+                                    .clone()
+                                    .unwrap_or_else(|| entry.signature.clone()),
+                            )
+                            .with_obligation(resolution.obligation.clone())
+                            .with_repay_mint(parsed.repay_mint.clone())
+                            .with_repay_symbol(parsed.repay_symbol.clone())
+                            .with_optional_bundle_id(resolution.bundle_id.clone())
+                            .with_reason(match resolution.outcome {
+                                KaminoAdaptiveTipOutcome::Win => "first_shot_won",
+                                KaminoAdaptiveTipOutcome::Loss => "first_shot_lost",
+                            })
+                            .with_detail(format!(
+                                "source={} attempted_tip={} bundle_status={:?} expected_liquidator={} actual_liquidator={}",
+                                resolution.source,
+                                resolution.attempted_tip_lamports,
+                                resolution.bundle_status,
+                                resolution.expected_liquidator,
+                                resolution.actual_liquidator
+                            )),
+                        );
+                    }
+                }
+            }
+
+            log_stdout_at(RuntimeLogVerbosity::Low, format!(
                 "[observer] liquidation | sig={} market={} borrower={} liquidator={} \
                  repay={} {} (native={}, ${:.2}) withdraw={} {} (native={}, ${:.2}) profit=${:.2} delay={}ms",
                 entry.signature,
@@ -649,7 +741,7 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
 
     let repay_amount = native_to_human(repay_native, &repay_mint).unwrap_or_else(|| {
         if repay_native > 0 {
-            log_stdout(format!(
+            log_stdout_at(RuntimeLogVerbosity::High, format!(
                 "[parser] repay_mint='{}' not in catalogue — decimals unknown",
                 repay_mint
             ));
@@ -659,7 +751,7 @@ fn parse_liquidation_logs(logs: &[String]) -> ParsedLiquidation {
 
     let withdraw_amount = native_to_human(withdraw_native, &withdraw_mint).unwrap_or_else(|| {
         if withdraw_native > 0 {
-            log_stdout(format!(
+            log_stdout_at(RuntimeLogVerbosity::High, format!(
                 "[parser] withdraw_mint='{}' not in catalogue — decimals unknown",
                 withdraw_mint
             ));
@@ -756,6 +848,21 @@ mod tests {
         async fn get_program_accounts(
             &self,
             _program_id: &str,
+        ) -> anyhow::Result<Vec<crate::ports::rpc::ProgramAccount>> {
+            Ok(vec![])
+        }
+        async fn get_program_accounts_with_memcmp(
+            &self,
+            _program_id: &str,
+            _offset: usize,
+            _bytes_base58: &str,
+        ) -> anyhow::Result<Vec<crate::ports::rpc::ProgramAccount>> {
+            Ok(vec![])
+        }
+        async fn get_program_accounts_with_memcmp_filters(
+            &self,
+            _program_id: &str,
+            _filters: &[(usize, String)],
         ) -> anyhow::Result<Vec<crate::ports::rpc::ProgramAccount>> {
             Ok(vec![])
         }

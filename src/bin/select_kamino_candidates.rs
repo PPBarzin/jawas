@@ -38,7 +38,8 @@ struct FilteredCandidate {
     matched_wallet_symbols: Vec<String>,
     all_borrows_covered: bool,
     onchain_exists: Option<bool>,
-    onchain_liquidatable: Option<bool>,
+    onchain_snapshot_liquidatable: Option<bool>,
+    onchain_lending_market: Option<String>,
     onchain_error: Option<String>,
 }
 
@@ -133,8 +134,8 @@ Options:
   --borrow-symbol <SYMBOL>    keep only candidates borrowing this symbol
   --single-borrow-only        keep only obligations with a single borrow token
   --all-borrows-covered       keep only obligations where every borrow token is covered
-  --check-rpc                 annotate candidates with on-chain existence/liquidatable state
-  --liquidatable-only         keep only candidates that still decode as liquidatable on-chain
+  --check-rpc                 annotate candidates with on-chain existence and raw snapshot state
+  --liquidatable-only         keep only candidates whose raw obligation snapshot is liquidatable on-chain
   --found-only                keep only candidates whose account is found by RPC"
     );
 }
@@ -307,7 +308,8 @@ fn filter_candidates(cli: &Cli, candidates: Vec<Candidate>) -> Result<Vec<Filter
                 matched_wallet_symbols: matched,
                 all_borrows_covered,
                 onchain_exists: None,
-                onchain_liquidatable: None,
+                onchain_snapshot_liquidatable: None,
+                onchain_lending_market: None,
                 onchain_error: None,
             })
         })
@@ -380,10 +382,12 @@ fn annotate_onchain(cli: &Cli, filtered: Vec<FilteredCandidate>) -> Result<Vec<F
         match rpc.get_account(&pubkey) {
             Ok(account) => match decode_anchor_account::<Obligation>(&account.data) {
                 Ok(obligation) => {
-                    let liquidatable = obligation.is_liquidatable();
+                    let snapshot_liquidatable = obligation.is_liquidatable();
                     entry.onchain_exists = Some(true);
-                    entry.onchain_liquidatable = Some(liquidatable);
-                    if (!cli.liquidatable_only || liquidatable) && (!cli.found_only || true) {
+                    entry.onchain_snapshot_liquidatable = Some(snapshot_liquidatable);
+                    entry.onchain_lending_market =
+                        Some(Pubkey::new_from_array(obligation.lending_market).to_string());
+                    if (!cli.liquidatable_only || snapshot_liquidatable) && (!cli.found_only || true) {
                         annotated.push(entry);
                     }
                 }
@@ -481,9 +485,12 @@ fn main() -> Result<()> {
                 candidate.onchain_exists.unwrap_or(false)
             );
             println!(
-                "  onchain_liquidatable: {}",
-                candidate.onchain_liquidatable.unwrap_or(false)
+                "  onchain_snapshot_liquidatable: {}",
+                candidate.onchain_snapshot_liquidatable.unwrap_or(false)
             );
+            if let Some(market) = &candidate.onchain_lending_market {
+                println!("  onchain_lending_market: {market}");
+            }
             if let Some(error) = &candidate.onchain_error {
                 println!("  onchain_error     : {error}");
             }

@@ -1,5 +1,6 @@
 use crate::application::heartbeat::HeartbeatService;
 use crate::application::hunter::{HunterService, DEFAULT_KAMINO_REPLAY_SIGNATURE};
+use crate::application::kamino_tip::KaminoAdaptiveTipPolicy;
 use crate::application::observer::ObserverService;
 use crate::config::wallet::{load_wallet_tokens, WalletToken};
 use crate::config::AppConfig;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
+    let kamino_tip_policy = KaminoAdaptiveTipPolicy::from_env();
 
     log_info("app", "booting Jawas research runtime");
 
@@ -33,6 +35,15 @@ pub async fn run() -> anyhow::Result<()> {
     let hunter_signal_secondary_rpc = config.hunter.signal_secondary.as_ref().map(|rpc| {
         HeliusAdapter::with_tx_commitment(&rpc.rpc_url, &rpc.ws_url, &rpc.tx_commitment)
     });
+    let hermes_shortlist_rpc = std::env::var("HERMES_SHORTLIST_RPC_URL")
+        .ok()
+        .map(|rpc_url| {
+            HeliusAdapter::with_tx_commitment(
+                &rpc_url,
+                &config.hunter.ws_url,
+                &config.hunter.tx_commitment,
+            )
+        });
 
     let (logger, logger_worker) = AirtableLoggerAdapter::new(
         config.airtable.token.clone(),
@@ -48,14 +59,22 @@ pub async fn run() -> anyhow::Result<()> {
         &config,
         hunter_rpc.clone(),
         hunter_signal_secondary_rpc.clone(),
+        hermes_shortlist_rpc.clone(),
         logger.clone(),
         jito,
+        kamino_tip_policy.clone(),
     )?;
 
     if config.runtime.enable_hunter {
         log_rpc_healthcheck("hunter RPC", &hunter_rpc).await;
         if let Some(rpc) = hunter_signal_secondary_rpc.as_ref() {
             log_rpc_healthcheck("hunter signal secondary RPC", rpc).await;
+        }
+        if protocol == Protocol::Kamino && !config.runtime.enable_observer {
+            log_error(
+                "observer",
+                "Kamino adaptive tip feedback is enabled but ENABLE_OBSERVER=false; the tip state will not learn from landed liquidations until the observer is re-enabled.",
+            );
         }
     }
     if config.runtime.enable_observer {
@@ -83,7 +102,13 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     if config.runtime.enable_observer {
-        spawn_observer(protocol, observer_rpc, logger.clone(), oracle);
+        spawn_observer(
+            protocol,
+            observer_rpc,
+            logger.clone(),
+            oracle,
+            kamino_tip_policy,
+        );
     } else {
         log_info("observer", "disabled via configuration");
     }
@@ -101,8 +126,10 @@ fn build_hunter_service(
     config: &AppConfig,
     hunter_rpc: HeliusAdapter,
     hunter_signal_secondary_rpc: Option<HeliusAdapter>,
+    hermes_shortlist_rpc: Option<HeliusAdapter>,
     logger: AirtableLoggerAdapter,
     jito: JitoAdapter,
+    kamino_tip_policy: KaminoAdaptiveTipPolicy,
 ) -> anyhow::Result<Option<JawasHunter>> {
     if !config.runtime.enable_hunter {
         return Ok(None);
@@ -137,10 +164,12 @@ fn build_hunter_service(
     Ok(Some(HunterService::new(
         hunter_rpc,
         hunter_signal_secondary_rpc,
+        hermes_shortlist_rpc,
         jito,
         logger,
         keypair,
         config.hunter.max_repay_usd,
+        kamino_tip_policy,
     )))
 }
 
@@ -257,6 +286,7 @@ fn spawn_observer(
     rpc: HeliusAdapter,
     logger: AirtableLoggerAdapter,
     oracle: SimplePriceOracle,
+    kamino_tip_policy: KaminoAdaptiveTipPolicy,
 ) {
     tokio::spawn(async move {
         loop {
@@ -268,8 +298,17 @@ fn spawn_observer(
                 Some("running"),
                 None,
             );
-            let service =
-                ObserverService::new(rpc.clone(), logger.clone(), oracle.clone(), protocol);
+            let service = if protocol == Protocol::Kamino {
+                ObserverService::with_kamino_tip_policy(
+                    rpc.clone(),
+                    logger.clone(),
+                    oracle.clone(),
+                    protocol,
+                    kamino_tip_policy.clone(),
+                )
+            } else {
+                ObserverService::new(rpc.clone(), logger.clone(), oracle.clone(), protocol)
+            };
             if let Err(error) = service.watch().await {
                 log_error(
                     "observer",

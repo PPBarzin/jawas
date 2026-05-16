@@ -5,7 +5,7 @@ services:
     environment:
       - TARGET_PROTOCOL=KAMINO
       - ENABLE_HUNTER=true
-      - ENABLE_OBSERVER=false
+      - ENABLE_OBSERVER=true
       - LOG_FILE=kamino_raw.jsonl
       - SOLANA_KEYPAIR_PATH=secrets/keypair.json
       - WALLET_TOML_PATH=wallet.toml
@@ -15,32 +15,12 @@ services:
     volumes:
       - ./secrets:/app/secrets:ro
       - ./wallet.toml:/app/wallet.toml:ro
+      - ./hunter_trace.jsonl:/app/hunter_trace.jsonl
+      - ./hunter_signal_metrics.jsonl:/app/hunter_signal_metrics.jsonl
+      - ./.jawas:/app/.jawas
     restart: always
     deploy:
       resources:
         limits:
           cpus: "0.5"
-          memory: 256M
-
-  jawas-solend:
-    build: .
-    container_name: jawas-solend
-    environment:
-      - TARGET_PROTOCOL=SOLEND
-      - ENABLE_HUNTER=false
-      - ENABLE_OBSERVER=false
-      - LOG_FILE=solend_raw.jsonl
-      - SOLANA_KEYPAIR_PATH=secrets/keypair.json
-      - WALLET_TOML_PATH=wallet.toml
-      - HUNTER_REPLAY=false
-    env_file:
-      - .env
-    volumes:
-      - ./secrets:/app/secrets:ro
-      - ./wallet.toml:/app/wallet.toml:ro
-    restart: always
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
+          memory: 1G

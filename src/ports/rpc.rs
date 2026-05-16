@@ -92,6 +92,19 @@ pub trait RpcClient: Send + Sync {
         &self,
         program_id: &str,
     ) -> impl std::future::Future<Output = Result<Vec<ProgramAccount>>> + Send;
+    /// Returns program accounts filtered by a base58 memcmp predicate.
+    fn get_program_accounts_with_memcmp(
+        &self,
+        program_id: &str,
+        offset: usize,
+        bytes_base58: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<ProgramAccount>>> + Send;
+    /// Returns program accounts filtered by multiple base58 memcmp predicates.
+    fn get_program_accounts_with_memcmp_filters(
+        &self,
+        program_id: &str,
+        filters: &[(usize, String)],
+    ) -> impl std::future::Future<Output = Result<Vec<ProgramAccount>>> + Send;
 }
 
 /// Port for real-time streaming of Solana logs.

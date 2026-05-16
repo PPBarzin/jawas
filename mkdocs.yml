@@ -1,0 +1,99 @@
+site_name: Jawas
+site_description: Recherche sur les bots de liquidation réactifs sur Solana — pourquoi ils arrivent structurellement trop tard.
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: fr
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Passer en mode sombre
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Passer en mode clair
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+
+use_directory_urls: false
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+
+nav:
+  - Accueil: index.md
+  - Concepts:
+    - RPC & WebSocket: specifications/rpc_wss_helius_quicknode_explained.md
+    - Jito — Bundles: specifications/jito_explained_for_jawas.md
+    - Hermes — Price feeds: specifications/hermes_explained_for_jawas.md
+    - Usage RPC dans Jawas: specifications/jawas_rpc_wss_usage_guide.md
+  - Architecture:
+    - Vue d'ensemble: architecture.md
+    - Runtime de production: specifications/jawas_production_runtime.md
+    - Flux Hunter: images/hunter-flow.md
+    - Flux Observer: images/observer-flow.md
+  - Spécifications:
+    - Index: specifications/index.md
+    - Bot de liquidation: specifications/liquidation_bot_spec.md
+    - Phase 2 — Workflow: specifications/phase2_liquidation_workflow.md
+    - P1 — Shortlist proactive: specifications/p1_proactive_shortlist_hybrid_spec.md
+    - Hermes v1 — Firing: specifications/hermes_hybrid_firing_v1.md
+    - Hermes — State machine de tir: specifications/hermes_firing_state_machine.md
+    - Jito — Décongestion: specifications/jito_decongestion_runtime_spec.md
+  - Opérations:
+    - Leçons apprises: lessons-learned/index.md
+    - Config vs Secrets: lessons-learned/config-vs-secrets.md
+    - Nommage des variables: lessons-learned/variable-naming.md
+    - Rôles des agents IA: lessons-learned/multi-agent-roles-and-models.md
+  - Recherche:
+    - Notes de recherche: research-notes.md
+    - Analyse expert — Retard: specifications/analyse-de-retard-expert1.md
+  - Analyse:
+    - Index: analysis/index.md
+    - "2026-05-03 — Hunter funnel": analysis/2026-05-03-hunter-analysis.md
+    - "2026-05-06/07 — Diagnostic": analysis/2026-05-06_07-diagnostic.md
+    - "2026-05-06/07 — Latence cycle": analysis/2026-05-06_07-bot-cycle-latency.md
+    - "2026-05-08 — Helius investigation": analysis/2026-05-08-helius-obligation-investigation.md
+    - "2026-05-08 — Refresh gap Kamino": analysis/2026-05-08-kamino-liquidatable-after-refresh-gap.md
+    - "2026-05-08 — Probe liquidation": analysis/2026-05-08-kamino-liquidation-probe.md
+    - "2026-05-08 — Last mile": analysis/2026-05-08-kamino-prod-last-mile.md
+    - "2026-05-11 — Hunter analysis": analysis/2026-05-11-hunter-analysis.md
+    - "2026-05-11 — Hermes fast lane": analysis/2026-05-11-hermes-v1-passive-fast-lane.md
+    - "2026-05-11 — Night watcher": analysis/2026-05-11-kamino-night-watcher-observation.md
+    - "2026-05-12 — Hunter analysis": analysis/2026-05-12-hunter-analysis.md
+    - "2026-05-13 — Liquidation": analysis/2026-05-13-07-liquidation.md
+    - Cas Kamino — Firing:
+      - Index: analysis/kamino-firing/README.md
+      - "2026-04-22T23:25 — 4JxUtqhP": analysis/kamino-firing/2026-04-22T23-25-27Z-4JxUtqhP.md
+      - "2026-04-23T00:11 — 24Sfd1TQ": analysis/kamino-firing/2026-04-23T00-11-08Z-24Sfd1TQ.md
+      - "2026-04-23T00:11 — 5tYDieYJ": analysis/kamino-firing/2026-04-23T00-11-09Z-5tYDieYJ.md

@@ -9,7 +9,7 @@ use crate::ports::rpc::{
     LogEntry, ProgramAccount, RpcClient, RpcCommitment, SignatureStatusInfo, StreamingRpcClient,
     TransactionInfo,
 };
-use crate::utils::log_stderr;
+use crate::utils::{log_stderr, log_stderr_at, log_stdout_at, RuntimeLogVerbosity};
 use bs58;
 
 #[derive(Clone)]
@@ -136,6 +136,77 @@ fn endpoint_host_label(raw: &str) -> String {
         .to_string()
 }
 
+impl HeliusAdapter {
+    async fn get_program_accounts_with_optional_filters(
+        &self,
+        program_id: &str,
+        filters: Option<serde_json::Value>,
+    ) -> Result<Vec<ProgramAccount>> {
+        let mut config = json!({"encoding": "base64"});
+        if let Some(filters) = filters {
+            config["filters"] = filters;
+        }
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [program_id, config]
+        });
+
+        let resp = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| {
+                format!("getProgramAccounts HTTP request failed ({})", self.rpc_url)
+            })?;
+
+        let body: serde_json::Value = resp.json().await.with_context(|| {
+            format!(
+                "getProgramAccounts response parse failed ({})",
+                self.rpc_url
+            )
+        })?;
+
+        let accounts = body["result"]
+            .as_array()
+            .or_else(|| body["result"]["value"].as_array())
+            .with_context(|| {
+                let rpc_error = body
+                    .get("error")
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    "getProgramAccounts: missing result array (rpc_error={rpc_error}, body={body})"
+                )
+            })?;
+
+        let mut out = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let Some(pubkey) = account["pubkey"].as_str() else {
+                continue;
+            };
+            let data_arr = account["account"]["data"]
+                .as_array()
+                .context("getProgramAccounts: missing data array")?;
+            let b64 = data_arr
+                .first()
+                .and_then(|v| v.as_str())
+                .context("getProgramAccounts: missing base64 data")?;
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                .context("getProgramAccounts: base64 decode failed")?;
+            out.push(ProgramAccount {
+                pubkey: pubkey.to_string(),
+                data: bytes,
+            });
+        }
+
+        Ok(out)
+    }
+}
+
 impl RpcClient for HeliusAdapter {
     async fn get_version(&self) -> Result<String> {
         let payload = json!({
@@ -246,55 +317,43 @@ impl RpcClient for HeliusAdapter {
     }
 
     async fn get_program_accounts(&self, program_id: &str) -> Result<Vec<ProgramAccount>> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getProgramAccounts",
-            "params": [program_id, {"encoding": "base64"}]
-        });
-
-        let resp = self
-            .http_client
-            .post(&self.rpc_url)
-            .json(&payload)
-            .send()
+        self.get_program_accounts_with_optional_filters(program_id, None)
             .await
-            .with_context(|| {
-                format!("getProgramAccounts HTTP request failed ({})", self.rpc_url)
-            })?;
+    }
 
-        let body: serde_json::Value = resp.json().await.with_context(|| {
-            format!(
-                "getProgramAccounts response parse failed ({})",
-                self.rpc_url
-            )
-        })?;
+    async fn get_program_accounts_with_memcmp(
+        &self,
+        program_id: &str,
+        offset: usize,
+        bytes_base58: &str,
+    ) -> Result<Vec<ProgramAccount>> {
+        self.get_program_accounts_with_memcmp_filters(
+            program_id,
+            &[(offset, bytes_base58.to_string())],
+        )
+        .await
+    }
 
-        let accounts = body["result"]
-            .as_array()
-            .context("getProgramAccounts: missing result array")?;
-
-        let mut out = Vec::with_capacity(accounts.len());
-        for account in accounts {
-            let Some(pubkey) = account["pubkey"].as_str() else {
-                continue;
-            };
-            let data_arr = account["account"]["data"]
-                .as_array()
-                .context("getProgramAccounts: missing data array")?;
-            let b64 = data_arr
-                .first()
-                .and_then(|v| v.as_str())
-                .context("getProgramAccounts: missing base64 data")?;
-            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                .context("getProgramAccounts: base64 decode failed")?;
-            out.push(ProgramAccount {
-                pubkey: pubkey.to_string(),
-                data: bytes,
-            });
-        }
-
-        Ok(out)
+    async fn get_program_accounts_with_memcmp_filters(
+        &self,
+        program_id: &str,
+        memcmp_filters: &[(usize, String)],
+    ) -> Result<Vec<ProgramAccount>> {
+        let filters = serde_json::Value::Array(
+            memcmp_filters
+                .iter()
+                .map(|(offset, bytes_base58)| {
+                    json!({
+                        "memcmp": {
+                            "offset": offset,
+                            "bytes": bytes_base58
+                        }
+                    })
+                })
+                .collect(),
+        );
+        self.get_program_accounts_with_optional_filters(program_id, Some(filters))
+            .await
     }
 
     async fn get_signature_status(&self, signature: &str) -> Result<Option<SignatureStatusInfo>> {
@@ -491,10 +550,16 @@ impl StreamingRpcClient for HeliusAdapter {
                 let mut backoff_secs: u64 = 1;
 
                 loop {
-                    log_stderr(format!("[rpc-ws {ws_label}] connecting..."));
+                    log_stdout_at(
+                        RuntimeLogVerbosity::Medium,
+                        format!("[rpc-ws {ws_label}] connecting..."),
+                    );
                     match connect_async(&ws_url).await {
                         Ok((mut ws_stream, _)) => {
-                            log_stderr(format!("[rpc-ws {ws_label}] connected."));
+                            log_stdout_at(
+                                RuntimeLogVerbosity::Medium,
+                                format!("[rpc-ws {ws_label}] connected."),
+                            );
                             backoff_secs = 1; // reset backoff on successful connection
 
                             let subscribe_msg = json!({
@@ -542,7 +607,7 @@ impl StreamingRpcClient for HeliusAdapter {
                                                     if let Some(subscription_id) =
                                                         value.get("result")
                                                     {
-                                                        log_stderr(format!(
+                                                        log_stdout_at(RuntimeLogVerbosity::Medium, format!(
                                                         "[rpc-ws {ws_label}] subscribed successfully: subscription_id={}",
                                                         subscription_id
                                                     ));
@@ -550,7 +615,7 @@ impl StreamingRpcClient for HeliusAdapter {
                                                         continue;
                                                     }
 
-                                                    log_stderr(format!(
+                                                    log_stderr_at(RuntimeLogVerbosity::Medium, format!(
                                                     "[rpc-ws {ws_label}] subscribe response missing result/error: {}",
                                                     value
                                                 ));
@@ -588,19 +653,19 @@ impl StreamingRpcClient for HeliusAdapter {
                                                         return;
                                                     }
                                                 } else if !subscribed {
-                                                    log_stderr(format!(
+                                                    log_stderr_at(RuntimeLogVerbosity::High, format!(
                                                     "[rpc-ws {ws_label}] unexpected pre-subscription message: {}",
                                                     value
                                                 ));
                                                 } else if let Some(method) =
                                                     value.get("method").and_then(|m| m.as_str())
                                                 {
-                                                    log_stderr(format!(
+                                                    log_stderr_at(RuntimeLogVerbosity::High, format!(
                                                     "[rpc-ws {ws_label}] ignoring WS message method={method}"
                                                 ));
                                                 }
                                             } else {
-                                                log_stderr(format!(
+                                                log_stderr_at(RuntimeLogVerbosity::Medium, format!(
                                                 "[rpc-ws {ws_label}] failed to parse WS text message: {}",
                                                 text
                                             ));
@@ -615,7 +680,7 @@ impl StreamingRpcClient for HeliusAdapter {
                                 }
                             }
 
-                            log_stderr(format!(
+                            log_stdout_at(RuntimeLogVerbosity::Low, format!(
                             "[rpc-ws {ws_label}] stream ended. Reconnecting in {backoff_secs}s..."
                         ));
                         }

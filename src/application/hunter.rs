@@ -1,8 +1,8 @@
 use crate::application::hermes_shortlist::{
     decode_kamino_obligation, spawn_price_feed_signal_source, HermesExecutionMode,
-    HermesRuntimeConfig,
-    HermesShortlistRuntime,
+    HermesRuntimeConfig, HermesShortlistRuntime,
 };
+use crate::application::kamino_tip::{KaminoAdaptiveTipPolicy, KaminoBundleMonitorUpdate};
 use crate::application::kamino_shortlist::{
     enforce_candidate_history_limit, select_shortlist, KaminoShortlistRefreshRequest,
     KaminoShortlistRuntime, PreparedExecutionContext, ShortlistCandidate, ShortlistEntry,
@@ -24,7 +24,9 @@ use crate::domain::protocol::{KAMINO_PROGRAM_ID, SOLEND_PROGRAM_ID};
 use crate::ports::jito::JitoPort;
 use crate::ports::logger::{LiquidationLogger, ObservationEvent};
 use crate::ports::rpc::{RpcClient, SignatureStatusInfo, StreamingRpcClient};
-use crate::utils::log_stderr;
+use crate::utils::{
+    log_stderr, log_stdout, log_stdout_at, RuntimeLogVerbosity,
+};
 use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::DashMap;
 use serde::Serialize;
@@ -38,11 +40,12 @@ use solana_sdk::sysvar;
 use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinHandle;
 
 const FARMS_PROGRAM: &str = "FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr";
 
@@ -63,8 +66,41 @@ const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
     "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
 ];
 
-/// Tip is refreshed every 60s.
+/// Solend still uses provider tip refresh while Kamino is driven by adaptive first-shot policy.
 const TIP_REFRESH_SECS: u64 = 60;
+const DEFAULT_KAMINO_LENDING_MARKET: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
+const DEFAULT_KAMINO_MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
+
+struct TaskAbortGuard {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl TaskAbortGuard {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    fn extend<I>(&mut self, handles: I)
+    where
+        I: IntoIterator<Item = JoinHandle<()>>,
+    {
+        self.handles.extend(handles);
+    }
+}
+
+impl Drop for TaskAbortGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
 
 pub(crate) fn hunter_dry_run_enabled() -> bool {
     std::env::var("HUNTER_DRY_RUN")
@@ -84,8 +120,12 @@ pub(crate) fn jito_send_max_attempts() -> usize {
         .unwrap_or(2)
 }
 
-fn hunter_verbose_log(enabled: bool, protocol: &str, message: impl AsRef<str>) {
-    if enabled {
+fn hunter_verbose_log(
+    verbosity: RuntimeLogVerbosity,
+    protocol: &str,
+    message: impl AsRef<str>,
+) {
+    if verbosity >= RuntimeLogVerbosity::High {
         log_stderr(format!("[hunter-{protocol}] {}", message.as_ref()));
     }
 }
@@ -448,6 +488,35 @@ impl HunterTraceLogger {
     }
 }
 
+fn log_kamino_bundle_monitor_update(
+    trace_logger: &HunterTraceLogger,
+    update: KaminoBundleMonitorUpdate,
+) {
+    trace_logger.log(
+        HunterTraceEvent::new("kamino", update.stage, update.signal_signature.clone())
+            .with_obligation(update.obligation.clone())
+            .with_detail(format!(
+                "source={} tip={} liquidator={} {}",
+                update.source, update.tip_lamports, update.liquidator, update.detail
+            ))
+            .with_reason(update.reason)
+            .with_optional_bundle_id(Some(update.bundle_id.clone())),
+    );
+    log_stdout_at(
+        RuntimeLogVerbosity::Low,
+        format!(
+            "[hunter-kamino] {} | source={} obligation={} bundle={} tip={} liquidator={} {}",
+            update.stage,
+            update.source,
+            &update.obligation[..8.min(update.obligation.len())],
+            &update.bundle_id[..12.min(update.bundle_id.len())],
+            update.tip_lamports,
+            update.liquidator,
+            update.detail
+        ),
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HunterSignalSource {
@@ -801,30 +870,36 @@ fn build_wallet_token_index(
 pub struct HunterService<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone> {
     hunter_rpc: R,
     signal_secondary_rpc: Option<R>,
+    hermes_shortlist_rpc: Option<R>,
     jito: JI,
     logger: L,
     keypair: Arc<Keypair>,
     max_repay_usd: f64,
     trace_logger: HunterTraceLogger,
+    kamino_tip_policy: KaminoAdaptiveTipPolicy,
 }
 
 impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterService<R, JI, L> {
     pub fn new(
         hunter_rpc: R,
         signal_secondary_rpc: Option<R>,
+        hermes_shortlist_rpc: Option<R>,
         jito: JI,
         logger: L,
         keypair: Arc<Keypair>,
         max_repay_usd: f64,
+        kamino_tip_policy: KaminoAdaptiveTipPolicy,
     ) -> Self {
         Self {
             hunter_rpc,
             signal_secondary_rpc,
+            hermes_shortlist_rpc,
             jito,
             logger,
             keypair,
             max_repay_usd,
             trace_logger: HunterTraceLogger::from_env(),
+            kamino_tip_policy,
         }
     }
 
@@ -848,7 +923,10 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
     {
         let runtime = HunterRuntimeConfig::from_env("KAMINO");
         let hermes_config = HermesRuntimeConfig::from_env();
-        log_stderr("[hunter-kamino] runtime config reloaded from env at loop start".to_string());
+        log_stdout_at(
+            RuntimeLogVerbosity::Low,
+            "[hunter-kamino] runtime config reloaded from env at loop start".to_string(),
+        );
         let wallet_index = Arc::new(build_wallet_token_index(
             &self.keypair.pubkey(),
             &wallet_tokens,
@@ -860,7 +938,9 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
         let (shortlist_refresh_tx, mut shortlist_refresh_rx) =
             mpsc::channel::<KaminoShortlistRefreshRequest>(64);
 
-        log_stderr(format!(
+        let first_shot_tip = self.kamino_tip_policy.current_tip_lamports();
+        let tip_state = self.kamino_tip_policy.state_snapshot();
+        log_stdout_at(RuntimeLogVerbosity::Low, format!(
             "[hunter-kamino] Starting autonomous hunter. Wallet: {} | max_repay: ${:.0} | signal_commitment={:?} | tx_fetch={:?} | shortlist_enabled={} | shortlist_max={} | shortlist_refresh_secs={} | shortlist_refresh_debounce_ms={} | hermes_shortlist_size={} | hermes_refresh_secs={} | hermes_execution_mode={} | hermes_fire_enabled={} | jito_min_send_interval_ms={} | jito_send_wait_budget_ms={} | tokens: {}",
             self.keypair.pubkey(),
             self.max_repay_usd,
@@ -878,6 +958,16 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             runtime.jito_send_gate.wait_budget_ms,
             wallet_tokens.iter().map(|t| t.symbol.as_str()).collect::<Vec<_>>().join(", ")
         ));
+        log_stdout_at(
+            RuntimeLogVerbosity::Low,
+            format!(
+                "[hunter-kamino] adaptive first-shot tip | current_tip={} mode={:?} last_win={:?} last_loss={:?}",
+                first_shot_tip,
+                tip_state.mode,
+                tip_state.last_winning_tip_lamports,
+                tip_state.last_losing_tip_lamports
+            ),
+        );
 
         // ── Hot cache: blockhash ─────────────────────────────────────────────
         let initial_blockhash = self
@@ -890,11 +980,12 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             .unwrap_or_else(|_| "3".to_string())
             .parse::<u64>()
             .unwrap_or(3);
+        let mut task_guard = TaskAbortGuard::new();
 
         {
             let rpc = self.hunter_rpc.clone();
             let bh = cached_blockhash.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(blockhash_refresh_secs))
                         .await;
@@ -908,27 +999,95 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     }
                 }
             });
+            task_guard.push(handle);
         }
 
-        // ── Hot cache: Jito tip ──────────────────────────────────────────────
-        let initial_tip = self.jito.get_tip_recommendation().await.unwrap_or(100_000);
-        let cached_tip = Arc::new(std::sync::atomic::AtomicU64::new(initial_tip));
         {
             let jito = self.jito.clone();
-            let tip = cached_tip.clone();
-            tokio::spawn(async move {
+            let kamino_tip_policy = self.kamino_tip_policy.clone();
+            let trace_logger = self.trace_logger.clone();
+            let hermes_runtime = hermes_runtime.clone();
+            let hermes_config = hermes_config.clone();
+            let handle = tokio::spawn(async move {
+                let poll_ms = kamino_tip_policy.bundle_monitor_poll_ms();
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(TIP_REFRESH_SECS)).await;
-                    if let Ok(t) = jito.get_tip_recommendation().await {
-                        tip.store(t, Ordering::Relaxed);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+                    let observed_at_ms = now_ms();
+
+                    for update in kamino_tip_policy.drain_bundle_timeouts(observed_at_ms) {
+                        log_kamino_bundle_monitor_update(&trace_logger, update);
+                    }
+
+                    let bundle_ids = kamino_tip_policy.pending_bundle_ids(observed_at_ms);
+                    if bundle_ids.is_empty() {
+                        continue;
+                    }
+
+                    match jito.get_inflight_bundle_statuses(bundle_ids.clone()).await {
+                        Ok(statuses) => {
+                            let statuses_by_id = statuses
+                                .into_iter()
+                                .map(|status| (status.bundle_id.clone(), status))
+                                .collect::<HashMap<_, _>>();
+                            for bundle_id in bundle_ids {
+                                if let Some(status) = statuses_by_id.get(&bundle_id) {
+                                    if let Some(update) = kamino_tip_policy
+                                        .note_bundle_status(&bundle_id, status, observed_at_ms)
+                                    {
+                                        if update
+                                            .bundle_status
+                                            .as_deref()
+                                            .is_some_and(|value| value.eq_ignore_ascii_case("invalid"))
+                                        {
+                                            let mut runtime = hermes_runtime.write().await;
+                                            runtime.note_invalid_bundle(
+                                                &update.obligation,
+                                                observed_at_ms,
+                                                &hermes_config,
+                                            );
+                                            if runtime
+                                                .shortlisted_entry(&update.obligation)
+                                                .is_some_and(|entry| {
+                                                    entry.state == ShortlistState::Dropped
+                                                })
+                                            {
+                                                log_stdout_at(
+                                                    RuntimeLogVerbosity::Low,
+                                                    format!(
+                                                        "[hunter-kamino] hermes fireability blocked obligation={} after invalid bundle status={}",
+                                                        &update.obligation[..8.min(update.obligation.len())],
+                                                        update
+                                                            .bundle_status
+                                                            .as_deref()
+                                                            .unwrap_or("unknown")
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        log_kamino_bundle_monitor_update(&trace_logger, update);
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => log_stdout_at(
+                            RuntimeLogVerbosity::Medium,
+                            format!(
+                                "[hunter-kamino] bundle monitor poll failed for {} bundle(s): {}",
+                                bundle_ids.len(),
+                                error
+                            ),
+                        ),
                     }
                 }
             });
+            task_guard.push(handle);
         }
 
         let recent_non_whitelist: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let signal_locks: Arc<DashMap<SignalFingerprint, LockRecord>> = Arc::new(DashMap::new());
+        let fire_gate = Arc::new(Semaphore::new(1));
+        let hermes_fire_block_until_ms = Arc::new(AtomicU64::new(0));
         let signal_metrics = SignalMetricsLogger::from_env();
         let (signal_tx, mut signal_rx) = mpsc::channel::<HunterSignalEvent>(512);
         let hunter_wallet = self.keypair.pubkey().to_string();
@@ -937,7 +1096,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             let locks = signal_locks.clone();
             let metrics = signal_metrics.clone();
             let lock_ms = runtime.signal_lock_ms;
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let sweep_every = std::cmp::max(250, lock_ms / 2);
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_millis(sweep_every)).await;
@@ -946,6 +1105,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     remove_expired_signal_fingerprints(&locks, &metrics, expired, now, lock_ms);
                 }
             });
+            task_guard.push(handle);
         }
 
         let source_config = read_kamino_signal_source_config(self.signal_secondary_rpc.is_some());
@@ -954,7 +1114,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
         let price_feed_enabled = source_config.price_feed_enabled;
 
         if primary_rpc_enabled {
-            spawn_kamino_log_signal_source(
+            task_guard.push(spawn_kamino_log_signal_source(
                 HunterSignalSource::PrimaryRpc,
                 self.hunter_rpc.clone(),
                 runtime,
@@ -962,12 +1122,12 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 self.trace_logger.clone(),
                 self.logger.clone(),
                 hunter_wallet.clone(),
-            );
+            ));
         }
 
         if secondary_rpc_enabled {
             if let Some(secondary_rpc) = self.signal_secondary_rpc.clone() {
-                spawn_kamino_log_signal_source(
+                task_guard.push(spawn_kamino_log_signal_source(
                     HunterSignalSource::SecondaryRpc,
                     secondary_rpc,
                     runtime,
@@ -975,7 +1135,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     self.trace_logger.clone(),
                     self.logger.clone(),
                     hunter_wallet.clone(),
-                );
+                ));
             } else {
                 log_stderr(
                     "[hunter-kamino] secondary RPC signal source enabled but no HUNTER_SIGNAL_SECONDARY_* endpoint configured.",
@@ -984,38 +1144,56 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
         }
 
         if price_feed_enabled {
-            spawn_price_feed_signal_source(
-                self.hunter_rpc.clone(),
-                wallet_tokens.clone(),
-                hermes_runtime.clone(),
-                hermes_config.clone(),
-                {
-                    let signal_tx = signal_tx.clone();
-                    move |signal| {
+            let hermes_rpc_source = std::env::var("HERMES_SHORTLIST_RPC_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|_| "dedicated")
+                .unwrap_or("hunter");
+            log_stdout(format!(
+                "[hunter-kamino] hermes shortlist RPC source={}",
+                hermes_rpc_source
+            ));
+            let hermes_shortlist_rpc = self
+                .hermes_shortlist_rpc
+                .clone()
+                .unwrap_or_else(|| self.hunter_rpc.clone());
+            task_guard.extend(
+                spawn_price_feed_signal_source(
+                    hermes_shortlist_rpc,
+                    wallet_tokens.clone(),
+                    hermes_runtime.clone(),
+                    hermes_config.clone(),
+                    hermes_fire_block_until_ms.clone(),
+                    {
                         let signal_tx = signal_tx.clone();
-                        async move {
-                            signal_tx
-                                .send(HunterSignalEvent {
-                                    source: HunterSignalSource::PriceFeed,
-                                    protocol: "kamino",
-                                    signal_kind: HunterSignalKind::PriceFeedPredictedLiquidable,
-                                    received_at_ms: signal.signal_received_at_ms,
-                                    signature: None,
-                                    obligation_pubkey: signal.obligation_pubkey,
-                                    repay_mint: Some(signal.repay_mint),
-                                    detail: Some(format!(
-                                        "{} repay_symbol={} matched_feeds={}",
-                                        signal.detail, signal.repay_symbol, signal.feed_match_count
-                                    )),
-                                    tx_info: None,
-                                })
-                                .await
-                                .is_ok()
+                        move |signal| {
+                            let signal_tx = signal_tx.clone();
+                            async move {
+                                signal_tx
+                                    .send(HunterSignalEvent {
+                                        source: HunterSignalSource::PriceFeed,
+                                        protocol: "kamino",
+                                        signal_kind: HunterSignalKind::PriceFeedPredictedLiquidable,
+                                        received_at_ms: signal.signal_received_at_ms,
+                                        signature: None,
+                                        obligation_pubkey: signal.obligation_pubkey,
+                                        repay_mint: Some(signal.repay_mint),
+                                        detail: Some(format!(
+                                            "{} repay_symbol={} matched_feeds={}",
+                                            signal.detail,
+                                            signal.repay_symbol,
+                                            signal.feed_match_count
+                                        )),
+                                        tx_info: None,
+                                    })
+                                    .await
+                                    .is_ok()
+                            }
                         }
-                    }
-                },
-            )
-            .await;
+                    },
+                )
+                .await,
+            );
         }
 
         if runtime.shortlist_enabled {
@@ -1024,7 +1202,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             let trace_logger = self.trace_logger.clone();
             let refresh_runtime = runtime;
             let refresh_rpc = self.hunter_rpc.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 while let Some(request) = shortlist_refresh_rx.recv().await {
                     match refresh_kamino_shortlist(
                         &refresh_rpc,
@@ -1083,12 +1261,13 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     }
                 }
             });
+            task_guard.push(handle);
 
             let shortlist_runtime = shortlist_runtime.clone();
             let shortlist_refresh_tx = shortlist_refresh_tx.clone();
             let refresh_secs = runtime.shortlist_refresh_secs;
             let debounce_ms = runtime.shortlist_refresh_debounce_ms;
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(refresh_secs)).await;
                     request_shortlist_refresh(
@@ -1101,6 +1280,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     .await;
                 }
             });
+            task_guard.push(handle);
         }
 
         while let Some(signal) = signal_rx.recv().await {
@@ -1396,7 +1576,6 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             let keypair = self.keypair.clone();
             let jito = self.jito.clone();
             let bh = cached_blockhash.clone();
-            let tip = cached_tip.clone();
             let non_whitelist = recent_non_whitelist.clone();
             let max_repay = self.max_repay_usd;
             let wallet_idx = wallet_index.clone();
@@ -1404,10 +1583,13 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             let trace_logger = self.trace_logger.clone();
             let runtime_cfg = runtime;
             let airtable_logger = self.logger.clone();
+            let kamino_tip_policy = self.kamino_tip_policy.clone();
             let hunter_wallet = hunter_wallet.clone();
             let signal_locks = signal_locks.clone();
             let hermes_runtime = hermes_runtime.clone();
             let hermes_cfg = hermes_config.clone();
+            let fire_gate = fire_gate.clone();
+            let hermes_fire_block_until_ms = hermes_fire_block_until_ms.clone();
             let shortlist_context = shortlist_entry.map(|entry| entry.context);
             let prepared_context = hermes_fast_lane_context
                 .as_ref()
@@ -1425,7 +1607,94 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 HunterSignalSource::PriceFeed => self.hunter_rpc.clone(),
             };
 
+            if signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable {
+                let fire_now_ms = now_ms();
+                let current_block_until = hermes_fire_block_until_ms.load(Ordering::Relaxed);
+                if current_block_until > fire_now_ms {
+                    trace_logger.log(
+                        HunterTraceEvent::new(
+                            "kamino",
+                            "hermes_firing_skipped",
+                            format!("hermes:{}", signal.obligation_pubkey),
+                        )
+                        .with_obligation(signal.obligation_pubkey.clone())
+                        .with_optional_repay_mint(signal.repay_mint.clone())
+                        .with_reason("global_hermes_fire_cooldown")
+                        .with_detail(format!(
+                            "block_until_ms={} now_ms={}",
+                            current_block_until, fire_now_ms
+                        ))
+                        .with_timing(signal.received_at_ms, 0),
+                    );
+                    mark_lock_fired(
+                        &signal_locks,
+                        &fingerprint,
+                        signal.source,
+                        now_ms(),
+                        FireOutcome::Skipped,
+                    );
+                    continue;
+                }
+
+                let next_block_until = fire_now_ms.saturating_add(hermes_cfg.fire_cooldown_ms);
+                if hermes_fire_block_until_ms
+                    .compare_exchange(
+                        current_block_until,
+                        next_block_until,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    trace_logger.log(
+                        HunterTraceEvent::new(
+                            "kamino",
+                            "hermes_firing_skipped",
+                            format!("hermes:{}", signal.obligation_pubkey),
+                        )
+                        .with_obligation(signal.obligation_pubkey.clone())
+                        .with_optional_repay_mint(signal.repay_mint.clone())
+                        .with_reason("global_hermes_fire_cooldown_race")
+                        .with_detail("global execution window changed")
+                        .with_timing(signal.received_at_ms, 0),
+                    );
+                    mark_lock_fired(
+                        &signal_locks,
+                        &fingerprint,
+                        signal.source,
+                        now_ms(),
+                        FireOutcome::Skipped,
+                    );
+                    continue;
+                }
+            }
+
             tokio::spawn(async move {
+                let _fire_permit = match fire_gate.try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        trace_logger.log(
+                            HunterTraceEvent::new(
+                                "kamino",
+                                "hermes_firing_skipped",
+                                format!("hermes:{}", signal.obligation_pubkey),
+                            )
+                            .with_obligation(signal.obligation_pubkey.clone())
+                            .with_optional_repay_mint(signal.repay_mint.clone())
+                            .with_reason("another_fire_in_progress")
+                            .with_detail("global execution gate busy")
+                            .with_timing(signal.received_at_ms, 0),
+                        );
+                        mark_lock_fired(
+                            &signal_locks,
+                            &fingerprint,
+                            signal.source,
+                            now_ms(),
+                            FireOutcome::Skipped,
+                        );
+                        return;
+                    }
+                };
                 mark_lock_firing(&signal_locks, &fingerprint, signal.source, now_ms());
                 if signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable {
                     trace_logger.log(
@@ -1503,8 +1772,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                             .with_reason("hermes_context_stale")
                             .with_detail(format!(
                                 "context_age_ms={} max_context_age_ms={}",
-                                now_ms()
-                                    .saturating_sub(confirmed_context.last_price_signal_at_ms),
+                                now_ms().saturating_sub(confirmed_context.last_price_signal_at_ms),
                                 hermes_cfg.fire_max_context_age_ms
                             ))
                             .with_timing(signal.received_at_ms, 0),
@@ -1556,12 +1824,12 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                     wallet_idx,
                     reserve_cache,
                     bh,
-                    tip,
                     non_whitelist,
                     max_repay,
                     runtime_cfg,
                     trace_logger.clone(),
                     airtable_logger.clone(),
+                    kamino_tip_policy,
                     signal.source,
                     signal.tx_info,
                     Some(signal.obligation_pubkey.clone()),
@@ -1583,11 +1851,17 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 {
                     let mut state = hermes_runtime.write().await;
                     if signal.signal_kind == HunterSignalKind::PriceFeedPredictedLiquidable {
-                        let _ =
-                            state.note_hermes_fire(&signal.obligation_pubkey, now_ms(), &hermes_cfg);
+                        let _ = state.note_hermes_fire(
+                            &signal.obligation_pubkey,
+                            now_ms(),
+                            &hermes_cfg,
+                        );
                     } else {
-                        let _ = state
-                            .note_reactive_hit(&signal.obligation_pubkey, now_ms(), &hermes_cfg);
+                        let _ = state.note_reactive_hit(
+                            &signal.obligation_pubkey,
+                            now_ms(),
+                            &hermes_cfg,
+                        );
                     }
                 }
                 mark_lock_fired(
@@ -1655,9 +1929,6 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 .await
                 .unwrap_or_default(),
         ));
-        let cached_tip = Arc::new(std::sync::atomic::AtomicU64::new(
-            self.jito.get_tip_recommendation().await.unwrap_or(100_000),
-        ));
         let runtime = HunterRuntimeConfig::from_env("KAMINO");
         let non_whitelist: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -1678,12 +1949,12 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
             wallet_index,
             reserve_cache,
             cached_blockhash,
-            cached_tip,
             non_whitelist,
             self.max_repay_usd,
             runtime,
             self.trace_logger.clone(),
             self.logger.clone(),
+            self.kamino_tip_policy.clone(),
             HunterSignalSource::PrimaryRpc,
             None,
             None,
@@ -1715,13 +1986,13 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
         JI: Clone + Send + Sync + 'static,
     {
         let runtime = HunterRuntimeConfig::from_env("SOLEND");
-        log_stderr("[hunter-solend] runtime config reloaded from env at loop start".to_string());
+        log_stdout("[hunter-solend] runtime config reloaded from env at loop start".to_string());
         let wallet_index = Arc::new(build_wallet_token_index(
             &self.keypair.pubkey(),
             &wallet_tokens,
         )?);
 
-        log_stderr(format!(
+        log_stdout(format!(
             "[hunter-solend] Starting autonomous hunter. Wallet: {} | signal_commitment={:?} | tx_fetch={:?} | tokens: {}",
             self.keypair.pubkey(), runtime.signal_commitment, runtime.tx_fetch,
             wallet_tokens.iter().map(|t| t.symbol.as_str()).collect::<Vec<_>>().join(", ")
@@ -1796,7 +2067,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 }
             };
 
-            log_stderr("[hunter-solend] WS subscription task started.");
+            log_stdout("[hunter-solend] WS subscription task started.");
 
             loop {
                 let entry = match tokio::time::timeout(
@@ -1807,11 +2078,11 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 {
                     Ok(Some(e)) => e,
                     Ok(None) => {
-                        log_stderr("[hunter-solend] WS stream ended. Reconnecting...");
+                        log_stdout("[hunter-solend] WS stream ended. Reconnecting...");
                         break;
                     }
                     Err(_) => {
-                        log_stderr(format!(
+                        log_stdout(format!(
                             "[hunter-solend] WS idle timeout: no messages received for {}s. Reconnecting...",
                             runtime.ws_idle_timeout_secs
                         ));
@@ -1843,7 +2114,7 @@ impl<R: RpcClient, JI: JitoPort, L: LiquidationLogger + Clone + 'static> HunterS
                 let err_trace_logger = trace_logger.clone();
 
                 hunter_verbose_log(
-                    runtime.verbose,
+                    runtime.log_verbosity,
                     "solend",
                     format!("candidate | sig={}", sig),
                 );
@@ -2143,6 +2414,20 @@ fn active_kamino_reserve_pubkeys(obligation: &crate::domain::kamino::Obligation)
     reserve_pubkeys
 }
 
+fn kamino_obligation_lending_market(obligation: &crate::domain::kamino::Obligation) -> String {
+    Pubkey::new_from_array(obligation.lending_market).to_string()
+}
+
+fn configured_kamino_lending_market() -> String {
+    std::env::var("KAMINO_LENDING_MARKET")
+        .unwrap_or_else(|_| DEFAULT_KAMINO_LENDING_MARKET.to_string())
+}
+
+fn configured_kamino_market_authority() -> String {
+    std::env::var("KAMINO_MARKET_AUTHORITY")
+        .unwrap_or_else(|_| DEFAULT_KAMINO_MARKET_AUTHORITY.to_string())
+}
+
 async fn refresh_kamino_shortlist<R: RpcClient>(
     rpc: &R,
     runtime: &tokio::sync::RwLock<KaminoShortlistRuntime>,
@@ -2189,7 +2474,22 @@ async fn refresh_kamino_shortlist<R: RpcClient>(
                         || obligation_account.borrowed_assets_market_value_sf == 0
                     {
                         candidate.distance_to_liq = None;
+                        candidate.last_refresh_reason = Some(format!(
+                            "{}:no_debt_or_market_value",
+                            reason
+                        ));
                     } else {
+                        let actual_market = kamino_obligation_lending_market(&obligation_account);
+                        if candidate.context.lending_market != actual_market {
+                            candidate.distance_to_liq = None;
+                            candidate.last_refreshed_at_ms = Some(refreshed_at_ms);
+                            candidate.last_refresh_reason = Some(format!(
+                                "{}:market_mismatch expected={} actual={}",
+                                reason, candidate.context.lending_market, actual_market
+                            ));
+                            refreshed_candidates.insert(obligation, candidate);
+                            continue;
+                        }
                         candidate.context.active_reserve_pubkeys =
                             active_kamino_reserve_pubkeys(&obligation_account);
                         candidate.update_refresh(
@@ -2212,10 +2512,14 @@ async fn refresh_kamino_shortlist<R: RpcClient>(
                     }
                 } else {
                     candidate.distance_to_liq = None;
+                    candidate.last_refresh_reason =
+                        Some(format!("{}:decode_failed", reason));
                 }
             }
             Err(_) => {
                 candidate.distance_to_liq = None;
+                candidate.last_refresh_reason =
+                    Some(format!("{}:account_lookup_failed", reason));
             }
         }
         refreshed_candidates.insert(obligation, candidate);
@@ -2325,7 +2629,8 @@ fn spawn_kamino_log_signal_source<R, L>(
     trace_logger: HunterTraceLogger,
     logger: L,
     hunter_wallet: String,
-) where
+) -> JoinHandle<()>
+where
     R: StreamingRpcClient + RpcClient + Clone + Send + Sync + 'static,
     L: LiquidationLogger + Clone + Send + Sync + 'static,
 {
@@ -2347,7 +2652,7 @@ fn spawn_kamino_log_signal_source<R, L>(
                 }
             };
 
-            log_stderr(format!(
+            log_stdout(format!(
                 "[hunter-kamino] {} signal subscription task started.",
                 source.as_str()
             ));
@@ -2371,7 +2676,7 @@ fn spawn_kamino_log_signal_source<R, L>(
                 let detail = summarize_candidate_logs(&entry.logs);
                 if kamino_logs_indicate_healthy_obligation(&entry.logs) {
                     hunter_verbose_log(
-                        runtime.verbose,
+                        runtime.log_verbosity,
                         "kamino",
                         format!(
                             "skip healthy obligation | source={} sig={} logs={}",
@@ -2397,7 +2702,7 @@ fn spawn_kamino_log_signal_source<R, L>(
                 }
 
                 hunter_verbose_log(
-                    runtime.verbose,
+                    runtime.log_verbosity,
                     "kamino",
                     format!(
                         "candidate | source={} sig={} logs={}",
@@ -2458,7 +2763,7 @@ fn spawn_kamino_log_signal_source<R, L>(
                 }
             }
         }
-    });
+    })
 }
 
 // ── Kamino opportunity execution (free function for tokio::spawn) ────────────
@@ -2479,12 +2784,12 @@ async fn execute_kamino_opportunity<R, JI>(
     wallet_index: Arc<HashMap<String, WalletTokenRuntime>>,
     reserve_cache: Arc<tokio::sync::RwLock<HashMap<String, KaminoReserveMeta>>>,
     cached_blockhash: Arc<tokio::sync::RwLock<solana_sdk::hash::Hash>>,
-    cached_tip: Arc<std::sync::atomic::AtomicU64>,
     non_whitelist: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     max_repay_usd: f64,
     runtime: HunterRuntimeConfig,
     trace_logger: HunterTraceLogger,
     logger: impl LiquidationLogger,
+    kamino_tip_policy: KaminoAdaptiveTipPolicy,
     source: HunterSignalSource,
     preloaded_tx_info: Option<crate::ports::rpc::TransactionInfo>,
     known_obligation: Option<String>,
@@ -2569,15 +2874,16 @@ where
                 ix_accs.len()
             );
         }
-        let resolve = |index: usize| -> anyhow::Result<String> {
-            tx_info
-                .account_keys
-                .get(*ix_accs.get(index).ok_or_else(|| {
-                    anyhow::anyhow!("missing liquidate account index {}", index)
-                })?)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing account key for {}", index))
-        };
+        let resolve =
+            |index: usize| -> anyhow::Result<String> {
+                tx_info
+                    .account_keys
+                    .get(*ix_accs.get(index).ok_or_else(|| {
+                        anyhow::anyhow!("missing liquidate account index {}", index)
+                    })?)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing account key for {}", index))
+            };
 
         (
             known_obligation
@@ -2658,6 +2964,44 @@ where
         Some("none".to_string())
     };
 
+    if let Some(prepared) = prepared_context.as_ref() {
+        let configured_market = configured_kamino_lending_market();
+        let configured_authority = configured_kamino_market_authority();
+        if prepared.lending_market_authority == configured_authority
+            && prepared.lending_market != configured_market
+        {
+            trace_logger.log(
+                HunterTraceEvent::new("kamino", "skip", sig.clone())
+                    .with_obligation(obligation_str.to_string())
+                    .with_repay_mint(repay_mint_str.to_string())
+                    .with_reason("prepared_context_market_unsupported")
+                    .with_detail(format!(
+                        "prepared_market={} configured_market={} static_authority={}",
+                        prepared.lending_market, configured_market, configured_authority
+                    ))
+                    .with_timing(ws_received_at_ms, elapsed_ms_since(ws_received_at_ms))
+                    .with_shortlist_context(
+                        shortlist_hit,
+                        shortlist_state.clone(),
+                        shortlist_age_ms,
+                        Some(prepared_context_used),
+                        None,
+                        refresh_reason.clone(),
+                    )
+                    .with_hermes_context(
+                        hermes_hit,
+                        hermes_state.clone(),
+                        hermes_feed_match_count,
+                        hermes_signal_received_at_ms,
+                        hermes_to_reactive_delta_ms,
+                        prepared_context_source.clone(),
+                        Some(fast_lane_used),
+                    ),
+            );
+            return Ok(KaminoExecutionOutcome::Skipped);
+        }
+    }
+
     // ── 4. Check we hold the repay token ────────────────────────────────────
     let Some(repay_token) = wallet_index.get(repay_mint_str) else {
         let non_whitelist_key = format!("{obligation_str}:{repay_mint_str}");
@@ -2704,7 +3048,7 @@ where
             ));
         } else {
             hunter_verbose_log(
-                runtime.verbose,
+                runtime.log_verbosity,
                 "kamino",
                 format!(
                     "skip suppressed by cooldown | obligation={} repay_mint={}",
@@ -2905,7 +3249,8 @@ where
                 farm_accounts.push(pk);
             }
             let farms_program_idx = *ix_accs.get(24)?;
-            let farms_program_pk = Pubkey::from_str(tx.account_keys.get(farms_program_idx)?).ok()?;
+            let farms_program_pk =
+                Pubkey::from_str(tx.account_keys.get(farms_program_idx)?).ok()?;
             Some((farm_accounts, farms_program_pk))
         });
     if let Some((farm_accounts, farms_program_pk)) = farm_extra_accounts {
@@ -2926,7 +3271,7 @@ where
         data: liquidation_data,
     };
 
-    let base_tip_lamports = cached_tip.load(Ordering::Relaxed);
+    let base_tip_lamports = kamino_tip_policy.current_tip_lamports();
     let max_send_attempts = jito_send_max_attempts();
     let ata_setup_instruction_count = ata_setup_instructions.len();
     let max_tx_size_bytes = 1232usize;
@@ -3282,6 +3627,17 @@ where
                     Some(elapsed_ms_since(ws_received_at_ms)),
                 )
                 .await;
+                if attempt == 1 {
+                    kamino_tip_policy.note_first_shot_bundle_sent(
+                        obligation_str.to_string(),
+                        liquidator.to_string(),
+                        tip_lamports,
+                        bundle_id.clone(),
+                        sig.clone(),
+                        source.as_str().to_string(),
+                        now_ms(),
+                    );
+                }
                 log_stderr(format!(
                     "[hunter-kamino] BUNDLE SENT | source={} obligation={} bundle={} attempt={}/{} tx_size={} reserves={} full_refresh={} ata_setup={} ata_dropped={}",
                     source.as_str(),
